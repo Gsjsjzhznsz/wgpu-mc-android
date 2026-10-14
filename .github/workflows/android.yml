@@ -48,7 +48,7 @@ jobs:
 
       - name: Install the pinned Rust toolchain and the Android targets
         shell: bash
-        working-directory: rust
+        working-directory: wgpu-mc-neo/rust
         run: |
           rustup toolchain install "$(grep -m1 'channel' rust-toolchain.toml | cut -d'"' -f2)"
           rustup target add aarch64-linux-android x86_64-linux-android
@@ -56,12 +56,12 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rust
+          workspaces: wgpu-mc-neo/rust
           key: android
 
       - name: Build the JNI bridge for arm64-v8a
         shell: bash
-        working-directory: rust
+        working-directory: wgpu-mc-neo/rust
         # Line tables are what `debug = "line-tables-only"` puts in the binary, and on Android
         # there is no sidecar PDB for them to live in - they would ride into the jar. Symbol
         # names stay (panics and profilers read those); the line tables, which nothing on a
@@ -72,7 +72,7 @@ jobs:
 
       - name: Build the JNI bridge for x86_64
         shell: bash
-        working-directory: rust
+        working-directory: wgpu-mc-neo/rust
         env:
           RUSTFLAGS: -C strip=debuginfo
         run: cargo build --release -p wgpu-mc-jni --target x86_64-linux-android
