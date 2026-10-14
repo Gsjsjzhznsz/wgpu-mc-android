@@ -52,7 +52,9 @@ jobs:
           ls "$RUNNER_TEMP" | head
           echo "::endgroup::"
           echo "$RUNNER_TEMP/android-ndk-r28b/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
-          command -v aarch64-linux-android24-clang
+          # A GITHUB_PATH entry takes effect for the *next* step, not this one - so the sanity
+          # check is the explicit path, not a PATH lookup.
+          test -x "$RUNNER_TEMP/android-ndk-r28b/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang"
 
       - name: Install the pinned Rust toolchain and the Android targets
         shell: bash
