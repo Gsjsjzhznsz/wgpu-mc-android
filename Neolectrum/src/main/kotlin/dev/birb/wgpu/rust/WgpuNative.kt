@@ -193,7 +193,7 @@ object WgpuNative {
                                         "Could not find lib $mappedName in jar (looked in ${nativeResourceRoots().joinToString()})"
                                 )
 
-                        WgpuMcMod.LOGGER.info(
+                        dev.birb.wgpu.WgpuMcMod.LOGGER.info(
                                 "wgpu: extracting the native library from {} in the mod jar to {}",
                                 resourceName,
                                 libraryFile,
