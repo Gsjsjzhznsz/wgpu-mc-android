@@ -272,6 +272,10 @@ tasks.named<ProcessResources>("processResources") {
                 "minecraft_version_range" to minecraftVersionRange,
                 "neo_version" to neoforgeNeoVersion,
                 "loader_version_range" to loaderVersionRange,
+                // Kotlin for Forge's loader range, `neoforge.mods.toml`'s `loaderVersion` and the
+                // kfflib dependency range. Lived only in gradle.properties until a build without
+                // it in the expansion map taught processResources to fail on it.
+                "kff_version_range" to providers.gradleProperty("kff_version_range").get(),
                 "mod_id" to modId,
                 "mod_name" to modName,
                 "mod_license" to modLicense,
