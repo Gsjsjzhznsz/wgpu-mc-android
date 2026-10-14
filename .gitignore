@@ -1,0 +1,20 @@
+# Rust
+wgpu-mc-neo/rust/target/
+wgpu-mc-neo/rust/bindings.h
+**/*.rs.bk
+
+# Gradle
+Neolectrum/build/
+Neolectrum/runs/
+Neolectrum/repo/
+.gradle/
+build/
+
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+
+# Local engine checkouts made by scripts
+*.log

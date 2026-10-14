@@ -1,0 +1,108 @@
+# Builds the Android release: the Rust JNI bridge cross-compiled for the ABIs the port ships,
+# then the mod jar with those libraries packaged inside it.
+#
+# The jar this produces is the one a launcher (FCL, Pojav and friends) takes: it carries
+# `assets/wgpu_mc/natives/android-<abi>/libwgpu_mc_jni.so`, which is what the mod's loader
+# extracts and `System.load`s on a device - the file a desktop-populated jar never had, and the
+# reason an Android launch died in `WgpuNative` with a `FileNotFoundException` before this
+# pipeline existed.
+#
+# Both ABIs are built into one jar. arm64-v8a is what every real device speaks; x86_64 is what
+# an emulator speaks, and the two cost one CI job's worth of time more than one of them.
+#
+# Pushing a tag `v*` publishes the jar as a GitHub release; every push keeps it available as a
+# workflow artifact.
+name: android
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Rust (NDK) + mod jar
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Set up the Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          # r28 is the current LTS line; the wrappers this build calls by name
+          # (`aarch64-linux-android24-clang` and friends, see rust/.cargo/config.toml) have been
+          # in every NDK since r19.
+          ndk-version: r28b
+          add-to-path: true
+
+      - name: Install the pinned Rust toolchain and the Android targets
+        shell: bash
+        working-directory: rust
+        run: |
+          rustup toolchain install "$(grep -m1 'channel' rust-toolchain.toml | cut -d'"' -f2)"
+          rustup target add aarch64-linux-android x86_64-linux-android
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: android
+
+      - name: Build the JNI bridge for arm64-v8a
+        shell: bash
+        working-directory: rust
+        # Line tables are what `debug = "line-tables-only"` puts in the binary, and on Android
+        # there is no sidecar PDB for them to live in - they would ride into the jar. Symbol
+        # names stay (panics and profilers read those); the line tables, which nothing on a
+        # device reads, go.
+        env:
+          RUSTFLAGS: -C strip=debuginfo
+        run: cargo build --release -p wgpu-mc-jni --target aarch64-linux-android
+
+      - name: Build the JNI bridge for x86_64
+        shell: bash
+        working-directory: rust
+        env:
+          RUSTFLAGS: -C strip=debuginfo
+        run: cargo build --release -p wgpu-mc-jni --target x86_64-linux-android
+
+      - name: Package the mod jar
+        shell: bash
+        working-directory: Neolectrum
+        # `jarJar` is the task whose output (`-all`, with the Kotlin runtime embedded) is the
+        # artifact a player installs; `copyNatives` runs inside it and lifts the two libraries
+        # the steps above built into the jar's resources.
+        run: ./gradlew jarJar --no-daemon --stacktrace
+
+      - name: Show what the jar carries
+        shell: bash
+        working-directory: Neolectrum
+        run: |
+          jar=$(ls build/libs/*-all.jar | head -n 1)
+          echo "== $jar =="
+          unzip -l "$jar" | grep -E "natives|wgpu_mc_jni" || true
+
+      - name: Upload the jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: wgpu_mc-android
+          path: Neolectrum/build/libs/*-all.jar
+          if-no-files-found: error
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Neolectrum/build/libs/*-all.jar
+          generate_release_notes: true
