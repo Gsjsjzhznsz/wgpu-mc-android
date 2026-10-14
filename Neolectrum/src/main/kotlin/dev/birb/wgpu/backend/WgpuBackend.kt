@@ -51,20 +51,33 @@ class WgpuBackend : GpuBackend {
         //
         // Android is the branch where "the native handles" do not exist: the launcher's GLFW is a
         // stub whose window pointer is its own structure and whose native accessors are not
-        // implemented, so there is nothing `windowHandles` could produce. What the launcher does
-        // have is the `android.view.Surface` the game is drawn into, and that is what the Android
-        // entry point takes - Rust turns it into an `ANativeWindow` and proceeds exactly as the
-        // desktop path does.
+        // implemented, so there is nothing `windowHandles` could produce. Two ways to the window,
+        // in the order they can fail:
+        //
+        //  1. The Pojav-family launcher bridge (FCL, PojavLauncher and their forks). These
+        //     launchers keep the game's `ANativeWindow` in a process-global native struct their
+        //     own library exports - and carry **no framework classes on this JVM's classpath at
+        //     all**, which is why the reflection route below cannot be the first choice. Rust
+        //     resolves the window itself through the bridge; nothing Android-shaped ever crosses
+        //     the JNI border here.
+        //  2. The `android.view.Surface` reflection walk, for a launcher that does expose the
+        //     framework but has no Pojav-family bridge. A 0 return from route 1 means "no
+        //     bridge" (the window checks happen before any backend is selected), so this is the
+        //     clean fallback rather than a second attempt at the same thing.
         val (framebufferWidth, framebufferHeight) = WgpuSurface.framebufferSize(window)
         val renderer = if (AndroidRuntime.isAndroid) {
-            val surface = AndroidRuntime.findGameSurface()
-                ?: throw BackendCreationException(
-                    "wgpu-mc could not find the launcher's game Surface in this process, which " +
-                        "is what the renderer presents through on Android. The log names what " +
-                        "was searched; this launcher's window layout may need a new probe in " +
-                        "AndroidRuntime."
-                )
-            WgpuNative.createWmRendererOnAndroidSurface(surface, framebufferWidth, framebufferHeight)
+            val viaBridge = WgpuNative.createWmRendererOnPojavWindow()
+            if (viaBridge != 0L) {
+                viaBridge
+            } else {
+                val surface = AndroidRuntime.findGameSurface()
+                    ?: throw BackendCreationException(
+                        "wgpu-mc could not find a window to present through on Android: this " +
+                            "launcher offers neither the Pojav-family native bridge nor a game " +
+                            "Surface in its view hierarchy. The log names what was searched."
+                    )
+                WgpuNative.createWmRendererOnAndroidSurface(surface, framebufferWidth, framebufferHeight)
+            }
         } else {
             val (display, nativeWindow) = try {
                 WgpuSurface.windowHandles(window)

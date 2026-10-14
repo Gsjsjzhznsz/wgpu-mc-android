@@ -28,21 +28,31 @@ object AndroidRuntime {
     /**
      * Whether this JVM runs on Android.
      *
-     * `ActivityThread` is the framework's own thread class: it exists on the boot classpath of
-     * every Android runtime and on none of the desktop ones, so finding it is the whole test -
-     * and unlike `os.name`, which FCL's launch arguments pin to `Linux`, it cannot be spoofed by
-     * a `-D` flag. Evaluated once; the answer cannot change mid-process.
+     * Three independent signals, any one of which settles it, because no single one is present
+     * on every launcher: FCL's OpenJDK 25 game JVM carries **no framework classes at all** (the
+     * boot classpath holds only the Cacio AWT jars), so the `ActivityThread` probe fails there
+     * even though the process is as Android as it gets - but the device's `/system/build.prop`
+     * is on disk regardless of the JVM, and FCL's launch arguments pin `os.version` to
+     * `Android-<release>`. A desktop JVM answers no to all three. Evaluated once; the answer
+     * cannot change mid-process.
      */
     val isAndroid: Boolean by lazy {
-        val found = runCatching {
+        val frameworkClass = runCatching {
             Class.forName("android.app.ActivityThread") != null
         }.getOrDefault(false)
+        val systemImage = File("/system/build.prop").isFile
+        val osVersion = System.getProperty("os.version").orEmpty()
+        val osVersionAndroid = osVersion.lowercase().contains("android")
 
-        if (found) {
-            WgpuMcMod.LOGGER.info(
-                "wgpu: Android runtime detected (framework classes on the boot classpath)",
-            )
-        }
+        val found = frameworkClass || systemImage || osVersionAndroid
+        WgpuMcMod.LOGGER.info(
+            "wgpu: Android runtime detection: framework classes {}, /system/build.prop {}, " +
+                "os.version '{}' -> {}",
+            frameworkClass,
+            systemImage,
+            osVersion.ifBlank { "<unset>" },
+            found,
+        )
         found
     }
 

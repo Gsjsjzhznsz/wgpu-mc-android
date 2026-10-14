@@ -187,10 +187,20 @@ object WgpuNative {
                 // Fast path: the prebuilt library sits in the Rust workspace output.
                 if (!libraryFile.exists() || forceOverwrite) {
                         libraryFile.parentFile?.mkdirs()
-                        val resourceName = nativeResourceRoots()
+                        val roots = nativeResourceRoots()
+                        val resourceName = roots
                                 .firstOrNull { WgpuNative::class.java.classLoader.getResource(it + mappedName) != null }
+                                // Belt and braces for a classloader that hides mod-jar resources from
+                                // `getResource` - NeoForge's union filesystem is the usual path and
+                                // answers fine, but the jar on disk cannot lie about its own entries.
+                                // Anything under a `natives` directory of this jar counts; the roots
+                                // above stay the probe of record for where a jar is *supposed* to put it.
+                                ?: scanJarEntries(mappedName)
                                 ?: throw FileNotFoundException(
-                                        "Could not find lib $mappedName in jar (looked in ${nativeResourceRoots().joinToString()})"
+                                        "Could not find lib $mappedName in jar (looked in " +
+                                                "$roots, then every entry of the mod jar itself; " +
+                                                "the jar in use does not carry an Android build of the " +
+                                                "native library for this device)"
                                 )
 
                         dev.birb.wgpu.WgpuMcMod.LOGGER.info(
@@ -225,6 +235,34 @@ object WgpuNative {
                         copySymbolsBeside(mappedName)
                 }
                 return libraryFile.absolutePath
+        }
+
+        /**
+         * Opens the mod jar this class was loaded from and looks for [mappedName] anywhere under
+         * a `natives` directory, however the jar named the platform or ABI directory it sits in.
+         *
+         * The resource roots [nativeResourceRoots] answers are the contract; this is the fallback
+         * for a classloader that will not answer for them (or a jar laid out by a build this
+         * side never anticipated). It reads the jar file itself, so it depends on nothing but
+         * the jar being on disk as a plain file - which a NeoForge mod always is.
+         */
+        private fun scanJarEntries(mappedName: String): String? {
+                val jarFile = runCatching {
+                        val location = WgpuNative::class.java.protectionDomain.codeSource.location
+                        File(location.toURI()).takeIf { it.isFile }
+                }.getOrNull() ?: return null
+
+                return runCatching {
+                        java.util.zip.ZipFile(jarFile).use { jar ->
+                                jar.entries().asSequence()
+                                        .filter { !it.isDirectory }
+                                        .firstOrNull { entry ->
+                                                entry.name.endsWith("/$mappedName") &&
+                                                        entry.name.contains("natives")
+                                        }
+                                        ?.name
+                        }
+                }.getOrNull()
         }
 
         /**
@@ -710,6 +748,24 @@ object WgpuNative {
          */
         @JvmStatic
         external fun createWmRendererOnAndroidSurface(surface: Any, width: Int, height: Int): Long
+
+        /**
+         * [createWmRendererOnWindow] for the launchers that never show this JVM an Android
+         * framework class: FCL, PojavLauncher and every fork built on their code.
+         *
+         * Those launchers run the game inside their own process with the framework classes off
+         * the classpath, so neither [AndroidRuntime.findGameSurface] nor the Surface entry above
+         * can produce anything - but their native bridge keeps the game's `ANativeWindow` in a
+         * process-global struct that this library can reach itself (`POJAV_ENVIRON` and the
+         * exported `pojav_environ` symbol name it). This entry takes no argument because there
+         * is nothing this side could add: Rust resolves the window, acquires its own reference
+         * to it, and proceeds exactly as the other entry points do.
+         *
+         * @return the `WmRenderer` pointer, or 0 when this launcher offers no bridge (or the
+         * window it names is not usable) - the caller falls back to the Surface path
+         */
+        @JvmStatic
+        external fun createWmRendererOnPojavWindow(): Long
 
         /**
          * Says where the camera is, in sections.

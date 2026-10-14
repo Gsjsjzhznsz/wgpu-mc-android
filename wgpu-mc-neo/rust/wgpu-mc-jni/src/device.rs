@@ -1184,6 +1184,139 @@ pub fn createWmRendererOnAndroidSurface(
     create_renderer(&mut env, 0, window, width as u32, height as u32)
 }
 
+/// The Android renderer entry point for Pojav-family launchers, which is what FCL and every
+/// launcher built on that codebase is.
+///
+/// Those launchers run the game JVM inside their own Android app process, and the one library
+/// both sides load - `libpojavexec.so`, the GLFW stub's native half - keeps the current game
+/// window in a process-global `pojav_environ` struct whose **first field** is the
+/// `ANativeWindow*` every renderer the launcher ships draws into. That layout invariant is what
+/// this entry point is built on: the JVM side needs no `android.view.Surface` at all, because
+/// the framework classes those launchers' JVMs cannot see are exactly the classes the old
+/// `Surface`-reflection path needed.
+///
+/// The struct pointer is shared through the `POJAV_ENVIRON` environment variable (set by
+/// `libpojavexec`'s constructor the moment the launcher's own side loads it, so the game
+/// process always inherits it), with the exported `pojav_environ` symbol as the fallback.
+/// Only offset 0 is ever read - the field has sat first in every Pojav-family fork since 2022 -
+/// so a fork that grew fields of its own further down does not break the read.
+#[cfg(target_os = "android")]
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn createWmRendererOnPojavWindow(mut env: JNIEnv, _: JClass) -> jlong {
+    let native_window = unsafe { pojav_bridge::resolve_pojav_window() };
+    if native_window.is_null() {
+        error!(
+            "wgpu-mc: this launcher offers no Pojav-family bridge - getenv(\"POJAV_ENVIRON\") and \
+             the dlsym lookup both failed - so the renderer cannot find the window to present to"
+        );
+        return 0;
+    }
+
+    // The launcher owns the window's lifetime and hands the same pointer to every renderer it
+    // runs, but if the surface is ever recreated (rotation, foldable state) the launcher drops
+    // its old reference and frees the window. Acquiring our own reference keeps the pointer we
+    // present through alive no matter what the launcher does next; the matching release is
+    // never called, which is the same process-lifetime ownership the surface entry point uses.
+    unsafe { android_window::ANativeWindow_acquire(native_window) };
+
+    let width = unsafe { android_window::ANativeWindow_getWidth(native_window) };
+    let height = unsafe { android_window::ANativeWindow_getHeight(native_window) };
+    if width <= 0 || height <= 0 {
+        error!(
+            "wgpu-mc: the launcher bridge resolved a window at {:#x} that reports {}x{} - not \
+             a usable ANativeWindow, so the renderer cannot attach to it",
+            native_window as usize, width, height
+        );
+        return 0;
+    }
+
+    info!(
+        "wgpu-mc: launcher bridge window is an ANativeWindow at {:#x} ({}x{})",
+        native_window as usize, width, height
+    );
+
+    create_renderer(&mut env, 0, native_window as usize as u64, width as u32, height as u32)
+}
+
+/// The Pojav-family launcher bridge: finding the game's `ANativeWindow` without any help from
+/// the JVM.
+///
+/// Two ways in, tried in order:
+///
+///  1. `getenv("POJAV_ENVIRON")` - the hex form of the `pojav_environ` pointer, written by
+///     `libpojavexec`'s own constructor before any game code exists. The env var format is
+///     `%p`, so it carries a `0x` prefix that `strtoul(_, 16)` tolerates and the parser here
+///     strips first.
+///  2. `dlsym(RTLD_DEFAULT, "pojav_environ")` - the same pointer as an exported symbol. This
+///     only answers when `libpojavexec` landed in the linker namespace's global group, which
+///     a JVM `System.loadLibrary` does not promise; it is here because it costs nothing.
+///
+/// Both yield the same struct, of which exactly one thing is read: field 0, the window. The
+/// `basic_render_window_t` bundles the GL bridges build are not confused with it - those are
+/// what `pojavCreateContext` returns when a GL *context* is requested, while this port runs
+/// with `GLFW_NO_API` and the window the launcher itself renders into is the one thing every
+/// fork agrees on.
+#[cfg(target_os = "android")]
+mod pojav_bridge {
+    use std::ffi::{c_char, c_void};
+
+    /// The first field of `struct pojav_environ_s` - `struct ANativeWindow* pojavWindow`.
+    /// Declared as a one-field struct on purpose: the rest of the layout differs between forks,
+    /// and nothing past offset 0 is read.
+    #[repr(C)]
+    struct PojavEnvironHead {
+        pojav_window: *mut c_void,
+    }
+
+    /// The game window as an `ANativeWindow*`, or null when this process is not a
+    /// Pojav-family launcher (or the bridge is there but names no window).
+    pub unsafe fn resolve_pojav_window() -> *mut c_void {
+        if let Some(window) = window_from_environ_env() {
+            return window;
+        }
+        window_from_symbol().unwrap_or(std::ptr::null_mut())
+    }
+
+    /// Route 1: the `POJAV_ENVIRON` environment variable, the way the launcher itself shares
+    /// the struct with everything it loads.
+    unsafe fn window_from_environ_env() -> Option<*mut c_void> {
+        let value = std::env::var("POJAV_ENVIRON").ok()?;
+        let digits = value.trim().trim_start_matches("0x").trim_start_matches("0X");
+        let environ = usize::from_str_radix(digits, 16).ok()? as *mut PojavEnvironHead;
+        if environ.is_null() {
+            return None;
+        }
+        // One dereference into a struct the launcher allocated and filled before this code
+        // could possibly run - no synchronization is needed for a value that is write-once.
+        let window = unsafe { (*environ).pojav_window };
+        (!window.is_null()).then_some(window)
+    }
+
+    /// Route 2: the exported `pojav_environ` symbol, when the launcher's library is visible to
+    /// this one. `dlsym` answers the address *of the global pointer variable*, so two
+    /// dereferences: pointer-to-pointer, then the window field.
+    unsafe fn window_from_symbol() -> Option<*mut c_void> {
+        unsafe extern "C" {
+            pub fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+        }
+
+        // `RTLD_DEFAULT` - the global scope. NULL on bionic, same as on glibc.
+        const RTLD_DEFAULT: *mut c_void = std::ptr::null_mut();
+
+        let symbol = b"pojav_environ\0".as_ptr() as *const c_char;
+        let variable = unsafe { dlsym(RTLD_DEFAULT, symbol) };
+        if variable.is_null() {
+            return None;
+        }
+        let environ = unsafe { *(variable as *mut *mut PojavEnvironHead) };
+        if environ.is_null() {
+            return None;
+        }
+        let window = unsafe { (*environ).pojav_window };
+        (!window.is_null()).then_some(window)
+    }
+}
+
 /// The `ANativeWindow` calls this port makes, declared against `libandroid`.
 ///
 /// `libandroid.so` is public since API 8 and carries all three of these on every device the
@@ -1202,6 +1335,11 @@ mod android_window {
         /// `android/native_window_jni.h` - the `ANativeWindow` behind a `android.view.Surface`,
         /// with a reference taken on it. Returned pointer is owned by the caller.
         pub fn ANativeWindow_fromSurface(env: *mut JNIEnv, surface: jobject) -> *mut c_void;
+
+        /// `android/native_window.h` - adds a reference of the caller's own to a window that is
+        /// already referenced elsewhere, so the caller's use of it stays valid no matter when
+        /// the original owner lets go.
+        pub fn ANativeWindow_acquire(window: *mut c_void);
 
         /// `android/native_window.h` - the surface's current size in pixels.
         pub fn ANativeWindow_getWidth(window: *mut c_void) -> i32;
