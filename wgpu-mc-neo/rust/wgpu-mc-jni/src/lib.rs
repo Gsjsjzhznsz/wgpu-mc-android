@@ -75,6 +75,29 @@ mod abi_tests;
 #[cfg(test)]
 mod packaging;
 
+/// Installs the `log` pipeline on Android, once, from the first Android JNI entry that runs.
+///
+/// On the desktop the JVM calls [`setPanicHook`] early in `Main.main`, which is what installs
+/// `env_logger`; on Android nothing calls it before the renderer is created, and an install that
+/// never happened means every `info!`/`warn!` this crate writes is silently dropped - the exact
+/// blindness that made the first Android surface-creation failures undiagnosable from a game log
+/// where only the raw panic text arrived. `env_logger` writes to stderr, which the launcher's log
+/// pipe captures, so the same filter as `setPanicHook` turns the Android log into the desktop one.
+/// Harmless when it runs after `setPanicHook`: both install into the same global slot, the first
+/// one wins, and the filters agree.
+#[cfg(target_os = "android")]
+pub(crate) fn ensure_android_logging() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let _ = env_logger::Builder::from_env(
+            env_logger::Env::default()
+                .default_filter_or("wgpu_mc_jni=info,wgpu_mc=info,wgpu=warn,naga=warn"),
+        )
+        .try_init();
+    });
+}
+
 #[derive(Debug)]
 struct MinecraftRenderState {
     //draw_queue: Vec<>,

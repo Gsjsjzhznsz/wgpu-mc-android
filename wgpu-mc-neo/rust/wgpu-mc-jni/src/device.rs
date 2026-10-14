@@ -1085,30 +1085,82 @@ pub fn create_renderer(
             continue;
         }
 
+        // Android runs Vulkan only, by design and by request. The GLES attempt cannot succeed -
+        // wgpu's GL backend needs vertex-stage storage buffers, which GLES drivers do not expose
+        // (the `VERTEX_STORAGE` downlevel flag; the panic it produces names it) - and a failed
+        // attempt is worse than a skipped one: reaching the device would attach the shared
+        // window a second time, and the panic buries the Vulkan error that actually matters
+        // under a second stack trace.
+        if cfg!(target_os = "android") && backend == GraphicsBackend::GLES {
+            info!(
+                "wgpu-mc: {backend:?} is not attempted on Android - the renderer is Vulkan-only \
+                 there"
+            );
+            continue;
+        }
+
         // wgpu-hal's surface creation path is written with `expect`, and a panic reaching the
         // JNI boundary cannot unwind - it aborts the process. Every panic inside a backend
         // attempt is contained here instead: the failed backend is dropped the same way an
         // `Err` is, and the next backend (or, at the bottom, the JVM's clean
         // BackendCreationException) gets its turn.
-        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            try_create_renderer(&mut *env, backend, display, window)
-        }));
-        let wm = match attempt {
-            Ok(Some(wm)) => wm,
-            Ok(None) => continue,
-            Err(payload) => {
-                let message = if let Some(text) = payload.downcast_ref::<&'static str>() {
-                    (*text).to_string()
-                } else if let Some(text) = payload.downcast_ref::<String>() {
-                    text.clone()
-                } else {
-                    "no panic message".to_string()
-                };
-                error!(
-                    "wgpu-mc: {backend:?} renderer creation panicked and was contained: {message}"
-                );
-                continue;
+        //
+        // On Android the Vulkan attempt is also retried. `VK_ERROR_NATIVE_WINDOW_IN_USE_KHR` is
+        // answered at surface creation when the launcher's GL bridge still holds the shared
+        // window, and a driver may drop that hold asynchronously after our release: a surface
+        // destroyed while a context still has it current is released lazily per the EGL spec,
+        // which is exactly the shape the cross-thread route can leave behind. Three attempts,
+        // with the release re-run between them, cost nothing when they are not needed and turn
+        // that race into a boot.
+        let retries = if cfg!(target_os = "android") && backend == GraphicsBackend::Vulkan {
+            3
+        } else {
+            1
+        };
+        let mut created = None;
+        for retry in 0..retries {
+            if retry > 0 {
+                // The hold the previous attempt tripped over may already be gone, may need the
+                // release once more, or may just need the driver a moment - this is where the
+                // wait happens, and the re-run names its own outcome in the log.
+                std::thread::sleep(std::time::Duration::from_millis(150 * retry as u64));
+                #[cfg(target_os = "android")]
+                if backend == GraphicsBackend::Vulkan {
+                    let environ = unsafe { pojav_bridge::resolve_pojav_environ() };
+                    info!(
+                        "wgpu-mc: Vulkan attempt {} of {} - re-running the window release: {}",
+                        retry + 1,
+                        retries,
+                        unsafe { egl_release::release_window_attachment(environ) }
+                    );
+                }
             }
+
+            let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                try_create_renderer(&mut *env, backend, display, window)
+            }));
+            match attempt {
+                Ok(Some(wm)) => {
+                    created = Some(wm);
+                    break;
+                }
+                Ok(None) => break,
+                Err(payload) => {
+                    let message = if let Some(text) = payload.downcast_ref::<&'static str>() {
+                        (*text).to_string()
+                    } else if let Some(text) = payload.downcast_ref::<String>() {
+                        text.clone()
+                    } else {
+                        "no panic message".to_string()
+                    };
+                    error!(
+                        "wgpu-mc: {backend:?} renderer creation panicked and was contained: {message}"
+                    );
+                }
+            }
+        }
+        let Some(wm) = created else {
+            continue;
         };
 
         if backend != requested {
@@ -1182,6 +1234,10 @@ pub fn createWmRendererOnAndroidSurface(
     width: jint,
     height: jint,
 ) -> jlong {
+    // Everything below reports through `log`, and on Android nothing else has installed a
+    // logger by this point - without this, the outcome lines this entry writes are dropped.
+    crate::ensure_android_logging();
+
     // `ANativeWindow_fromSurface` takes a reference on the window. The renderer presents to this
     // window for the life of the process - the JVM keeps its own reference to the `Surface`
     // alive for just as long - and the matching `ANativeWindow_release` is therefore never
@@ -1235,6 +1291,11 @@ pub fn createWmRendererOnAndroidSurface(
 #[cfg(target_os = "android")]
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn createWmRendererOnPojavWindow(mut env: JNIEnv, _: JClass) -> jlong {
+    // Everything below reports through `log`, and on Android nothing else has installed a
+    // logger by this point - without this, the outcome lines this entry writes are dropped
+    // and a failure like the window-in-use one is invisible behind the raw panic text.
+    crate::ensure_android_logging();
+
     let environ = unsafe { pojav_bridge::resolve_pojav_environ() };
     let native_window = if environ.is_null() {
         std::ptr::null_mut()
@@ -1362,16 +1423,40 @@ mod pojav_bridge {
     /// it. A fork that builds with symbol hiding defeats this, and every caller must treat
     /// `None` as "the launcher does not offer this".
     pub(super) unsafe fn dlsym_global(symbol: &[u8]) -> Option<*mut c_void> {
+        // `RTLD_DEFAULT` - the global scope. NULL on bionic, same as on glibc.
+        unsafe { dlsym_in(std::ptr::null_mut(), symbol) }
+    }
+
+    /// The address of `symbol` in `handle`'s link map, or `None`. `handle` is a raw `dlsym`
+    /// handle: null means the global scope (`RTLD_DEFAULT`), otherwise it is what [`dlopen_loaded`]
+    /// (or a plain `dlopen`) answered.
+    pub(super) unsafe fn dlsym_in(handle: *mut c_void, symbol: &[u8]) -> Option<*mut c_void> {
         debug_assert!(symbol.last() == Some(&0));
         unsafe extern "C" {
             pub fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
         }
 
-        // `RTLD_DEFAULT` - the global scope. NULL on bionic, same as on glibc.
-        const RTLD_DEFAULT: *mut c_void = std::ptr::null_mut();
-
-        let resolved = unsafe { dlsym(RTLD_DEFAULT, symbol.as_ptr() as *const c_char) };
+        let resolved = unsafe { dlsym(handle, symbol.as_ptr() as *const c_char) };
         (!resolved.is_null()).then_some(resolved)
+    }
+
+    /// A `dlopen` handle for a library that is *already loaded*, or `None` when it is not.
+    ///
+    /// `RTLD_NOLOAD` never loads anything: it only matches an existing entry by soname and
+    /// hands back a new reference to it, which is exactly what the EGL fallback needs - the
+    /// driver is in the process because the launcher's bridge could not have made a context
+    /// otherwise, and the goal is to reach its entry points without changing what is loaded.
+    /// The flag combination is `RTLD_LAZY | RTLD_NOLOAD`, identical on bionic and glibc.
+    pub(super) unsafe fn dlopen_loaded(path: *const c_char) -> Option<*mut c_void> {
+        unsafe extern "C" {
+            pub fn dlopen(filename: *const c_char, flag: i32) -> *mut c_void;
+        }
+
+        const RTLD_LAZY: i32 = 0x0001;
+        const RTLD_NOLOAD: i32 = 0x8000;
+
+        let handle = unsafe { dlopen(path, RTLD_LAZY | RTLD_NOLOAD) };
+        (!handle.is_null()).then_some(handle)
     }
 }
 
@@ -1414,6 +1499,8 @@ mod pojav_bridge {
 mod egl_release {
     use std::ffi::c_void;
 
+    use log::info;
+
     /// `EGL_DRAW` - the read surface of a context, which is the one bound to the window.
     const EGL_DRAW: u32 = 0x3059;
 
@@ -1429,13 +1516,75 @@ mod egl_release {
             Self { name }
         }
 
-        /// The function pointer the variable holds, or `None` when this launcher build does not
-        /// export it (older forks, or the symbol hidden by the linker namespace). Call sites
-        /// transmute the raw address to the signature they are calling through.
+        /// The plain EGL entry-point name behind a trampoline literal: `b"eglGetDisplay_p\0"`
+        /// names the bridge's global *variable*, `b"eglGetDisplay\0"` the function inside the
+        /// driver library the variable points into.
+        fn plain_name(&self) -> Vec<u8> {
+            let stem = &self.name[..self.name.len() - 3]; // drop the trailing "_p\0"
+            let mut plain = Vec::with_capacity(stem.len() + 1);
+            plain.extend_from_slice(stem);
+            plain.push(0);
+            plain
+        }
+
+        /// The function pointer to call through, or `None` when this launcher offers EGL through
+        /// none of the three routes below. Call sites transmute the raw address to the signature
+        /// they are calling through.
+        ///
+        /// Three routes, best first:
+        ///
+        /// 1. the bridge's `*_p` global - what the launcher's own GL code calls through, so by
+        ///    construction the exact driver every context in the process belongs to;
+        /// 2. `RTLD_NOLOAD` of the library `POJAVEXEC_EGL` names - the driver is already loaded
+        ///    (the bridge could not have made a context otherwise), and EGL displays are
+        ///    per-driver process singletons, so entry points reached through our own handle
+        ///    answer for the very same display. This covers launcher builds whose `*_p`
+        ///    globals are hidden by visibility flags;
+        /// 3. the plain name in the global scope - the system EGL. Usually the wrong driver
+        ///    when the launcher ships its own (its displays and handles would be foreign), so
+        ///    it is last and every call through it fails harmlessly if it is.
         unsafe fn load(&self) -> Option<*mut c_void> {
-            let variable = unsafe { super::pojav_bridge::dlsym_global(self.name) }?;
-            let function = unsafe { *(variable as *mut *mut c_void) };
-            (!function.is_null()).then_some(function)
+            if let Some(variable) = (unsafe { super::pojav_bridge::dlsym_global(self.name) }) {
+                let function = unsafe { *(variable as *mut *mut c_void) };
+                if !function.is_null() {
+                    return Some(function);
+                }
+            }
+
+            let plain = self.plain_name();
+            let driver = std::env::var("POJAVEXEC_EGL").ok().filter(|v| !v.is_empty());
+            if let Some(value) = driver {
+                if let Ok(path) = std::ffi::CString::new(value) {
+                    if let Some(handle) = (unsafe { super::pojav_bridge::dlopen_loaded(path.as_ptr()) }) {
+                        if let Some(function) =
+                            (unsafe { super::pojav_bridge::dlsym_in(handle, &plain) })
+                        {
+                            info!(
+                                "wgpu-mc: egl_release resolved {} through the driver library the \
+                                 bridge loaded; the bridge's own {} trampoline was not visible",
+                                self.plain_name_str(),
+                                self.plain_name_str(),
+                            );
+                            return Some(function);
+                        }
+                    }
+                }
+            }
+
+            let function = unsafe { super::pojav_bridge::dlsym_global(&plain) }?;
+            info!(
+                "wgpu-mc: egl_release resolved {} from the process's global EGL - possibly a \
+                 different driver than the bridge's contexts run on, so calls through it may \
+                 answer EGL_BAD_* and be ignored",
+                self.plain_name_str(),
+            );
+            Some(function)
+        }
+
+        /// The plain name for a log line - only valid ASCII inside, so this is safe.
+        fn plain_name_str(&self) -> String {
+            let plain = self.plain_name();
+            String::from_utf8_lossy(&plain[..plain.len() - 1]).into_owned()
         }
     }
 
@@ -1469,15 +1618,17 @@ mod egl_release {
         ] = trampolines();
 
         // A missing trampoline only amputates the routes that need it, and the messages below
-        // say which.
+        // say which. Each one itself falls back through the driver library and the global EGL
+        // before giving up, so a launcher with hidden `*_p` globals is still handled.
         let (Some(get_display), Some(get_current_surface), Some(make_current), Some(destroy_surface)) = (
             unsafe { get_display.load() },
             unsafe { get_current_surface.load() },
             unsafe { make_current.load() },
             unsafe { destroy_surface.load() },
         ) else {
-            return "the launcher's EGL trampolines are not visible to this library, so the \
-                    loading screen's window attachment cannot be released";
+            return "no EGL entry points could be resolved - not the bridge's *_p trampolines, \
+                    not the driver library POJAVEXEC_EGL names, nor the process's global EGL - \
+                    so the loading screen's window attachment cannot be released";
         };
 
         // The bridge created its display with `eglGetDisplay(EGL_DEFAULT_DISPLAY)`; asking the
@@ -1537,11 +1688,19 @@ mod egl_release {
         }
 
         // Route 2: wrong thread (or the context was already detached) - destroy through the
-        // bundle. A driver may defer the release while another thread holds the surface
-        // current; that is this route's documented best-effort limit.
-        if unsafe { super::egl_release::destroy_bundle_surface(environ, display, destroy_surface) } {
-            return "destroyed the loading screen's EGL surface through the environment bundle \
-                    (cross-thread route; the driver may defer the release)";
+        // bundle. The context goes too: with nothing holding the surface current any more the
+        // destroy is final rather than deferred, and leaving a live context behind would only
+        // keep the display - and through it, potentially the window's driver state - alive for
+        // nothing. If some thread does still hold it current, EGL defers the destruction, which
+        // is the documented best-effort limit of this route.
+        if unsafe { super::egl_release::destroy_bundle_surface(
+            environ,
+            display,
+            destroy_surface,
+            destroy_context,
+        ) } {
+            return "destroyed the loading screen's EGL surface and context through the \
+                    environment bundle (cross-thread route)";
         }
 
         "no live GL connection to the shared window was found - either the loading screen \
@@ -1574,6 +1733,7 @@ mod egl_release {
         environ: *mut super::pojav_bridge::PojavEnvironHead,
         display: *mut c_void,
         destroy_surface: unsafe extern "C" fn(dpy: *mut c_void, surface: *mut c_void) -> u32,
+        destroy_context: Option<unsafe extern "C" fn(dpy: *mut c_void, context: *mut c_void) -> u32>,
     ) -> bool {
         let Some((context, surface)) = (unsafe { bundle_fields(environ) }) else {
             return false;
@@ -1584,10 +1744,16 @@ mod egl_release {
         }
         let destroyed = unsafe { destroy_surface(display, surface_handle) } == 1 /* EGL_TRUE */;
         if destroyed {
+            // The context is destroyed before the handles are zeroed: the stub must never bind
+            // either handle again, and a destroy through a null handle is an error, not a no-op.
+            if let (true, Some(destroy_context)) = (!display.is_null(), destroy_context) {
+                let context_handle = unsafe { context.read() };
+                if !context_handle.is_null() {
+                    unsafe { destroy_context(display, context_handle) };
+                }
+            }
             unsafe { surface.write(std::ptr::null_mut()) };
-            // The context cannot be destroyed from here while another thread holds it current,
-            // but the surface was the window attachment; leave the context handle in place.
-            let _ = context;
+            unsafe { context.write(std::ptr::null_mut()) };
         }
         destroyed
     }
