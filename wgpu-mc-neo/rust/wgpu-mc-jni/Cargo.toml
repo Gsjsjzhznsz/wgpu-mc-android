@@ -1,0 +1,77 @@
+[package]
+name = "wgpu-mc-jni"
+version = "0.1.0"
+authors = ["Birb <birb.seeb@gmail.com>"]
+edition = "2024"
+
+[features]
+default = ["tracing"]
+libc_alloc = []
+tracing = []
+
+[dependencies]
+futures = "0.3"
+jni = "0.21.1"
+jni_fn = "0.1.0"
+raw-window-handle = "0.6"
+wgpu-mc = { path = "../wgpu-mc", features = ["tracing"] }
+#glfw = { git = "https://github.com/birbe/glfw.git", branch = "thin" }
+lazy_static = "1.4.0"
+strum = "0.26"
+strum_macros = "0.26"
+parking_lot = "0.12.1"
+rustc-hash = "2"
+arc-swap = "1.4.0"
+glam = "0.29"
+bytemuck = { version = "1.13", features = ["derive"] }
+once_cell = "1.9.0"
+byteorder = "1.4.3"
+crossbeam-channel = "0.5.4"
+mc-varint = "0.1.1"
+rayon = "1.5.2"
+serde_json = "1.0"
+serde = { version = "1.0.145", features = ["derive"] }
+slab = "0.4.7"
+log = "0.4.17"
+env_logger = "0.11"
+serde_yaml = "0.9"
+serde-binary = "0.5.0"
+glsl = { git = "https://github.com/wgpu-mc/glsl.git" }
+
+# Vendored rather than pulled from the fork: its lexer turned `*=` into `-=`, which made every
+# RGSS-filtered surface four times too bright - see `rust/cyntax/cyntax_lexer/src/lexer.rs` and the
+# round-trip tests at the end of `src/preprocessing.rs`. A one-line fix that has to survive the next
+# `cargo update` belongs in the tree, not in a pinned revision.
+cyntax = { path = "../cyntax" }
+
+[dev-dependencies]
+# The tests read the mod's Kotlin, its language files and its metadata out of the Neolectrum
+# checkout; this is the crate that finds it, and it says what it does when it is not there.
+wgpu-mc-modtree = { path = "../modtree" }
+
+[build-dependencies]
+cbindgen = "0.29"
+
+[target.'cfg(windows)'.dependencies]
+# `processthreadsapi`, `securitybaseapi`, `winnt` and `handleapi` are for the one thing PIX's
+# timing capture needs that this side cannot check any other way: whether the process is elevated.
+# `GetTokenInformation(TokenElevation)` is the only honest answer, and the difference between "not
+# elevated" and "elevated and still refused" is the difference between a `gradlew --stop` and a bug.
+winapi = { version = "0.3.9", features = [
+    "windef",
+    "libloaderapi",
+    "winuser",
+    "processthreadsapi",
+    "securitybaseapi",
+    "winnt",
+    "handleapi",
+] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# Nothing. The three `ANativeWindow` calls the Android surface path makes are declared directly
+# against `libandroid.so` in `device.rs` - the `ndk` crate's `nativewindow` bindings would link
+# `libnativewindow.so`, whose NDK stub only exists for API 34+, and the binary would then refuse
+# to load on every Android between 7.0 and 13 for a library it needs nothing else from.
+
+[lib]
+crate-type = ["cdylib", "rlib"]

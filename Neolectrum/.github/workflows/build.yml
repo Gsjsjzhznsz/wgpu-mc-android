@@ -1,0 +1,91 @@
+# Builds the mod, with the native library it needs, on the platforms it ships for.
+#
+# The engine is a **separate repository** now. `copyNatives` takes `wgpu_mc_jni.<ext>` out of that
+# checkout's build output, so this job checks the engine out first, builds it with cargo, and only then
+# builds the mod - which is what the single-repository CI used to do through `./gradlew build`, where
+# the engine was a subproject.
+#
+# `-Pwgpu_mc_rust_dir=wgpu-mc-neo/rust` is what says where the checkout is: a relative path is resolved
+# against this repository's root, and the sibling default (`../wgpu-mc-neo/rust`) is not where a CI
+# workspace puts it. Without the flag the build still succeeds - `copyNatives` warns and skips - and the
+# jar it produces cannot run the renderer.
+
+name: build
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        java: [
+          25 # Minimum supported by Minecraft
+        ]
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: checkout this repository
+        uses: actions/checkout@v4
+
+      # **After** this repository, and never before: `actions/checkout` cleans the directory it checks
+      # out into, so a workspace-root checkout would delete the engine.
+      - name: checkout the engine
+        uses: actions/checkout@v4
+        with:
+          repository: NTS-Official/wgpu-mc-neo
+          path: wgpu-mc-neo
+
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('wgpu-mc-neo/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: build the native library
+        run: cargo build --release
+        working-directory: wgpu-mc-neo/rust
+
+      # The wrapper is committed with its executable bit (`100755`), because that is the only thing
+      # that makes `./gradlew` runnable on a Linux runner - but this repository is developed on
+      # Windows, where `core.filemode=false` means a re-added `gradlew` silently comes back as
+      # `100644`, and the first `./gradlew` then dies with `Permission denied` and exit code 126.
+      # That is what happened here, so the mode is set again at the one point a checkout can be
+      # asked what it got.
+      - name: make the gradle wrapper executable
+        if: runner.os != 'Windows'
+        run: chmod +x gradlew
+
+      - name: validate gradle wrapper
+        uses: gradle/wrapper-validation-action@v2
+
+      - name: setup jdk ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'graalvm'
+          java-version: ${{ matrix.java }}
+
+      - name: setup gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: build
+        run: ./gradlew build -Pwgpu_mc_rust_dir=wgpu-mc-neo/rust
+
+      - name: capture build artifacts
+      # Only upload artifacts built by ubuntu on LTS java
+        if: ${{ runner.os == 'Linux' && matrix.java == '25' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Artifacts
+          path: build/libs/
+          if-no-files-found: error

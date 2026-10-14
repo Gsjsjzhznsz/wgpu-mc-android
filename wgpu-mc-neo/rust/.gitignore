@@ -1,0 +1,6 @@
+/target
+/wgpu-mc-demo/res/assets
+/.idea
+./\.DS_Store
+/wgpu-mc-jni/shader/**
+bindings.h

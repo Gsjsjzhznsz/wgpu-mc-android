@@ -1,0 +1,33 @@
+[workspace]
+
+resolver = "2"
+
+members = [
+    "wgpu-mc",
+    "wgpu-mc-jni",
+    "wgpu-mc-demo",
+    # **Vendored rather than taken from git, because one field had to be added to it**: a model face's
+    # `shade` flag, which the game reads as `quad.materialInfo().shade()` and which decides whether the
+    # face is drawn at its direction's brightness or at `up`. Upstream has no such field, and the crate is
+    # 136 KB of serde types, so a copy that can be edited is cheaper than a fork that has to be published
+    # before this renderer can use it.
+    "minecraft-assets",
+    # The tests of the two crates above read the mod's own files - its Kotlin, its language files, its
+    # shader sources - out of the Neolectrum checkout, and this is the crate that finds it. It is a
+    # dev-dependency and builds nothing into either library.
+    "modtree"
+]
+
+# The vendored GLSL preprocessor is a workspace of its own with its own lock file, reached only
+# through the path dependency in `wgpu-mc-jni`, so it stays out of this one.
+exclude = ["cyntax"]
+
+[profile.release]
+# Line tables, and only line tables, in the PDB beside the library.
+#
+# A PIX timing capture resolves the functions in its CPU samples and callstacks through PDBs, and a
+# release build without this ships a PDB with no source files in it at all - so every frame from this
+# crate showed up as an address, and the capture's `FunctionInformation`, `SymbolStrings` and
+# `ModuleSymbols` tables came back empty. This costs nothing at runtime (the debug info lives in the
+# PDB, not in the code), adds no locals or types, and is what makes a capture readable.
+debug = "line-tables-only"

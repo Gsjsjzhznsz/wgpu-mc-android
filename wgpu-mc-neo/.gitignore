@@ -1,0 +1,54 @@
+# Mac OS 
+.DS_Store
+
+# Idea
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Eclipse
+*.launch
+
+# VSCode
+.settings/
+.vscode/
+bin/
+.classpath
+.project
+
+# Project
+run/
+
+# Project references, including VulkanMod, Radiance(and its MCVR), C2ME and Bye-Pregen
+references/
+
+# The demo's generated assets and the header cbindgen used to write into the Fabric tree, which this
+# repository no longer has a copy of.
+rust/wgpu-mc-demo/tmp
+rust/wgpu-mc-demo/res/assets
+
+# Ignore Gradle project-specific cache directory
+.gradle
+.gradle-home/
+
+# Ignore Gradle build output directory
+build/
+out/
+classes/
+
+target/
+
+*.log
+
+# direnv
+.direnv/
+
+# nix
+result
+
+# DeepSeek Harness
+/.dsh-tmp/
+
+/.kotlin
+/logs

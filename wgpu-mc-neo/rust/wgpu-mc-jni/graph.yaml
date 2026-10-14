@@ -1,0 +1,139 @@
+version: "2612.0.7"
+support: wgsl
+resources: {}
+pipelines:
+  # The terrain pass: the chunk sections the Rust baker meshed, drawn from the arena the section feed
+  # fills (`scene.chunk_buffer`). The vertex data is read out of that storage buffer by the shader -
+  # `@geo_terrain` carries no vertex buffers at all - and the pass is drawn once per frame per section
+  # the camera can see. See `RenderGraph::render` and `Scene`.
+  #
+  # The block atlas and the sampler are registered by `RenderGraph::new` itself, and the three
+  # matrices are the buffers `application.rs` creates; `@texture_depth` is the scene's own depth
+  # texture and `@framebuffer_texture` is whatever the caller hands the pass as its target.
+  #
+  # Bindings 5 and 6 are the *game's* block atlas, for the faces whose sprite the game animates: the
+  # face is baked with the game's own coordinates and flagged for it, and the game animates that atlas
+  # by rendering each due frame into it, so the fire moves without this renderer copying anything. The
+  # sampler is the one the game samples its atlas with - see `RenderGraph::new`.
+  #
+  # Bindings 7 and 8 are the game's **lightmap**, which is what the game's own terrain shader samples
+  # for its lighting (`sample_lightmap(Sampler2, UV2)`): one fetch per vertex, the colour interpolated
+  # across the quad, so the gamma, the brightness option, the time of day, night vision and the
+  # darkness effect all come from the game rather than from a curve written here. See `GAME_LIGHTMAP`.
+  #
+  # **This pipeline draws the cutout layer and not the solid one.** The two are separate pipelines
+  # because of one instruction: this shader's fragment stage has a `discard`, and a `discard` anywhere
+  # in a fragment shader is what makes a driver give up on early-Z and hierarchical-Z for the whole
+  # pipeline, since it cannot know whether a fragment survives until the shader has run. The solid
+  # layer is most of the screen, so drawing it through a shader with a test that can never fire cost it
+  # early-Z for nothing. `terrain_solid` below is the same shader without the test. Minecraft's own
+  # terrain is split the same way - `SOLID_TERRAIN` defines no `ALPHA_CUTOUT`, `CUTOUT_TERRAIN`
+  # declares 0.5 - and `terrain_layers` in `graph.rs` is where a layer is paired with its pipeline.
+  terrain:
+    geometry: "@geo_terrain"
+    depth: "@texture_depth"
+    output: [ "@framebuffer_texture" ]
+    # Minecraft's main target is an `Rgba8Unorm` texture of its own, not the surface: a pipeline built
+    # for the swapchain's `Bgra8Unorm` is refused by wgpu the moment it is set in a pass.
+    output_format: rgba8unorm
+    blending: replace
+    bind_groups:
+      0:
+        0: "@mat4_model"
+        1: "@mat4_view"
+        2: "@mat4_perspective"
+        3: "@texture_block_atlas"
+        4: "@sampler"
+        5: "@texture_mc_block_atlas"
+        6: "@sampler_mc_block_atlas"
+        7: "@texture_game_lightmap"
+        8: "@sampler_game_lightmap"
+        9: "@fog_environment"
+        10: "@sampler_mc_block_atlas_magnify"
+        11: "@sampler_block_atlas_magnify"
+        12: "@sampler_mc_block_atlas_animated"
+        13: "@sampler_block_atlas_animated"
+      1: "@bg_ssbo_chunks"
+      2: "@bg_section_draws"
+    immediates:
+      0: "@pc_section_position"
+
+  # The solid layer of the same arena: the opaque block models, which is most of what the terrain pass
+  # draws. A copy of `terrain` in every respect but one - its shader has no `discard` in it at all -
+  # and the copy is the price of wgpu having no pipeline-overridable constant, which is what one shader
+  # would need to compile the test out for one layer and in for another. `shader:` is what makes the
+  # graph read `wgpu_mc:shaders/terrain_solid.wgsl` rather than a file named after this pipeline.
+  terrain_solid:
+    geometry: "@geo_terrain"
+    shader: terrain_solid
+    depth: "@texture_depth"
+    output: [ "@framebuffer_texture" ]
+    output_format: rgba8unorm
+    blending: replace
+    bind_groups:
+      0:
+        0: "@mat4_model"
+        1: "@mat4_view"
+        2: "@mat4_perspective"
+        3: "@texture_block_atlas"
+        4: "@sampler"
+        5: "@texture_mc_block_atlas"
+        6: "@sampler_mc_block_atlas"
+        7: "@texture_game_lightmap"
+        8: "@sampler_game_lightmap"
+        9: "@fog_environment"
+        10: "@sampler_mc_block_atlas_magnify"
+        11: "@sampler_block_atlas_magnify"
+        12: "@sampler_mc_block_atlas_animated"
+        13: "@sampler_block_atlas_animated"
+      1: "@bg_ssbo_chunks"
+      2: "@bg_section_draws"
+    immediates:
+      0: "@pc_section_position"
+
+  # The translucent terrain pass: the transparent layer of the same arena, which is water, ice, stained
+  # glass and every other block model whose sprite blends.
+  #
+  # It is a pipeline of its own rather than a third layer of the one above because Minecraft's own
+  # terrain is two *groups* and not one pass - `ChunkSectionLayerGroup.TRANSLUCENT` is opened after the
+  # transparent features have been submitted, and its layer needs different pipeline state: it blends,
+  # it does not write depth, and it is drawn far-to-near. See `terrain_layers` in `graph.rs` for which
+  # layers each of the two draws, and `PipelineConfig::depth_write` for the depth half.
+  #
+  # `alpha_blending` is the game's own `BlendFunction.TRANSLUCENT`, and `rgba8unorm` is the same target
+  # as the opaque pass because the translucent target - which Minecraft only creates for the Fabulous
+  # preset and for a resource pack with a transparency post chain - does not exist here; see
+  # `TerrainPass` on the JVM side for what handles that case.
+  translucent_terrain:
+    geometry: "@geo_terrain_translucent"
+    # The same shader as `terrain`, which is the whole point: the two are one vertex and one fragment
+    # program with two sets of pipeline state. Without this the graph would look for
+    # `wgpu_mc:shaders/translucent_terrain.wgsl`, not find it, and skip the pipeline - which is a pass
+    # that never opens, a transparent layer nothing draws, and no error anywhere loud enough to notice.
+    shader: terrain
+    depth: "@texture_depth"
+    output: [ "@framebuffer_texture" ]
+    output_format: rgba8unorm
+    blending: alpha_blending
+    depth_write: false
+    bind_groups:
+      0:
+        0: "@mat4_model"
+        1: "@mat4_view"
+        2: "@mat4_perspective"
+        3: "@texture_block_atlas"
+        4: "@sampler"
+        5: "@texture_mc_block_atlas"
+        6: "@sampler_mc_block_atlas"
+        7: "@texture_game_lightmap"
+        8: "@sampler_game_lightmap"
+        9: "@fog_environment"
+        10: "@sampler_mc_block_atlas_magnify"
+        11: "@sampler_block_atlas_magnify"
+        12: "@sampler_mc_block_atlas_animated"
+        13: "@sampler_block_atlas_animated"
+      1: "@bg_ssbo_chunks"
+      2: "@bg_section_draws"
+    immediates:
+      0: "@pc_section_position"
+

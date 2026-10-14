@@ -1,0 +1,109 @@
+# Uses template from https://github.com/booyaa/gh-actions-template-rust which is licensed under MIT or Apache License Version 2.0
+name: Rust CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The toolchain is pinned to the dated nightly in rust/rust-toolchain.toml, not to "nightly",
+  # because rustfmt is free to change its mind about line breaking between two nightlies and clippy
+  # is free to grow lints. With a floating nightly the `fmt` and `clippy` jobs go red on commits that
+  # touched nothing they care about - and a red `fmt` job is a reflow of the whole tree, not a bug -
+  # so the pin is what makes these four jobs say something about the commit rather than about the
+  # day. `cargo`/`rustc` read the same file, so a workstation and this runner build the same tree.
+  #
+  # Moving the pin is a deliberate commit: bump it here and in rust/rust-toolchain.toml together,
+  # run `cargo fmt --all` and `cargo clippy -- -D warnings`, and commit whatever either asks for.
+  RUSTUP_TOOLCHAIN: nightly-2026-09-26
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-09-26
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - run: cargo check --manifest-path rust/Cargo.toml
+
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The tests that check this side of the bridge against the mod's own source - its Kotlin, its
+      # language files, the shaders it ships, `updates.json` - read them out of the Neolectrum checkout,
+      # and skip when it is not there. Without it this job would run green having checked only the half
+      # of the bridge that is in this repository, so the checkout is part of the job.
+      #
+      # It goes in `rust/neolectrum`, which is beside the workspace and therefore exactly where
+      # `modtree`'s first default candidate looks. `WGPU_MC_MOD_DIR` is deliberately not set: the
+      # second candidate is inside the repository root, and a checkout put there would be a
+      # repository inside a repository, so the sibling layout is the one this job exercises.
+      - name: checkout the mod
+        uses: actions/checkout@v4
+        with:
+          repository: NTS-Official/Neolectrum
+          path: rust/neolectrum
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-09-26
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - run: cargo test --manifest-path rust/Cargo.toml
+
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-09-26
+          components: rustfmt
+      - run: cargo fmt --manifest-path rust/Cargo.toml --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-09-26
+          components: clippy
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - run: cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings

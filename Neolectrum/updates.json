@@ -1,0 +1,17 @@
+{
+  "homepage": "https://github.com/NTS-Official/Neolectrum/releases",
+  "promos": {
+    "26.1.2-latest": "2612.0.8-beta",
+    "26.1.1-latest": "2612.0.8-beta",
+    "26.1-latest": "2612.0.8-beta"
+  },
+  "26.1.2": {
+    "2612.0.8-beta": "Beta build of the Rust terrain path for Minecraft 26.1.\n\nThe renderer is built against wgpu 30, and the mod now ships from its own repository rather than out of the engine's tree - this is the first build released that way.\nThe fullscreen setting is now a mode: exclusive fullscreen, borderless, or a window. The game's own F11 key keeps working and toggles between a window and whichever mode is chosen, and a fresh install opens in a window.\nMore of the render pass runs in Rust: the pipeline and uniform work, the indirect calls the terrain is drawn from, and the section feed.\n\nFull notes: https://github.com/NTS-Official/Neolectrum/blob/main/README.md"
+  },
+  "26.1.1": {
+    "2612.0.8-beta": "Beta build of the Rust terrain path for Minecraft 26.1.\n\nThis is the same jar for every 26.1.x hotfix; see the 26.1.2 entry for what it contains.\n\nFull notes: https://github.com/NTS-Official/Neolectrum/blob/main/README.md"
+  },
+  "26.1": {
+    "2612.0.8-beta": "Beta build of the Rust terrain path for Minecraft 26.1.\n\nThis is the same jar for every 26.1.x hotfix; see the 26.1.2 entry for what it contains.\n\nFull notes: https://github.com/NTS-Official/Neolectrum/blob/main/README.md"
+  }
+}

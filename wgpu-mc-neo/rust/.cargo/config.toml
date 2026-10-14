@@ -1,0 +1,21 @@
+# Android cross-compile linkers.
+#
+# These are the NDK's own clang wrappers, by name: any environment that can build these targets
+# has the NDK's `toolchains/llvm/prebuilt/<host>/bin` directory on its PATH (the CI installs it
+# there, and so does a local checkout that follows the README), and a plain name is how the
+# linker is found on every one of them - no absolute path that would only work on one machine.
+#
+# API 24 is the floor on purpose: `libvulkan.so` - the library the Vulkan backend loads - first
+# ships in Android 7.0, and every device the game runs on has Vulkan or the GLES fallback
+# reaches for the launcher's EGL stack instead. Both backends' requirements sit at or below 24.
+[target.aarch64-linux-android]
+linker = "aarch64-linux-android24-clang"
+
+[target.armv7-linux-androideabi]
+linker = "armv7-linux-androideabi24-clang"
+
+[target.x86_64-linux-android]
+linker = "x86_64-linux-android24-clang"
+
+[target.i686-linux-android]
+linker = "i686-linux-android24-clang"
