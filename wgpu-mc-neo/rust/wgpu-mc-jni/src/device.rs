@@ -1234,9 +1234,9 @@ pub fn createWmRendererOnAndroidSurface(
     width: jint,
     height: jint,
 ) -> jlong {
-    // Everything below reports through `log`, and on Android nothing else has installed a
-    // logger by this point - without this, the outcome lines this entry writes are dropped.
-    crate::ensure_android_logging();
+    // Everything below reports through `log`, and nothing else has installed a logger by this
+    // point - without this, the outcome lines this entry writes are dropped.
+    crate::install_env_logger();
 
     // `ANativeWindow_fromSurface` takes a reference on the window. The renderer presents to this
     // window for the life of the process - the JVM keeps its own reference to the `Surface`
@@ -1291,10 +1291,10 @@ pub fn createWmRendererOnAndroidSurface(
 #[cfg(target_os = "android")]
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn createWmRendererOnPojavWindow(mut env: JNIEnv, _: JClass) -> jlong {
-    // Everything below reports through `log`, and on Android nothing else has installed a
-    // logger by this point - without this, the outcome lines this entry writes are dropped
-    // and a failure like the window-in-use one is invisible behind the raw panic text.
-    crate::ensure_android_logging();
+    // Everything below reports through `log`, and nothing else has installed a logger by this
+    // point - without this, the outcome lines this entry writes are dropped and a failure like
+    // the window-in-use one is invisible behind the raw panic text.
+    crate::install_env_logger();
 
     let environ = unsafe { pojav_bridge::resolve_pojav_environ() };
     let native_window = if environ.is_null() {

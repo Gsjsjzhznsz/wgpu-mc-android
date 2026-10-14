@@ -75,18 +75,25 @@ mod abi_tests;
 #[cfg(test)]
 mod packaging;
 
-/// Installs the `log` pipeline on Android, once, from the first Android JNI entry that runs.
+/// Installs the `log` pipeline, once, no matter which entry reaches for it first.
 ///
-/// On the desktop the JVM calls [`setPanicHook`] early in `Main.main`, which is what installs
-/// `env_logger`; on Android nothing calls it before the renderer is created, and an install that
-/// never happened means every `info!`/`warn!` this crate writes is silently dropped - the exact
-/// blindness that made the first Android surface-creation failures undiagnosable from a game log
-/// where only the raw panic text arrived. `env_logger` writes to stderr, which the launcher's log
-/// pipe captures, so the same filter as `setPanicHook` turns the Android log into the desktop one.
-/// Harmless when it runs after `setPanicHook`: both install into the same global slot, the first
-/// one wins, and the filters agree.
-#[cfg(target_os = "android")]
-pub(crate) fn ensure_android_logging() {
+/// Two entries install logging: [`setPanicHook`], which the JVM calls during client setup on
+/// every platform, and the Android renderer entries, which need their logs before client setup
+/// reaches them - an install that never happened means every `info!`/`warn!` this crate writes
+/// is silently dropped, the exact blindness that made the first Android surface-creation
+/// failures undiagnosable from a game log where only the raw panic text arrived.
+///
+/// Idempotent by construction, because the second installer used to be a crash: `env_logger`'s
+/// `Builder::init` panics when a logger is already installed, and a panic crossing a JNI
+/// function's C ABI is a process abort. `try_init` turns "already there" into a no-op and the
+/// `Once` collapses concurrent first callers into a single builder, so every entry can
+/// unconditionally reach for the same pipeline and exactly one install happens.
+///
+/// The filter is written here and nowhere else, so both entries agree by sharing: this crate and
+/// `wgpu-mc` at `info`, `wgpu` and `naga` at `warn`, with `RUST_LOG` still overriding it.
+/// `env_logger` writes to stderr, which the launcher's log pipe captures, so this is what turns
+/// the Android log into the desktop one.
+pub(crate) fn install_env_logger() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -2998,15 +3005,13 @@ pub fn watchedBlockFaces(env: JNIEnv, _class: JClass) -> jstring {
 #[allow(unused_must_use)]
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn setPanicHook(env: JNIEnv, _class: JClass) {
-    // `env_logger::init` alone drops everything below `error`, which hides the renderer's own
-    // reporting (swapchain configuration, adapter choice, the frame dump). The default filter keeps
-    // this crate and `wgpu-mc` at `info` while leaving `wgpu` and `naga` at `warn`, so what is
-    // printed is the mod's own, and `RUST_LOG` still overrides it.
-    env_logger::Builder::from_env(
-        env_logger::Env::default()
-            .default_filter_or("wgpu_mc_jni=info,wgpu_mc=info,wgpu=warn,naga=warn"),
-    )
-    .init();
+    // Logging goes through the shared idempotent installer rather than a bare
+    // `Builder::init`: on desktop this is the first entry to reach it, on Android the renderer
+    // entries have already installed the same pipeline by the time client setup gets here, and
+    // `Builder::init` panics when a logger is already installed - a panic crossing this
+    // function's C ABI is a process abort, which is exactly what the double install produced.
+    // The filter's rationale lives on `install_env_logger`.
+    crate::install_env_logger();
 
     let jvm = env.get_java_vm().unwrap();
     let jvm_ptr = jvm.get_java_vm_pointer() as usize;
