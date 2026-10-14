@@ -34,7 +34,8 @@ object DebugReload {
 		Files.exists(Path.of(MARKER)) || Files.exists(Path.of("..", MARKER))
 	}
 
-	@JvmStatic
+	// No @JvmStatic here, ever. See the note in BlockCache.onClientTick: the static delegate
+	// it generates makes NeoForge's bus reject the KFF auto-registration of this object.
 	@SubscribeEvent
 	fun onClientTick(event: ClientTickEvent.Post) {
 		if (!marker || done) {

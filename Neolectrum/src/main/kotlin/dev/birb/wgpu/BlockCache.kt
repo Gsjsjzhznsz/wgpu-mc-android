@@ -646,7 +646,10 @@ object BlockCache {
 	}
 
 	@SubscribeEvent
-	@JvmStatic
+	// No @JvmStatic here, ever. KFF 6.3.0's AutoKotlinEventBusSubscriber registers this whole
+	// object via `gameBus.register(instance)`, and the new NeoForge event bus throws
+	// IllegalArgumentException when it finds a *static* @SubscribeEvent method on an instance
+	// registration - which is exactly what @JvmStatic generates (with the annotation copied).
 	fun onClientTick(event: ClientTickEvent.Post) {
 		val ticks = sinceReload
 		if (ticks >= 0) {

@@ -34,7 +34,8 @@ object DebugCamera {
 
 	private var reported = false
 
-	@JvmStatic
+	// No @JvmStatic here, ever. See the note in BlockCache.onClientTick: the static delegate
+	// it generates makes NeoForge's bus reject the KFF auto-registration of this object.
 	@SubscribeEvent
 	fun onClientTick(event: ClientTickEvent.Post) {
 		if (RendererSettings.bool(PIN_CAMERA) != true) {
