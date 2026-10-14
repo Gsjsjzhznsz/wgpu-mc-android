@@ -27,6 +27,10 @@ jobs:
   build:
     name: Rust (NDK) + mod jar
     runs-on: ubuntu-latest
+    # The release step creates a release and uploads the jar to it; the job's default GITHUB_TOKEN
+    # is read-only, and softprops/action-gh-release dies on the 403 that follows.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
