@@ -1085,8 +1085,30 @@ pub fn create_renderer(
             continue;
         }
 
-        let Some(wm) = try_create_renderer(&mut *env, backend, display, window) else {
-            continue;
+        // wgpu-hal's surface creation path is written with `expect`, and a panic reaching the
+        // JNI boundary cannot unwind - it aborts the process. Every panic inside a backend
+        // attempt is contained here instead: the failed backend is dropped the same way an
+        // `Err` is, and the next backend (or, at the bottom, the JVM's clean
+        // BackendCreationException) gets its turn.
+        let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            try_create_renderer(&mut *env, backend, display, window)
+        }));
+        let wm = match attempt {
+            Ok(Some(wm)) => wm,
+            Ok(None) => continue,
+            Err(payload) => {
+                let message = if let Some(text) = payload.downcast_ref::<&'static str>() {
+                    (*text).to_string()
+                } else if let Some(text) = payload.downcast_ref::<String>() {
+                    text.clone()
+                } else {
+                    "no panic message".to_string()
+                };
+                error!(
+                    "wgpu-mc: {backend:?} renderer creation panicked and was contained: {message}"
+                );
+                continue;
+            }
         };
 
         if backend != requested {
@@ -1174,6 +1196,16 @@ pub fn createWmRendererOnAndroidSurface(
         return 0;
     }
 
+    // Same hold, same release as the bridge path: a launcher that reaches this entry point
+    // through the Surface reflection may still be Pojav-family underneath, and the loading
+    // screen's GL attachment does not care which route found the window. On a launcher with
+    // no bridge at all this logs the trampoline message and moves on.
+    let environ = unsafe { pojav_bridge::resolve_pojav_environ() };
+    info!(
+        "wgpu-mc: {}",
+        unsafe { egl_release::release_window_attachment(environ) }
+    );
+
     let window = native_window as usize as u64;
     info!(
         "wgpu-mc: launcher surface is an ANativeWindow at {window:#x} ({}x{})",
@@ -1203,7 +1235,12 @@ pub fn createWmRendererOnAndroidSurface(
 #[cfg(target_os = "android")]
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn createWmRendererOnPojavWindow(mut env: JNIEnv, _: JClass) -> jlong {
-    let native_window = unsafe { pojav_bridge::resolve_pojav_window() };
+    let environ = unsafe { pojav_bridge::resolve_pojav_environ() };
+    let native_window = if environ.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe { (*environ).pojav_window }
+    };
     if native_window.is_null() {
         error!(
             "wgpu-mc: this launcher offers no Pojav-family bridge - getenv(\"POJAV_ENVIRON\") and \
@@ -1211,6 +1248,16 @@ pub fn createWmRendererOnPojavWindow(mut env: JNIEnv, _: JClass) -> jlong {
         );
         return 0;
     }
+
+    // The early loading screen's GL context still holds the window through the launcher's GL
+    // bridge (a Vulkan WSI surface under Zink or MobileGlues), and a Vulkan surface created
+    // beside it would die with VK_ERROR_NATIVE_WINDOW_IN_USE_KHR. Take the hold apart first;
+    // the outcome is information either way, and a failure here only means the surface
+    // creation below may fail on its own terms.
+    info!(
+        "wgpu-mc: {}",
+        unsafe { egl_release::release_window_attachment(environ) }
+    );
 
     // The launcher owns the window's lifetime and hands the same pointer to every renderer it
     // runs, but if the surface is ever recreated (rotation, foldable state) the launcher drops
@@ -1260,26 +1307,32 @@ pub fn createWmRendererOnPojavWindow(mut env: JNIEnv, _: JClass) -> jlong {
 mod pojav_bridge {
     use std::ffi::{c_char, c_void};
 
-    /// The first field of `struct pojav_environ_s` - `struct ANativeWindow* pojavWindow`.
-    /// Declared as a one-field struct on purpose: the rest of the layout differs between forks,
-    /// and nothing past offset 0 is read.
+    /// The head of `struct pojav_environ_s`. Only two fields are read, and both have sat in
+    /// these positions in every Pojav-family fork since 2022 (FCL's `environ/environ.h` is the
+    /// reference layout):
+    ///
+    /// - offset 0: `struct ANativeWindow* pojavWindow` - the game window every renderer draws
+    ///   into;
+    /// - offset 8: `basic_render_window_t* mainWindowBundle` - the first GL context bundle the
+    ///   bridge made current, which on a normal boot is the FML early loading screen's.
     #[repr(C)]
-    struct PojavEnvironHead {
-        pojav_window: *mut c_void,
+    pub struct PojavEnvironHead {
+        pub pojav_window: *mut c_void,
+        pub main_window_bundle: *mut c_void,
     }
 
-    /// The game window as an `ANativeWindow*`, or null when this process is not a
-    /// Pojav-family launcher (or the bridge is there but names no window).
-    pub unsafe fn resolve_pojav_window() -> *mut c_void {
-        if let Some(window) = window_from_environ_env() {
-            return window;
+    /// The launcher's shared environment struct, or null when this process is not a
+    /// Pojav-family launcher (or the bridge is there but names no struct).
+    pub unsafe fn resolve_pojav_environ() -> *mut PojavEnvironHead {
+        if let Some(environ) = unsafe { environ_from_env_var() } {
+            return environ;
         }
-        window_from_symbol().unwrap_or(std::ptr::null_mut())
+        unsafe { environ_from_symbol() }.unwrap_or(std::ptr::null_mut())
     }
 
     /// Route 1: the `POJAV_ENVIRON` environment variable, the way the launcher itself shares
     /// the struct with everything it loads.
-    unsafe fn window_from_environ_env() -> Option<*mut c_void> {
+    unsafe fn environ_from_env_var() -> Option<*mut PojavEnvironHead> {
         let value = std::env::var("POJAV_ENVIRON").ok()?;
         let digits = value.trim().trim_start_matches("0x").trim_start_matches("0X");
         let environ = usize::from_str_radix(digits, 16).ok()? as *mut PojavEnvironHead;
@@ -1288,14 +1341,28 @@ mod pojav_bridge {
         }
         // One dereference into a struct the launcher allocated and filled before this code
         // could possibly run - no synchronization is needed for a value that is write-once.
-        let window = unsafe { (*environ).pojav_window };
-        (!window.is_null()).then_some(window)
+        (!environ.is_null()).then_some(environ)
     }
 
     /// Route 2: the exported `pojav_environ` symbol, when the launcher's library is visible to
     /// this one. `dlsym` answers the address *of the global pointer variable*, so two
-    /// dereferences: pointer-to-pointer, then the window field.
-    unsafe fn window_from_symbol() -> Option<*mut c_void> {
+    /// dereferences: pointer-to-pointer, then the struct field.
+    unsafe fn environ_from_symbol() -> Option<*mut PojavEnvironHead> {
+        let variable = unsafe { dlsym_global(b"pojav_environ\0")? };
+        let environ = unsafe { *(variable as *mut *mut PojavEnvironHead) };
+        (!environ.is_null()).then_some(environ)
+    }
+
+    /// The address of a symbol visible in the global scope, or `None`. Both callers read
+    /// launcher-owned globals (`pojav_environ`, the EGL `*_p` trampolines), so the resolved
+    /// address is that of the *variable* and callers dereference it as their own type.
+    ///
+    /// `libpojavexec.so` lands in the same classloader linker namespace as this library - both
+    /// are loaded by the game JVM with `System.load`/`loadNative` - so `RTLD_DEFAULT` reaches
+    /// it. A fork that builds with symbol hiding defeats this, and every caller must treat
+    /// `None` as "the launcher does not offer this".
+    pub(super) unsafe fn dlsym_global(symbol: &[u8]) -> Option<*mut c_void> {
+        debug_assert!(symbol.last() == Some(&0));
         unsafe extern "C" {
             pub fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
         }
@@ -1303,17 +1370,226 @@ mod pojav_bridge {
         // `RTLD_DEFAULT` - the global scope. NULL on bionic, same as on glibc.
         const RTLD_DEFAULT: *mut c_void = std::ptr::null_mut();
 
-        let symbol = b"pojav_environ\0".as_ptr() as *const c_char;
-        let variable = unsafe { dlsym(RTLD_DEFAULT, symbol) };
-        if variable.is_null() {
-            return None;
+        let resolved = unsafe { dlsym(RTLD_DEFAULT, symbol.as_ptr() as *const c_char) };
+        (!resolved.is_null()).then_some(resolved)
+    }
+}
+
+/// Freeing the one `ANativeWindow` the launcher owns for the Vulkan surface.
+///
+/// This is the Android translation of the thing VulkanMod gets for free on desktop: there, the
+/// game window is created `NO_API` from birth (its `WindowMixin` clears every vanilla window
+/// hint and re-asks with `GLFW_CLIENT_API = GLFW_NO_API`), so the window its Vulkan surface
+/// attaches to never carried a live GL connection. Here the Pojav-family GLFW stub maps *every*
+/// GLFW window onto the same `ANativeWindow`, and FML's early loading screen opened its GL
+/// context on that window before any mod code ran - through the launcher's GL bridge, which on
+/// a Vulkan-backed GL implementation (Zink, MobileGlues DirectVulkan) binds the window with a
+/// Vulkan WSI surface of its own. Creating ours beside it dies with
+/// `VK_ERROR_NATIVE_WINDOW_IN_USE_KHR`, which inside wgpu-hal is an `expect` - and a panic
+/// crossing the JNI boundary aborts the process.
+///
+/// The bridge (FCL `ctxbridges/gl_bridge.c`, inherited from Pojav) is where the hold lives: the
+/// first context ever made current - the loading screen's - got an `EGLSurface` on the shared
+/// window, and that surface keeps the window attached for as long as it exists. This module
+/// takes the hold apart through the bridge's own exported EGL trampolines (`*_p` globals in
+/// `libpojavexec.so`, loaded from whatever GL implementation the launcher configured):
+///
+/// 1. **Current-thread route** - the loading screen's context was made current on the thread
+///    that ran `Main.main` (see `EarlyWindow.disarm`), and the device is created on that same
+///    render thread. `eglGetCurrentSurface(EGL_DRAW)` then names the offending surface
+///    directly; detach, destroy it, destroy the context. Mesa's WSI drops the window the
+///    moment the surface dies.
+/// 2. **Bundle route** - `pojav_environ->mainWindowBundle` is that same first-made-current
+///    context. `surface` and `context` sit at fixed offsets of `gl_render_window_t`, so they
+///    can be destroyed from any thread - though a surface that is still current on another
+///    thread may only be released lazily by the driver, so this route is best-effort and the
+///    current-thread route is what normally fires.
+///
+/// In both routes the bundle's stale handles are zeroed afterwards, so the stub cannot bind a
+/// destroyed EGLSurface again (FML's fatal-error path would otherwise makeCurrent a dangling
+/// handle). What that path loses - the splash cannot draw the crash screen once its window is
+/// gone - is the price of booting at all; a game that reaches a fatal error without a renderer
+/// had nothing to draw with in the first place.
+#[cfg(target_os = "android")]
+mod egl_release {
+    use std::ffi::c_void;
+
+    /// `EGL_DRAW` - the read surface of a context, which is the one bound to the window.
+    const EGL_DRAW: u32 = 0x3059;
+
+    /// One of the bridge's exported EGL trampoline variables: a global that *holds* a function
+    /// pointer, resolved from the same GL implementation the launcher's contexts run on.
+    struct Trampoline {
+        name: &'static [u8],
+    }
+
+    impl Trampoline {
+        /// Callers pass `b"name\0"` literals - the NUL is what `dlsym` needs.
+        fn new(name: &'static [u8]) -> Self {
+            Self { name }
         }
-        let environ = unsafe { *(variable as *mut *mut PojavEnvironHead) };
+
+        /// The function pointer the variable holds, or `None` when this launcher build does not
+        /// export it (older forks, or the symbol hidden by the linker namespace). Call sites
+        /// transmute the raw address to the signature they are calling through.
+        unsafe fn load(&self) -> Option<*mut c_void> {
+            let variable = unsafe { super::pojav_bridge::dlsym_global(self.name) }?;
+            let function = unsafe { *(variable as *mut *mut c_void) };
+            (!function.is_null()).then_some(function)
+        }
+    }
+
+    // Call shapes differ, so every trampoline is transmuted at its own call site. These name
+    // literals must stay NUL-terminated for `dlsym`.
+    fn trampolines() -> [Trampoline; 6] {
+        [
+            Trampoline::new(b"eglGetDisplay_p\0"),
+            Trampoline::new(b"eglGetCurrentSurface_p\0"),
+            Trampoline::new(b"eglGetCurrentContext_p\0"),
+            Trampoline::new(b"eglMakeCurrent_p\0"),
+            Trampoline::new(b"eglDestroySurface_p\0"),
+            Trampoline::new(b"eglDestroyContext_p\0"),
+        ]
+    }
+
+    /// Detaches and destroys the GL connection that holds the shared window, as far as this
+    /// process allows. Answers with a short human-readable outcome for the caller to log;
+    /// failure is not fatal to the caller, it just means the surface creation may meet a
+    /// window that is still in use.
+    pub unsafe fn release_window_attachment(
+        environ: *mut super::pojav_bridge::PojavEnvironHead,
+    ) -> &'static str {
+        let [
+            get_display,
+            get_current_surface,
+            get_current_context,
+            make_current,
+            destroy_surface,
+            destroy_context,
+        ] = trampolines();
+
+        // A missing trampoline only amputates the routes that need it, and the messages below
+        // say which.
+        let (Some(get_display), Some(get_current_surface), Some(make_current), Some(destroy_surface)) = (
+            unsafe { get_display.load() },
+            unsafe { get_current_surface.load() },
+            unsafe { make_current.load() },
+            unsafe { destroy_surface.load() },
+        ) else {
+            return "the launcher's EGL trampolines are not visible to this library, so the \
+                    loading screen's window attachment cannot be released";
+        };
+
+        // The bridge created its display with `eglGetDisplay(EGL_DEFAULT_DISPLAY)`; asking the
+        // same question through the same trampoline hands back the same, already-initialized
+        // display - `g_EglDisplay` is `static` in the bridge, so this is the way to reach it.
+        type EglGetDisplay = unsafe extern "C" fn(native_display: usize) -> *mut c_void;
+        let get_display: EglGetDisplay = unsafe { std::mem::transmute(get_display) };
+        let display = unsafe { get_display(0 /* EGL_DEFAULT_DISPLAY */) };
+        if display.is_null() {
+            return "the launcher's EGL display could not be resolved, so the loading screen's \
+                    window attachment cannot be released";
+        }
+
+        type EglGetCurrentSurface = unsafe extern "C" fn(readdraw: u32) -> *mut c_void;
+        let get_current_surface: EglGetCurrentSurface =
+            unsafe { std::mem::transmute(get_current_surface) };
+        type EglGetCurrentContext = unsafe extern "C" fn() -> *mut c_void;
+        let get_current_context: Option<EglGetCurrentContext> = unsafe { get_current_context.load() }
+            .map(|raw| unsafe { std::mem::transmute(raw) });
+        type EglMakeCurrent = unsafe extern "C" fn(
+            dpy: *mut c_void,
+            draw: *mut c_void,
+            read: *mut c_void,
+            ctx: *mut c_void,
+        ) -> u32;
+        let make_current: EglMakeCurrent = unsafe { std::mem::transmute(make_current) };
+        type EglDestroySurface = unsafe extern "C" fn(dpy: *mut c_void, surface: *mut c_void) -> u32;
+        let destroy_surface: EglDestroySurface = unsafe { std::mem::transmute(destroy_surface) };
+        type EglDestroyContext = unsafe extern "C" fn(dpy: *mut c_void, context: *mut c_void) -> u32;
+        let destroy_context: Option<EglDestroyContext> = unsafe { destroy_context.load() }
+            .map(|raw| unsafe { std::mem::transmute(raw) });
+
+        // Route 1: this thread holds the loading screen's context current (it does when the
+        // device is created on the render thread, which is where `Main.main` ran).
+        let current_surface = unsafe { get_current_surface(EGL_DRAW) };
+        if !current_surface.is_null() {
+            // Read the context before the detach zeroes it.
+            let current_context =
+                get_current_context.map(|query| unsafe { query() }).unwrap_or(std::ptr::null_mut());
+
+            unsafe {
+                make_current(
+                    display,
+                    std::ptr::null_mut(), /* EGL_NO_SURFACE */
+                    std::ptr::null_mut(), /* EGL_NO_SURFACE */
+                    std::ptr::null_mut(), /* EGL_NO_CONTEXT */
+                )
+            };
+            unsafe { destroy_surface(display, current_surface) };
+            if let (true, Some(destroy_context)) = (!current_context.is_null(), destroy_context) {
+                // The loading screen is long closed; its context is dead weight that would
+                // otherwise hold the last EGL objects alive.
+                unsafe { destroy_context(display, current_context) };
+            }
+            unsafe { super::egl_release::null_bundle_handles(environ) };
+            return "released the loading screen's EGL surface (current-thread route)";
+        }
+
+        // Route 2: wrong thread (or the context was already detached) - destroy through the
+        // bundle. A driver may defer the release while another thread holds the surface
+        // current; that is this route's documented best-effort limit.
+        if unsafe { super::egl_release::destroy_bundle_surface(environ, display, destroy_surface) } {
+            return "destroyed the loading screen's EGL surface through the environment bundle \
+                    (cross-thread route; the driver may defer the release)";
+        }
+
+        "no live GL connection to the shared window was found - either the loading screen \
+         never bound one, or a previous run released it"
+    }
+
+    /// The bundle's `context`/`surface` fields of `gl_render_window_t` (offsets 40 and 48 in
+    /// FCL's layout; `EGLContext`/`EGLSurface` are pointers), zeroed so the stub cannot bind
+    /// the destroyed handles again.
+    unsafe fn bundle_fields(environ: *mut super::pojav_bridge::PojavEnvironHead) -> Option<(*mut *mut c_void, *mut *mut c_void)> {
         if environ.is_null() {
             return None;
         }
-        let window = unsafe { (*environ).pojav_window };
-        (!window.is_null()).then_some(window)
+        let bundle = unsafe { (*environ).main_window_bundle };
+        if bundle.is_null() {
+            return None;
+        }
+        let base = bundle as *mut *mut c_void;
+        Some((unsafe { base.add(5) }, unsafe { base.add(6) })) // 40 / 8, 48 / 8
+    }
+
+    unsafe fn null_bundle_handles(environ: *mut super::pojav_bridge::PojavEnvironHead) {
+        if let Some((context, surface)) = (unsafe { bundle_fields(environ) }) {
+            unsafe { context.write(std::ptr::null_mut()) };
+            unsafe { surface.write(std::ptr::null_mut()) };
+        }
+    }
+
+    unsafe fn destroy_bundle_surface(
+        environ: *mut super::pojav_bridge::PojavEnvironHead,
+        display: *mut c_void,
+        destroy_surface: unsafe extern "C" fn(dpy: *mut c_void, surface: *mut c_void) -> u32,
+    ) -> bool {
+        let Some((context, surface)) = (unsafe { bundle_fields(environ) }) else {
+            return false;
+        };
+        let surface_handle = unsafe { surface.read() };
+        if surface_handle.is_null() {
+            return false;
+        }
+        let destroyed = unsafe { destroy_surface(display, surface_handle) } == 1 /* EGL_TRUE */;
+        if destroyed {
+            unsafe { surface.write(std::ptr::null_mut()) };
+            // The context cannot be destroyed from here while another thread holds it current,
+            // but the surface was the window attachment; leave the context handle in place.
+            let _ = context;
+        }
+        destroyed
     }
 }
 
