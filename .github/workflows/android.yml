@@ -36,24 +36,16 @@ jobs:
           distribution: temurin
           java-version: "25"
 
-      - name: Set up the Android NDK
-        id: ndk
-        uses: nttld/setup-ndk@v1
-        with:
-          # r28 is the current LTS line; the wrappers this build calls by name
-          # (`aarch64-linux-android24-clang` and friends, see rust/.cargo/config.toml) have been
-          # in every NDK since r19.
-          ndk-version: r28b
-          add-to-path: true
-
-      - name: Put the NDK's clang wrappers on PATH
+      - name: Download the Android NDK and put its clang wrappers on PATH
         shell: bash
-        # `add-to-path` puts the NDK *root* there - `ndk-build` is findable, the toolchain bin
-        # directory one level deeper is not, and cargo resolves the linker by name against that
-        # directory. Walking from `ndk-build` needs no knowledge of where the action installs.
+        # Downloaded directly rather than through an action: one URL, one unzip, and the
+        # toolchain bin directory is known before the next step starts. The wrappers this build
+        # calls by name (`aarch64-linux-android24-clang` and friends, see rust/.cargo/config.toml)
+        # have been in every NDK since r19.
         run: |
-          ndk_bin="$(dirname "$(command -v ndk-build)")/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          echo "$ndk_bin" >> "$GITHUB_PATH"
+          curl -sSfL -o "$RUNNER_TEMP/ndk.zip" https://dl.google.com/android/repository/android-ndk-r28b-linux.zip
+          unzip -q "$RUNNER_TEMP/ndk.zip" -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/android-ndk-r28b/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
           command -v aarch64-linux-android24-clang
 
       - name: Install the pinned Rust toolchain and the Android targets
