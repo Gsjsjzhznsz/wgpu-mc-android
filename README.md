@@ -29,8 +29,8 @@ java.io.FileNotFoundException: Could not find lib libwgpu_mc_jni.so in jar
 | 文件 | 改动 |
 |---|---|
 | `settings.rs` | `GraphicsBackend` 新增 `GLES`（OpenGL ES）变体；`is_available_here()` 把 `target_os = "android"` 算进 Vulkan；Android 上 Vulkan 的后备后端是 GLES（桌面仍是 Vulkan↔DX12） |
-| `device.rs` | `surface_target()` 新增 `#[cfg(target_os = "android")]` 分支，用 `AndroidNdkWindowHandle` 包 `ANativeWindow*`；`wgpu_backends()` 增加 `GLES → Backends::GL`；新增 JNI 入口 `createWmRendererOnAndroidSurface`（`ANativeWindow_fromSurface`）；`MAPPABLE_PRIMARY_BUFFERS` / `DEPTH_CLIP_CONTROL` 改为“适配器有才要”——Mali 的 Vulkan 驱动常缺 `VK_EXT_depth_clip_control`，原先的无条件请求会直接让设备创建失败（这两个 feature 全仓库没有任何 pipeline 实际使用） |
-| `Cargo.toml` | `cfg(target_os = "android")` 下新增 `ndk = "0.9"`（`native_window` feature，链接 `libandroid`） |
+| `device.rs` | `surface_target()` 新增 `#[cfg(target_os = "android")]` 分支，用 `AndroidNdkWindowHandle` 包 `ANativeWindow*`；`wgpu_backends()` 增加 `GLES → Backends::GL`；新增 JNI 入口 `createWmRendererOnAndroidSurface`（`ANativeWindow_fromSurface`，直接对 `libandroid.so` 声明，规避 `ndk` crate 的 API 34+ `libnativewindow.so` 链接依赖）；`MAPPABLE_PRIMARY_BUFFERS` / `DEPTH_CLIP_CONTROL` 改为“适配器有才要”——Mali 的 Vulkan 驱动常缺 `VK_EXT_depth_clip_control`，原先的无条件请求会直接让设备创建失败（这两个 feature 全仓库没有任何 pipeline 实际使用） |
+| `Cargo.toml` | 移除从未使用的 `winit` 依赖（它在 android target 会拖进无法编译的 `android-activity`）；Android target 零新增依赖——三个 `ANativeWindow` 函数直接对 `libandroid.so` 声明 |
 | `rust/.cargo/config.toml`（新增） | 四个 Android target 的 NDK clang 链接器名（API 24 起，`libvulkan.so` 的最低版本） |
 
 ### CI（`.github/workflows/android.yml`）
