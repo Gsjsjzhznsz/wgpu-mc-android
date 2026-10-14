@@ -1175,9 +1175,25 @@ fn per_draw_declaration(
         show_struct_field(&mut fields, field);
     }
 
+    // A zero pad is a legitimate answer, not a degenerate one: it is what the JVM's arithmetic
+    // produces whenever `CHUNK_SECTION_UBO_SIZE` is already a multiple of the device's uniform
+    // offset alignment, so the ring stride is the members' own size and the padding has nothing
+    // to span. GLSL - and naga's GLSL frontend along with it - rejects a zero-length array
+    // outright (`Array size must be greater than zero`, which is the crash a device with such an
+    // alignment produced as its first terrain shader was compiled), and clamping to one would be
+    // worse than illegal: a member that is not there is what leaves the array stride at the
+    // members' size, while one phantom `vec4` would push every record past the first sixteen
+    // bytes beyond where the game wrote it. So the padding member simply does not exist when
+    // there is nothing for it to do.
+    let pad_member = if pad > 0 {
+        format!("vec4 _wm_pad[{pad}];\n")
+    } else {
+        String::new()
+    };
+
     Some(format!(
         "layout(std430, set = {set}, binding = {binding}) readonly buffer {name}Block {{\n\
-         {fields}vec4 _wm_pad[{pad}];\n}} {PER_DRAW_ARRAY}[];"
+         {fields}{pad_member}}} {PER_DRAW_ARRAY}[];"
     ))
 }
 
@@ -1964,7 +1980,7 @@ void main() {
 }"#;
 
     /// Both stages through the whole preprocessor with `ChunkSection` declared as a per-draw block.
-    fn rewritten() -> (String, String) {
+    fn rewritten_with(directives: &str) -> (String, String) {
         let locations: HashMap<String, (u32, u32)> = [
             ("ChunkSection".to_string(), (0u32, 1u32)),
             ("Projection".to_string(), (0u32, 0u32)),
@@ -1977,13 +1993,17 @@ void main() {
         let result = process_shaders(
             VERTEX,
             FRAGMENT,
-            "#define WM_CHUNK_PAD 10\n",
+            directives,
             &locations,
             [("Position".to_string(), 0u32)].into_iter().collect(),
             &per_draw,
         );
 
         (result.vert, result.frag)
+    }
+
+    fn rewritten() -> (String, String) {
+        rewritten_with("#define WM_CHUNK_PAD 10\n")
     }
 
     /// The vertex stage has the one thing a batched draw can carry per record, so it reads the block.
@@ -2013,6 +2033,24 @@ void main() {
         );
         assert!(
             vert.contains("wmTextureSize = vec2(wmPerDraw[gl_InstanceIndex].TextureSize);"),
+            "{vert}"
+        );
+    }
+
+    /// A pad of zero is what the JVM's arithmetic produces whenever the block's size already sits
+    /// on the device's uniform offset alignment - the ring stride is then the members' own size,
+    /// and the declaration must carry no padding member at all: a zero-length array is illegal
+    /// GLSL, and one phantom `vec4` would misread every record past the first. See
+    /// [`per_draw_declaration`].
+    #[test]
+    fn a_zero_pad_declares_no_padding_member() {
+        let (vert, _) = rewritten_with("#define WM_CHUNK_PAD 0\n");
+
+        assert!(vert.contains("readonly buffer ChunkSectionBlock"), "{vert}");
+        assert!(vert.contains("wmPerDraw[]"), "{vert}");
+        assert!(!vert.contains("_wm_pad"), "{vert}");
+        assert!(
+            vert.contains("wmPerDraw[gl_InstanceIndex].ChunkPosition"),
             "{vert}"
         );
     }
@@ -2105,6 +2143,26 @@ void main() {
 
         if let Some(error) = naga_error(&frag, naga::ShaderStage::Fragment) {
             panic!("naga rejects the rewritten terrain fragment shader: {error}\n{frag}");
+        }
+    }
+
+    /// The zero-pad declaration through naga, because that is where the crash was: a device whose
+    /// uniform offset alignment divides the block's size made the JVM send `WM_CHUNK_PAD 0`, and the
+    /// declaration that carried `vec4 _wm_pad[0]` died in naga's GLSL frontend - `Array size must be
+    /// greater than zero` - on the first terrain shader the device ever asked for. What ships now
+    /// (the block with no padding member at all) must parse, not merely look right.
+    #[test]
+    fn zero_pad_survives_naga() {
+        use wgpu_mc::wgpu::naga;
+
+        let (vert, frag) = rewritten_with("#define WM_CHUNK_PAD 0\n");
+
+        if let Some(error) = naga_error(&vert, naga::ShaderStage::Vertex) {
+            panic!("naga rejects the zero-pad terrain vertex shader: {error}\n{vert}");
+        }
+
+        if let Some(error) = naga_error(&frag, naga::ShaderStage::Fragment) {
+            panic!("naga rejects the zero-pad terrain fragment shader: {error}\n{frag}");
         }
     }
 }
