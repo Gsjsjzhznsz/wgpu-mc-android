@@ -48,10 +48,13 @@ jobs:
 
       - name: Put the NDK's clang wrappers on PATH
         shell: bash
-        # `add-to-path` puts the NDK *root* there; cargo resolves the linker by name against the
-        # per-host toolchain bin directory one level deeper, and that directory is what has to be
-        # on PATH for `aarch64-linux-android24-clang` to be found.
-        run: echo "${{ steps.ndk.outputs.ndk-root }}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+        # `add-to-path` puts the NDK *root* there - `ndk-build` is findable, the toolchain bin
+        # directory one level deeper is not, and cargo resolves the linker by name against that
+        # directory. Walking from `ndk-build` needs no knowledge of where the action installs.
+        run: |
+          ndk_bin="$(dirname "$(command -v ndk-build)")/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "$ndk_bin" >> "$GITHUB_PATH"
+          command -v aarch64-linux-android24-clang
 
       - name: Install the pinned Rust toolchain and the Android targets
         shell: bash
