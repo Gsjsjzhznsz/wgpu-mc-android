@@ -67,7 +67,8 @@ class WgpuCompiledRenderPipeline private constructor(
      * `precompilePipeline`'s report honest about what failed - instead of a screen that renders
      * everything except the frames that bound it, which is to say nothing at all.
      */
-    private val valid: Boolean = WmNative.isRenderPipelineValid(first)
+    private val valid: Boolean =
+        WmNative.isRenderPipelineValid.invokeExact(first) as Boolean
 
     override fun isValid(): Boolean = valid
 
