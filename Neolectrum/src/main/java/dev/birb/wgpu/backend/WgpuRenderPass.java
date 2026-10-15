@@ -213,6 +213,18 @@ public class WgpuRenderPass implements RenderPassBackend {
     /** The location of the pipeline bound now, for the diagnostics that name one. */
     private String activePipelineName = null;
 
+    /**
+     * Whether the driver refused the pipeline bound now, which every draw of this pass must skip.
+     *
+     * <p>A refused pipeline is one the native side holds as invalid, and a draw that binds an
+     * invalid pipeline fails the render pass - which poisons the frame's whole command encoder, so
+     * the frame is discarded at submit and the screen shows nothing at all. That is exactly what
+     * the android.12 build did on two Adreno devices: one refused entity pipeline, and every world
+     * frame after it black. The native side refuses such draws on its own as a last resort; the
+     * skip here is the same answer one call earlier, before the draw call is even made.</p>
+     */
+    private boolean activePipelineInvalid = false;
+
     private int openDebugGroups;
 
     public WgpuRenderPass(
@@ -365,6 +377,14 @@ public class WgpuRenderPass implements RenderPassBackend {
                 WgpuCompiledRenderPipeline.of(device, pipeline, device.defaultShaderSource(), wantsDepth);
         this.activePipeline = compiled.forDepth(wantsDepth);
         this.activePipelineName = pipeline.getLocation().toString();
+        this.activePipelineInvalid = !compiled.isValid();
+
+        if (activePipelineInvalid && REFUSED_DRAWS.add(activePipelineName)) {
+            dev.birb.wgpu.WgpuMcMod.LOGGER.error(
+                    "wgpu: {} was refused by the driver, so every draw that binds it is skipped; "
+                            + "the rest of the frame renders",
+                    activePipelineName);
+        }
 
         // The slots of the new plan, and everything bound so far re-emitted into them: the same
         // binding name sits in a different slot under a different pipeline, so what was written for
@@ -1332,6 +1352,14 @@ public class WgpuRenderPass implements RenderPassBackend {
             return;
         }
 
+        if (activePipelineInvalid) {
+            // The driver refused this pipeline at compilation - see `activePipelineInvalid`. A draw
+            // that binds it would fail the render pass and discard the whole frame at submit, so it
+            // is skipped here, before the native call: the pass loses these draws and keeps the
+            // rest, which is a missing entity rather than a missing world.
+            return;
+        }
+
         if (activePipeline.equals(MemorySegment.NULL) || bindings == null) {
             // Blaze3D never draws without a pipeline; if it ever does, the call would dereference a
             // null pipeline inside wgpu.
@@ -1367,11 +1395,16 @@ public class WgpuRenderPass implements RenderPassBackend {
         }
 
         if (!recorded) {
-            // Unreachable while the native side only refuses a draw that left its bindings behind. If
-            // it ever happens, the picture is missing draws rather than wrong ones.
-            dev.birb.wgpu.WgpuMcMod.LOGGER.error(
-                    "wgpu: the native side refused a draw of {} that carried its bindings",
-                    activePipelineName);
+            // Unreachable while the native side only refuses a draw that left its bindings behind -
+            // and near-reachable since the depth-variant refusals: a pipeline whose first variant
+            // compiled can still have its other variant refused, which `isValid` cannot see. The
+            // draw is skipped either way, and the picture is missing draws rather than wrong ones.
+            // Once per pipeline, because this fires per draw and a log has to stay a report.
+            if (REFUSED_DRAWS.add(activePipelineName)) {
+                dev.birb.wgpu.WgpuMcMod.LOGGER.error(
+                        "wgpu: the native side refused a draw of {} that carried its bindings",
+                        activePipelineName);
+            }
         }
     }
 
@@ -1728,6 +1761,12 @@ public class WgpuRenderPass implements RenderPassBackend {
      */
     private <T> int batch(
             List<RenderPass.Draw<T>> run, GpuBuffer indexBuffer, VertexFormat.IndexType indexType) {
+        if (activePipelineInvalid) {
+            // The driver refused this pipeline - see `activePipelineInvalid`. Zero sends the caller
+            // down the one-draw-at-a-time path, where `record` skips every draw of it as well.
+            return 0;
+        }
+
         RenderPass.Draw<T> first = run.get(0);
         setVertexBuffer(first.slot(), first.vertexBuffer());
         setIndexBuffer(indexBuffer, indexType);

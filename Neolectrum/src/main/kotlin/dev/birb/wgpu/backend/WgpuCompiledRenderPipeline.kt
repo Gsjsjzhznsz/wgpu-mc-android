@@ -56,7 +56,20 @@ class WgpuCompiledRenderPipeline private constructor(
      */
     private val variants = Variants(if (firstHasDepth) first else null, if (firstHasDepth) null else first)
 
-    override fun isValid(): Boolean = true
+    /**
+     * Whether the driver actually built this pipeline, asked once at construction and never again -
+     * the native side decides it at creation (see [WmNative.isRenderPipelineValid]) and it does not
+     * change after.
+     *
+     * A pipeline the driver refused is one every draw of which the native side would refuse too: a
+     * bound invalid pipeline fails the render pass and poisons the frame's whole command encoder,
+     * so the honest answer here is what keeps the game skipping its draws on this side - and keeps
+     * `precompilePipeline`'s report honest about what failed - instead of a screen that renders
+     * everything except the frames that bound it, which is to say nothing at all.
+     */
+    private val valid: Boolean = WmNative.isRenderPipelineValid(first)
+
+    override fun isValid(): Boolean = valid
 
     /**
      * The native pipeline to draw with in a pass that has a depth attachment or does not.
@@ -932,7 +945,7 @@ internal const val CHUNK_SECTION = "ChunkSection"
  * block and the dynamic offset it always had - the path that was measured before any of this existed.
  */
 private val TERRAIN_SECTION_STORAGE: Boolean by lazy {
-	WmNative.batchingPossible.invokeExact() as Boolean
+        WmNative.batchingPossible.invokeExact() as Boolean
 }
 
 /**

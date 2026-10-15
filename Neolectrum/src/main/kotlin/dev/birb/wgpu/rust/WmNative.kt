@@ -835,6 +835,23 @@ object WmNative {
     @JvmField val dropRenderPipeline: MethodHandle =
         handle("drop_render_pipeline", FunctionDescriptor.ofVoid(PTR))
 
+    /**
+     * Whether the driver actually built this pipeline.
+     *
+     * `(pipeline) -> bool`. A driver that refuses a pipeline's SPIR-V - wgpu's `Unexpected`, the
+     * `VK_ERROR_INVALID_SHADER_NV` class some Adreno parts answer with - still hands back a handle,
+     * one wgpu registers as invalid; the native side marks it at creation (it runs the creation
+     * under error scopes, which is the only way to see the refusal wgpu's infallible API hides)
+     * and refuses every draw that would bind it, because a bound invalid pipeline fails the render
+     * pass and poisons the frame's whole command encoder - every pass of the frame is discarded at
+     * submit and the screen shows nothing at all. This is the answer `isValid` reports, so the
+     * game skips its draws on this side before the native draw call is even made.
+     *
+     * Null answers yes: a null pipeline is the empty variant slot, and nobody draws through it.
+     */
+    @JvmField val isRenderPipelineValid: MethodHandle =
+        handle("is_render_pipeline_valid", FunctionDescriptor.of(ValueLayout.JAVA_BOOLEAN, PTR))
+
     @JvmField val maxTextureSize: MethodHandle =
         handle("max_texture_size", FunctionDescriptor.of(INT, PTR))
 
