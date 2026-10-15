@@ -3658,8 +3658,13 @@ fn dump_shaders(name: &str, vert: &str, frag: &str) {
 /// validates a binding without a declared minimum against the shader's block at draw time anyway, so
 /// asking naga once per pipeline is cheaper than being told about it per draw, and it is the only
 /// number that cannot be wrong about how large that block is.
-fn reflected_block_sizes(vert: &str, frag: &str) -> HashMap<String, u64> {
+fn reflected_block_sizes(vert: &str, frag: &str) -> (HashMap<String, u64>, bool) {
     let mut sizes = HashMap::new();
+    // Whether naga parsed *both* stages. A stage it refused is a shader wgpu will refuse too - the
+    // same frontend, a few lines later - and the caller wants to know that before it decides what
+    // reaches the disk: text naga has already rejected must never become a cache entry, or the next
+    // launch loads the refusal back as if it were a shader.
+    let mut both_parsed = true;
 
     for (stage, source) in [
         (naga::ShaderStage::Vertex, vert),
@@ -3679,6 +3684,7 @@ fn reflected_block_sizes(vert: &str, frag: &str) -> HashMap<String, u64> {
                     "wgpu-mc: naga would not parse the preprocessed {stage:?} shader for reflection"
                 );
             }
+            both_parsed = false;
             continue;
         };
 
@@ -3728,7 +3734,7 @@ fn reflected_block_sizes(vert: &str, frag: &str) -> HashMap<String, u64> {
         info!("wgpu-mc: reflected block sizes: {sizes:?}");
     }
 
-    sizes
+    (sizes, both_parsed)
 }
 
 /// Index buffers that turn a triangle fan into a triangle list, one per index count.
@@ -4635,29 +4641,48 @@ pub unsafe extern "C" fn compile_render_pipeline(
                     &plan.per_draw_storage(),
                 );
 
+                // A translation is a miss whether or not it survives: the counter is the report's
+                // "translated" half, and whether to keep it is the decision just below.
+                crate::shader_cache::count_translation();
+
                 // The reflection pass parses both shaders again, through naga this time, so it is the
                 // other half of what a cache hit saves - and it depends on nothing but the two
                 // strings above, which is why it can be cached with them.
-                let block_sizes = reflected_block_sizes(&vert, &frag);
+                let (block_sizes, parses) = reflected_block_sizes(&vert, &frag);
 
-                crate::shader_cache::store(
-                    &cache_key,
-                    &crate::shader_cache::Translation {
-                        vert: vert.clone(),
-                        frag: frag.clone(),
-                        cube_samplers: sampler_types
-                            .iter()
-                            .map(|(name, ty)| {
-                                (
-                                    name.clone(),
-                                    matches!(ty, TypeSpecifierNonArray::SamplerCube),
-                                )
-                            })
-                            .collect(),
-                        implicit_uniforms: implicit_uniforms.clone(),
-                        block_sizes: block_sizes.iter().map(|(k, v)| (k.clone(), *v)).collect(),
-                    },
-                );
+                if parses {
+                    crate::shader_cache::store(
+                        &cache_key,
+                        &crate::shader_cache::Translation {
+                            vert: vert.clone(),
+                            frag: frag.clone(),
+                            cube_samplers: sampler_types
+                                .iter()
+                                .map(|(name, ty)| {
+                                    (
+                                        name.clone(),
+                                        matches!(ty, TypeSpecifierNonArray::SamplerCube),
+                                    )
+                                })
+                                .collect(),
+                            implicit_uniforms: implicit_uniforms.clone(),
+                            block_sizes: block_sizes.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+                        },
+                    );
+                } else {
+                    // What naga refuses here, wgpu refuses a few lines from now - that failure
+                    // reaches its caller exactly as before. What it must not be is a disk entry:
+                    // a build whose preprocessor emitted a zero-length pad array once cached that
+                    // text before any parse ran, and the next build - with the fix in it - loaded
+                    // the poison back and crashed identically, because the entry's key still
+                    // matched. Not caching costs one re-translation per launch of a pipeline that
+                    // dies anyway, and it keeps the directory holding nothing but text naga
+                    // accepted, whichever build wrote it.
+                    log::info!(
+                        "wgpu-mc: the processed shaders for {} do not parse, so they are not cached",
+                        render_pipeline_description.name
+                    );
+                }
 
                 (vert, frag, sampler_types, implicit_uniforms, block_sizes)
             }

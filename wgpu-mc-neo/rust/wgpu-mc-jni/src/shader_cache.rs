@@ -33,7 +33,12 @@ use serde::{Deserialize, Serialize};
 ///
 /// The key includes this, so an entry written by an older build is never read by a newer one - and
 /// the `version` file below clears the directory instead of leaving the files to accumulate.
-const FORMAT_VERSION: u32 = 1;
+///
+/// 2: the per-draw pad member is skipped when `WM_CHUNK_PAD` is zero, where every earlier build
+/// emitted `vec4 _wm_pad[0]` - and *stored* it, because writing to the cache happened before any
+/// parse of the text. Every entry format 1 left behind is a shader that cannot compile, which is
+/// why the crash survived the fix itself until this bump wiped the directory.
+const FORMAT_VERSION: u32 = 2;
 
 /// Where the entries live, under the run directory.
 const DIRECTORY: &str = "wgpu-shader-cache";
@@ -242,12 +247,14 @@ pub fn load(key: &str) -> Option<Translation> {
 
 /// Writes a translation out, atomically: a half-written entry is one the next launch would fail to
 /// read, and the failure would look like a shader bug.
+///
+/// The caller has already counted the translation ([`count_translation`]) and decided this text is
+/// worth keeping - see the store-or-not decision at the only call site, which exists so that text
+/// naga refuses never reaches the disk at all.
 pub fn store(key: &str, translation: &Translation) {
     let Some(directory) = CACHE.directory.as_ref() else {
         return;
     };
-
-    CACHE.misses.fetch_add(1, Ordering::Relaxed);
 
     let Ok(json) = serde_json::to_vec(translation) else {
         log::warn!("wgpu-mc: a processed shader could not be serialised; it is not cached");
@@ -285,6 +292,16 @@ pub fn stats() -> (u64, u64) {
         CACHE.hits.load(Ordering::Relaxed),
         CACHE.misses.load(Ordering::Relaxed),
     )
+}
+
+/// Counts one translation, whether or not it ends up on disk.
+///
+/// The miss counter is the "translated" half of the report, and a translation naga refuses is still
+/// a translation - just not one worth keeping. Counting it here rather than inside [`store`] is
+/// what lets the keep-or-discard decision live with the caller: a discard must still be visible in
+/// the numbers, or a run full of refused shaders would report as if nothing had been translated.
+pub fn count_translation() {
+    CACHE.misses.fetch_add(1, Ordering::Relaxed);
 }
 
 /// A line saying what the cache did, written once when the first pipelines are compiled.
