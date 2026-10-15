@@ -2274,7 +2274,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc2f4eb4bc735547cfed7c0a4922cbd04a4655978c09b54f1f7b228750664c34"
 dependencies = [
  "cfg-if",
- "windows-targets 0.52.6",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -2516,8 +2516,7 @@ source = "git+https://github.com/rust-embedded-community/multi-map.git#9f686b494
 [[package]]
 name = "naga"
 version = "30.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a616d2fb8c89516ac2723a581f69d6c18576046bed761bd6b305e5618e6ae130"
+source = "git+https://github.com/Gsjsjzhznsz/naga?branch=main#3451c93aa2e53f1aa3159aab1b24cbf5a4ef7744"
 dependencies = [
  "arrayvec",
  "bit-set",

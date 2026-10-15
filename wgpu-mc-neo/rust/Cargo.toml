@@ -22,6 +22,19 @@ members = [
 # through the path dependency in `wgpu-mc-jni`, so it stays out of this one.
 exclude = ["cyntax"]
 
+# **The one divergence from the published naga**: its SPIR-V backend decorated the
+# fragment stage's `BuiltIn FrontFacing` bool input with `Flat`, which Qualcomm's
+# Adreno A6xx driver answers with VK_ERROR_INVALID_SHADER_NV - and wgpu turns that
+# into a lost device, so every two-sided-lit pipeline (`PER_FACE_LIGHTING`, the whole
+# armor family) killed the renderer on a Snapdragon while Mali accepted it. The
+# VUID the decoration cites (`StandaloneSpirv-Flat-04744`) mandates Flat for integer
+# and double inputs only, and glslang never emits it on gl_FrontFacing, which is the
+# shape every other Vulkan program ships. The fix is one match arm in the fork; it
+# stays one commit on top of the exact published source, and [patch.crates-io] is
+# what keeps it pinned to the same `naga = 30.0.1` wgpu already depends on.
+[patch.crates-io]
+naga = { git = "https://github.com/Gsjsjzhznsz/naga", branch = "main" }
+
 [profile.release]
 # Line tables, and only line tables, in the PDB beside the library.
 #

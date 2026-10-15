@@ -70,6 +70,11 @@ mod timing;
 #[cfg(test)]
 mod abi_tests;
 
+/// Task 14's regression: the Adreno `FrontFacing` + `Flat` device loss, its generated
+/// GLSL, and the SPIR-V shape the fix promises the driver.
+#[cfg(test)]
+mod adreno_front_facing;
+
 /// Checks the mod's own metadata: the version NeoForge is told in its `updates.json` against
 /// the version this tree builds. See the module for why nothing else can notice that they disagree.
 #[cfg(test)]
