@@ -9,7 +9,9 @@ use crate::{MinecraftResourceManagerAdapter, RENDERER};
 use futures::executor::block_on;
 use glsl::syntax::TypeSpecifierNonArray;
 use jni::JNIEnv;
-use jni::objects::{JClass, JObject};
+use jni::objects::JClass;
+#[cfg(target_os = "android")]
+use jni::objects::JObject;
 use jni::sys::{jint, jlong};
 use jni_fn::jni_fn;
 use log::{error, info, warn};
@@ -25,7 +27,6 @@ use std::path::PathBuf;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use wgpu_mc::wgpu::util::{BufferInitDescriptor, DeviceExt};
 use wgpu_mc::wgpu::{
     Color, CurrentSurfaceTexture, Extent3d, Limits, Operations, Origin3d, PresentMode,
     ShaderSource, SurfaceTexture, TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfo,
@@ -855,7 +856,10 @@ fn try_create_renderer(
         required_features |= wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;
     }
 
-    if adapter.features().contains(wgpu::Features::DEPTH_CLIP_CONTROL) {
+    if adapter
+        .features()
+        .contains(wgpu::Features::DEPTH_CLIP_CONTROL)
+    {
         required_features |= wgpu::Features::DEPTH_CLIP_CONTROL;
     }
 
@@ -985,6 +989,40 @@ fn try_create_renderer(
             return None;
         }
     };
+
+    // **Every wgpu error that no error scope caught ends in the game log, not in an abort.**
+    //
+    // Left to its own devices, wgpu answers an uncaptured error by panicking:
+    // `default_error_handler` writes one line to the `log` crate - which the default filter
+    // may not even show - and then panics with the error, and a panic inside a JNI
+    // `extern "C"` cannot unwind, so the process dies with nothing but "failed to initiate
+    // panic, error 5" to its name. The Adreno 830 report was exactly that shape: a buffer
+    // creation that had been refused, a util function that mapped the refused handle anyway,
+    // and no line anywhere carrying what the actual complaint was. Logging here keeps the
+    // process alive through a device that renders wrong - a wrong picture still plays, a
+    // dead process tells nobody anything - and, far more usefully, it names every call and
+    // every cause that leads to one of these.
+    //
+    // The first 64 land verbatim, so the first failure carries its full chain; after that
+    // one line per thousand, because a lost device turns every call of every frame into an
+    // error and a log has to stay a report rather than become a firehose.
+    device.on_uncaptured_error(Arc::new(|error| {
+        static REPORTED: AtomicU64 = AtomicU64::new(0);
+        let reported = REPORTED.fetch_add(1, Ordering::Relaxed);
+        if reported < 64 || reported.is_multiple_of(1000) {
+            error!("wgpu-mc: uncaptured wgpu error: {error}");
+        }
+    }));
+
+    // **The device being lost is not an uncaptured error at all.** wgpu routes a loss to this
+    // callback and then answers every later call with a contagious-invalidity resource, and
+    // `lose()` itself logs nothing - which is how a driver-side loss could take rendering down
+    // with no line naming it until some util panic blamed a buffer it had just failed to
+    // create. This is the one place the trigger is ever written down, so it is logged loudly
+    // and always: a loss happens once, not per frame.
+    device.set_device_lost_callback(|reason, message| {
+        error!("wgpu-mc: the device was lost ({reason:?}): {message}");
+    });
 
     let pipeline_cache = create_pipeline_cache(&device, &adapter);
 
@@ -1257,10 +1295,9 @@ pub fn createWmRendererOnAndroidSurface(
     // screen's GL attachment does not care which route found the window. On a launcher with
     // no bridge at all this logs the trampoline message and moves on.
     let environ = unsafe { pojav_bridge::resolve_pojav_environ() };
-    info!(
-        "wgpu-mc: {}",
-        unsafe { egl_release::release_window_attachment(environ) }
-    );
+    info!("wgpu-mc: {}", unsafe {
+        egl_release::release_window_attachment(environ)
+    });
 
     let window = native_window as usize as u64;
     info!(
@@ -1315,10 +1352,9 @@ pub fn createWmRendererOnPojavWindow(mut env: JNIEnv, _: JClass) -> jlong {
     // beside it would die with VK_ERROR_NATIVE_WINDOW_IN_USE_KHR. Take the hold apart first;
     // the outcome is information either way, and a failure here only means the surface
     // creation below may fail on its own terms.
-    info!(
-        "wgpu-mc: {}",
-        unsafe { egl_release::release_window_attachment(environ) }
-    );
+    info!("wgpu-mc: {}", unsafe {
+        egl_release::release_window_attachment(environ)
+    });
 
     // The launcher owns the window's lifetime and hands the same pointer to every renderer it
     // runs, but if the surface is ever recreated (rotation, foldable state) the launcher drops
@@ -1343,7 +1379,13 @@ pub fn createWmRendererOnPojavWindow(mut env: JNIEnv, _: JClass) -> jlong {
         native_window as usize, width, height
     );
 
-    create_renderer(&mut env, 0, native_window as usize as u64, width as u32, height as u32)
+    create_renderer(
+        &mut env,
+        0,
+        native_window as usize as u64,
+        width as u32,
+        height as u32,
+    )
 }
 
 /// The Pojav-family launcher bridge: finding the game's `ANativeWindow` without any help from
@@ -1395,7 +1437,10 @@ mod pojav_bridge {
     /// the struct with everything it loads.
     unsafe fn environ_from_env_var() -> Option<*mut PojavEnvironHead> {
         let value = std::env::var("POJAV_ENVIRON").ok()?;
-        let digits = value.trim().trim_start_matches("0x").trim_start_matches("0X");
+        let digits = value
+            .trim()
+            .trim_start_matches("0x")
+            .trim_start_matches("0X");
         let environ = usize::from_str_radix(digits, 16).ok()? as *mut PojavEnvironHead;
         if environ.is_null() {
             return None;
@@ -1552,10 +1597,14 @@ mod egl_release {
             }
 
             let plain = self.plain_name();
-            let driver = std::env::var("POJAVEXEC_EGL").ok().filter(|v| !v.is_empty());
+            let driver = std::env::var("POJAVEXEC_EGL")
+                .ok()
+                .filter(|v| !v.is_empty());
             if let Some(value) = driver {
                 if let Ok(path) = std::ffi::CString::new(value) {
-                    if let Some(handle) = (unsafe { super::pojav_bridge::dlopen_loaded(path.as_ptr()) }) {
+                    if let Some(handle) =
+                        (unsafe { super::pojav_bridge::dlopen_loaded(path.as_ptr()) })
+                    {
                         if let Some(function) =
                             (unsafe { super::pojav_bridge::dlsym_in(handle, &plain) })
                         {
@@ -1620,12 +1669,18 @@ mod egl_release {
         // A missing trampoline only amputates the routes that need it, and the messages below
         // say which. Each one itself falls back through the driver library and the global EGL
         // before giving up, so a launcher with hidden `*_p` globals is still handled.
-        let (Some(get_display), Some(get_current_surface), Some(make_current), Some(destroy_surface)) = (
+        let (
+            Some(get_display),
+            Some(get_current_surface),
+            Some(make_current),
+            Some(destroy_surface),
+        ) = (
             unsafe { get_display.load() },
             unsafe { get_current_surface.load() },
             unsafe { make_current.load() },
             unsafe { destroy_surface.load() },
-        ) else {
+        )
+        else {
             return "no EGL entry points could be resolved - not the bridge's *_p trampolines, \
                     not the driver library POJAVEXEC_EGL names, nor the process's global EGL - \
                     so the loading screen's window attachment cannot be released";
@@ -1636,7 +1691,9 @@ mod egl_release {
         // display - `g_EglDisplay` is `static` in the bridge, so this is the way to reach it.
         type EglGetDisplay = unsafe extern "C" fn(native_display: usize) -> *mut c_void;
         let get_display: EglGetDisplay = unsafe { std::mem::transmute(get_display) };
-        let display = unsafe { get_display(0 /* EGL_DEFAULT_DISPLAY */) };
+        let display = unsafe {
+            get_display(0 /* EGL_DEFAULT_DISPLAY */)
+        };
         if display.is_null() {
             return "the launcher's EGL display could not be resolved, so the loading screen's \
                     window attachment cannot be released";
@@ -1646,8 +1703,8 @@ mod egl_release {
         let get_current_surface: EglGetCurrentSurface =
             unsafe { std::mem::transmute(get_current_surface) };
         type EglGetCurrentContext = unsafe extern "C" fn() -> *mut c_void;
-        let get_current_context: Option<EglGetCurrentContext> = unsafe { get_current_context.load() }
-            .map(|raw| unsafe { std::mem::transmute(raw) });
+        let get_current_context: Option<EglGetCurrentContext> =
+            unsafe { get_current_context.load() }.map(|raw| unsafe { std::mem::transmute(raw) });
         type EglMakeCurrent = unsafe extern "C" fn(
             dpy: *mut c_void,
             draw: *mut c_void,
@@ -1655,19 +1712,22 @@ mod egl_release {
             ctx: *mut c_void,
         ) -> u32;
         let make_current: EglMakeCurrent = unsafe { std::mem::transmute(make_current) };
-        type EglDestroySurface = unsafe extern "C" fn(dpy: *mut c_void, surface: *mut c_void) -> u32;
+        type EglDestroySurface =
+            unsafe extern "C" fn(dpy: *mut c_void, surface: *mut c_void) -> u32;
         let destroy_surface: EglDestroySurface = unsafe { std::mem::transmute(destroy_surface) };
-        type EglDestroyContext = unsafe extern "C" fn(dpy: *mut c_void, context: *mut c_void) -> u32;
-        let destroy_context: Option<EglDestroyContext> = unsafe { destroy_context.load() }
-            .map(|raw| unsafe { std::mem::transmute(raw) });
+        type EglDestroyContext =
+            unsafe extern "C" fn(dpy: *mut c_void, context: *mut c_void) -> u32;
+        let destroy_context: Option<EglDestroyContext> =
+            unsafe { destroy_context.load() }.map(|raw| unsafe { std::mem::transmute(raw) });
 
         // Route 1: this thread holds the loading screen's context current (it does when the
         // device is created on the render thread, which is where `Main.main` ran).
         let current_surface = unsafe { get_current_surface(EGL_DRAW) };
         if !current_surface.is_null() {
             // Read the context before the detach zeroes it.
-            let current_context =
-                get_current_context.map(|query| unsafe { query() }).unwrap_or(std::ptr::null_mut());
+            let current_context = get_current_context
+                .map(|query| unsafe { query() })
+                .unwrap_or(std::ptr::null_mut());
 
             unsafe {
                 make_current(
@@ -1693,12 +1753,14 @@ mod egl_release {
         // keep the display - and through it, potentially the window's driver state - alive for
         // nothing. If some thread does still hold it current, EGL defers the destruction, which
         // is the documented best-effort limit of this route.
-        if unsafe { super::egl_release::destroy_bundle_surface(
-            environ,
-            display,
-            destroy_surface,
-            destroy_context,
-        ) } {
+        if unsafe {
+            super::egl_release::destroy_bundle_surface(
+                environ,
+                display,
+                destroy_surface,
+                destroy_context,
+            )
+        } {
             return "destroyed the loading screen's EGL surface and context through the \
                     environment bundle (cross-thread route)";
         }
@@ -1710,7 +1772,9 @@ mod egl_release {
     /// The bundle's `context`/`surface` fields of `gl_render_window_t` (offsets 40 and 48 in
     /// FCL's layout; `EGLContext`/`EGLSurface` are pointers), zeroed so the stub cannot bind
     /// the destroyed handles again.
-    unsafe fn bundle_fields(environ: *mut super::pojav_bridge::PojavEnvironHead) -> Option<(*mut *mut c_void, *mut *mut c_void)> {
+    unsafe fn bundle_fields(
+        environ: *mut super::pojav_bridge::PojavEnvironHead,
+    ) -> Option<(*mut *mut c_void, *mut *mut c_void)> {
         if environ.is_null() {
             return None;
         }
@@ -1733,7 +1797,9 @@ mod egl_release {
         environ: *mut super::pojav_bridge::PojavEnvironHead,
         display: *mut c_void,
         destroy_surface: unsafe extern "C" fn(dpy: *mut c_void, surface: *mut c_void) -> u32,
-        destroy_context: Option<unsafe extern "C" fn(dpy: *mut c_void, context: *mut c_void) -> u32>,
+        destroy_context: Option<
+            unsafe extern "C" fn(dpy: *mut c_void, context: *mut c_void) -> u32,
+        >,
     ) -> bool {
         let Some((context, surface)) = (unsafe { bundle_fields(environ) }) else {
             return false;
@@ -3785,11 +3851,12 @@ pub(crate) fn fan_indices(device: &wgpu::Device, index_count: u32) -> Option<wgp
                     indices.push(triangle + 2);
                 }
 
-                device.create_buffer_init(&BufferInitDescriptor {
-                    label: Some("wgpu-mc fan indices"),
-                    contents: bytemuck_cast_slice(&indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                })
+                create_buffer_with_contents(
+                    device,
+                    "wgpu-mc fan indices",
+                    wgpu::BufferUsages::INDEX,
+                    bytemuck_cast_slice(&indices),
+                )
             })
             .clone(),
     )
@@ -3829,11 +3896,12 @@ pub(crate) fn quad_indices(
                 ]);
             }
 
-            device.create_buffer_init(&BufferInitDescriptor {
-                label: Some("wgpu-mc quad indices"),
-                contents: bytemuck_cast_slice(&indices),
-                usage: wgpu::BufferUsages::INDEX,
-            })
+            create_buffer_with_contents(
+                device,
+                "wgpu-mc quad indices",
+                wgpu::BufferUsages::INDEX,
+                bytemuck_cast_slice(&indices),
+            )
         })
         .clone();
 
@@ -5280,11 +5348,28 @@ pub extern "C" fn write_buffer_with(
     data: *const u8,
     len: u64,
 ) {
-    let mut view = wm
+    // An empty write is a no-op - and `NonZero` would refuse to carry it, so the guard is
+    // what keeps a zero-length upload from being an abort rather than nothing.
+    if len == 0 {
+        return;
+    }
+
+    // `write_buffer_with` answers a buffer that cannot be written - one the device refused
+    // to create, or one an outstanding mapping pins - with `None`. That is a report, not a
+    // reason to die: the error sink already carries the why, the caller gets nothing back
+    // from this call either way, and the frame it belongs to is no better off for a process
+    // that is no longer there.
+    let Some(mut view) = wm
         .gpu
         .queue
         .write_buffer_with(buffer, 0, NonZero::new(len).unwrap())
-        .unwrap();
+    else {
+        error!(
+            "wgpu-mc: a write of {len} bytes into a buffer was refused, and the write was \
+             dropped: the error sink carries the reason"
+        );
+        return;
+    };
 
     view.copy_from_slice(unsafe { std::slice::from_raw_parts(data, len as usize) });
 }
@@ -5327,7 +5412,27 @@ pub extern "C" fn allocate_gpu_buffer_mapped(
         mapped_at_creation: true,
     });
 
-    buffer.unmap();
+    // A creation that was refused - the answer a lost device gives, silently - hands back a
+    // handle whose every use raises the same error, `unmap` among them: a refused buffer that
+    // was unmapped unconditionally used to reach the default error handler and, through it,
+    // the abort. Probing the map instead of assuming it keeps this entry point off that path
+    // the same way `create_buffer_init` is off it; a zero-sized buffer has no map to probe,
+    // and its unmap is as unconditional as it always was.
+    if size == 0 {
+        buffer.unmap();
+    } else {
+        match buffer.get_mapped_range_mut(..) {
+            Ok(mapping) => {
+                drop(mapping);
+                buffer.unmap();
+            }
+            Err(map_error) => {
+                error!(
+                    "wgpu-mc: a pooled buffer of {size} bytes could not be created: {map_error}"
+                );
+            }
+        }
+    }
 
     Box::new(buffer)
 }
@@ -6420,6 +6525,68 @@ pub extern "C" fn blit_from_texture(
     flush_shared_encoder(wm);
 }
 
+/// The size a buffer carrying `len` bytes of initial data is created at, which is the util
+/// function's own rule: empty contents make a zero-sized buffer, anything else is at least one
+/// copy-alignment block.
+fn buffer_size_for_contents(len: usize) -> u64 {
+    if len == 0 {
+        0
+    } else {
+        (len as u64).max(wgpu::COPY_BUFFER_ALIGNMENT)
+    }
+}
+
+/// Creates a buffer and fills it with `contents`, the way `DeviceExt::create_buffer_init` does -
+/// minus the panic the util function ends in when the creation was refused.
+///
+/// The util maps the buffer it just created without ever asking whether the creation succeeded.
+/// wgpu answers a refused creation with a contagious-invalidity handle - the error goes to the
+/// error sink, the handle goes to the caller - and the util's `get_mapped_range_mut` on that
+/// handle panics. That panic is how the Adreno 830 crash surfaced: the device had been lost
+/// moments earlier, every creation after it was refused, and `particles.png sprite UBOs` was the
+/// first buffer this util path touched. Here a refused map is a log line naming the buffer and
+/// the reason, the caller gets the same invalid handle its own later calls would have tripped
+/// over anyway, and the process stays alive for the rest of the log to say what happened.
+///
+/// The size comes from [`buffer_size_for_contents`]. Callers whose sizes are already a multiple
+/// of 16 - the JVM entry points round up - pay nothing for the floor; the two index caches are
+/// multiples of four by construction.
+pub(crate) fn create_buffer_with_contents(
+    device: &wgpu::Device,
+    label: &str,
+    usage: wgpu::BufferUsages,
+    contents: &[u8],
+) -> wgpu::Buffer {
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: buffer_size_for_contents(contents.len()),
+        usage,
+        mapped_at_creation: !contents.is_empty(),
+    });
+
+    if !contents.is_empty() {
+        match buffer.get_mapped_range_mut(..) {
+            Ok(mut mapping) => {
+                mapping.slice(..contents.len()).copy_from_slice(contents);
+                drop(mapping);
+                buffer.unmap();
+            }
+            Err(map_error) => {
+                // No `unmap` here: unmap on a buffer that was never really created raises its
+                // own error, and the buffer is dead regardless - the handle is returned so the
+                // caller's later uses meet the same refusal through the same error sink.
+                error!(
+                    "wgpu-mc: the buffer '{label}' could not be created, so its {} initial \
+                     bytes were never written: {map_error}",
+                    contents.len(),
+                );
+            }
+        }
+    }
+
+    buffer
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn create_buffer_init(
     wm: &WmRenderer,
@@ -6460,11 +6627,10 @@ pub extern "C" fn create_buffer_init(
 
     BUFFER_CREATES.fetch_add(1, Ordering::Relaxed);
 
-    let buffer = wm.gpu.device.create_buffer_init(&BufferInitDescriptor {
-        label: Some(label.to_str().unwrap()),
-        usage: wgpu_usage_flags,
-        contents: &padded_data,
-    });
+    // The fill is done by hand rather than through `DeviceExt::create_buffer_init`; see
+    // [`create_buffer_with_contents`] for why, and for what a refused creation does here.
+    let label = label.to_str().unwrap_or("unlabeled JVM buffer");
+    let buffer = create_buffer_with_contents(&wm.gpu.device, label, wgpu_usage_flags, &padded_data);
 
     LIVE_BUFFER_COUNT.fetch_add(1, Ordering::Relaxed);
     LIVE_BUFFER_BYTES.fetch_add(size, Ordering::Relaxed);
@@ -7092,5 +7258,29 @@ mod buffer_pool_tests {
         assert!(the_pool_has_room(0, 0, POOL_BYTES - 1024, 1024));
         assert!(!the_pool_has_room(0, 0, POOL_BYTES - 1024, 2048));
         assert!(!the_pool_has_room(0, 0, 0, POOL_BYTES + 1));
+    }
+}
+
+#[cfg(test)]
+mod created_buffer_size_tests {
+    use super::*;
+
+    /// **The sizes `create_buffer_with_contents` asks for are the sizes `DeviceExt::create_buffer_init`
+    /// asked for**, because the pool keys on `padded_data.len()` and every buffer the JVM binds is sized
+    /// against what the bind group was validated with. Empty contents are the one case the util answered
+    /// with a zero-sized buffer and no mapping; anything else sits on the copy-alignment floor, which the
+    /// JVM-rounded sizes and the index caches never reach.
+    #[test]
+    fn the_size_rule_is_the_util_functions_size_rule() {
+        assert_eq!(buffer_size_for_contents(0), 0);
+
+        // `particles.png sprite UBOs` for one animated sprite: sixteen bytes, a multiple of 16.
+        assert_eq!(buffer_size_for_contents(16), 16);
+
+        // The index caches: a fan of three is three `u32`s, a multiple of four.
+        assert_eq!(buffer_size_for_contents(12), 12);
+
+        // Below the floor, the floor: the util's `.max(COPY_BUFFER_ALIGNMENT)`.
+        assert_eq!(buffer_size_for_contents(1), 4);
     }
 }

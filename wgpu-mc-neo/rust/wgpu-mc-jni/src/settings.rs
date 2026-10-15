@@ -718,6 +718,10 @@ pub enum GraphicsBackend {
     Vulkan,
     #[strum(serialize = "DirectX 12")]
     DirectX12,
+    // `GLES`, not `Gles`: the name is the abbreviation every driver, every wgpu document and
+    // this renderer's own settings use, and the JSON the settings panel reads back is built
+    // from these names.
+    #[allow(clippy::upper_case_acronyms)]
     #[strum(serialize = "OpenGL ES")]
     GLES,
 }
