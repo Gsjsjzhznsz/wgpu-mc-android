@@ -46,7 +46,7 @@ const ENTITY_DIRECTIVES: &str = "#version 440\n\n#define WM_CHUNK_PAD 2\n";
 /// snippet uniforms in snippet order, then the samplers - of which `NO_OVERLAY` leaves
 /// `Sampler0` and `Sampler2`. The numbers themselves are an approximation; what matters
 /// for the emitted text is that every block and shim the shaders declare has one.
-fn entity_locations(with_overlay: bool) -> HashMap<String, (u32, u32)> {
+pub(crate) fn entity_locations(with_overlay: bool) -> HashMap<String, (u32, u32)> {
     let mut locations: HashMap<String, (u32, u32)> = [
         ("DynamicTransforms".to_string(), (0u32, 0u32)),
         ("Projection".to_string(), (0u32, 1u32)),
@@ -74,7 +74,7 @@ fn entity_locations(with_overlay: bool) -> HashMap<String, (u32, u32)> {
 }
 
 /// `DefaultVertexFormat.NEW_ENTITY`, in element order.
-fn entity_vertex_layout() -> HashMap<String, u32> {
+pub(crate) fn entity_vertex_layout() -> HashMap<String, u32> {
     [
         ("Position".to_string(), 0u32),
         ("Color".to_string(), 1u32),
@@ -104,15 +104,15 @@ fn final_glsl(directives: &str, with_overlay: bool) -> (String, String) {
 
 /// `OpDecorate`'s opcode, the `Decoration` numbers, and the `BuiltIn` numbers the
 /// checks below walk the module for.
-const OP_DECORATE: u32 = 71;
-const DECORATION_BUILT_IN: u32 = 11;
-const DECORATION_FLAT: u32 = 14;
-const BUILT_IN_FRONT_FACING: u32 = 17;
+pub(crate) const OP_DECORATE: u32 = 71;
+pub(crate) const DECORATION_BUILT_IN: u32 = 11;
+pub(crate) const DECORATION_FLAT: u32 = 14;
+pub(crate) const BUILT_IN_FRONT_FACING: u32 = 17;
 
 /// The SPIR-V words wgpu-hal would hand the driver for `source`: the same naga frontend
 /// the reflection pass uses, then the backend the Vulkan device runs inside
 /// `create_shader_module`.
-fn spirv_words(source: &str, stage: wgpu_mc::wgpu::naga::ShaderStage) -> Vec<u32> {
+pub(crate) fn spirv_words(source: &str, stage: wgpu_mc::wgpu::naga::ShaderStage) -> Vec<u32> {
     use wgpu_mc::wgpu::naga;
 
     let mut frontend = naga::front::glsl::Frontend::default();
@@ -147,7 +147,7 @@ fn spirv_words(source: &str, stage: wgpu_mc::wgpu::naga::ShaderStage) -> Vec<u32
 /// Walks the module's `OpDecorate` instructions. Returns `(builtin_ids, flat_ids)`:
 /// every id decorated `BuiltIn <literal>` per builtin number, and every id decorated
 /// `Flat`.
-fn decorations(spv: &[u32]) -> (HashMap<u32, u32>, HashSet<u32>) {
+pub(crate) fn decorations(spv: &[u32]) -> (HashMap<u32, u32>, HashSet<u32>) {
     let mut builtins = HashMap::new();
     let mut flats = HashSet::new();
 

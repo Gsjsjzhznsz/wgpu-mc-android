@@ -32,8 +32,33 @@ exclude = ["cyntax"]
 # shape every other Vulkan program ships. The fix is one match arm in the fork; it
 # stays one commit on top of the exact published source, and [patch.crates-io] is
 # what keeps it pinned to the same `naga = 30.0.1` wgpu already depends on.
+#
+# **The one divergence from the published wgpu-hal**: `Instance::from_raw` created the
+# debug-utils messenger unconditionally whenever the driver listed VK_EXT_debug_utils.
+# The Adreno 830 driver (Snapdragon 8 Elite, build 7853d15211) lists the extension and
+# accepts it in vkCreateInstance, yet answers vkGetInstanceProcAddr with null for
+# `vkCreateDebugUtilsMessengerEXT` on the launch right after another process of the
+# game lost its device - and ash's stub for an unresolved function pointer panics from
+# an `extern "system"` frame, which cannot unwind, so the whole game aborted with exit
+# code 6 before a single frame of that launch. The fork asks the driver for the pointer
+# first and degrades to "no debug messenger, no labels" when it is missing; on a driver
+# that behaves, the code is bit-identical to upstream. Same pinning story as naga: one
+# commit on the exact published source, held by [patch.crates-io].
+#
+# **The one divergence from the published wgpu-core**: every driver refusal that is
+# neither OOM nor DEVICE_LOST - wgpu's `Unexpected`, which is what `VK_ERROR_INVALID_
+# SHADER_NV` and friends map to - ran through `Device::lose` at the four creation sites
+# that can carry one, so a single pipeline the driver rejected ended the renderer: a
+# black screen, a dead swapchain and a relaunch, for one vendor SPIR-V opinion (the
+# Task 12-15 Adreno losses all landed here). The fork downgrades exactly that error
+# class at exactly those four sites: the refused module or pipeline never comes into
+# existence, every later use of its handle is wgpu's ordinary invalid-resource
+# validation error, and the game loses the draws that pipeline would have made instead
+# of all of them. A genuinely gone device still answers `Lost` and still loses.
 [patch.crates-io]
 naga = { git = "https://github.com/Gsjsjzhznsz/naga", branch = "main" }
+wgpu-hal = { git = "https://github.com/Gsjsjzhznsz/wgpu-hal", branch = "main" }
+wgpu-core = { git = "https://github.com/Gsjsjzhznsz/wgpu-core", branch = "main" }
 
 [profile.release]
 # Line tables, and only line tables, in the PDB beside the library.

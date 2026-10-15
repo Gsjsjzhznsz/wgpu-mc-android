@@ -1019,6 +1019,41 @@ fn try_create_renderer(
         if reported < 64 || reported.is_multiple_of(1000) {
             error!("wgpu-mc: uncaptured wgpu error: {error}");
         }
+
+        // **A refused pipeline or shader module is the driver-refusal shape, and it no
+        // longer costs the device** - the wgpu-core fork (see the note in the workspace
+        // Cargo.toml) fails exactly that call instead of losing the device, which also
+        // means the device-lost callback never hears about it. This is where the
+        // refusal gets its attribution now: the pipeline whose compilation was last
+        // started, with the exact text the driver was handed, written out the way a
+        // loss would be. `LAST_PIPELINE_COMPILING` is taken here, so one dump per
+        // refusal; the next compilation sets it again.
+        let text = error.to_string();
+        if text.contains("create_render_pipeline")
+            || text.contains("create_shader_module")
+            || text.contains("create_compute_pipeline")
+        {
+            let compiling = LAST_PIPELINE_COMPILING.lock().take();
+            if let Some(compilation) = &compiling {
+                error!(
+                    "wgpu-mc: the driver refused {} - writing its shaders out now",
+                    compilation.name
+                );
+                dump_pipeline_refused_or_lost(
+                    compilation,
+                    format!(
+                        "the driver refused it while {} of this pipeline was being compiled - \
+                         the device was not lost",
+                        compilation.variant
+                    ),
+                    &text,
+                    // The instance summary is built after this handler is installed; a
+                    // refusal dump names the adapter through the game log's own
+                    // `Vulkan adapter is` line instead.
+                    "",
+                );
+            }
+        }
     }));
 
     // **The device being lost is not an uncaptured error at all.** wgpu routes a loss to this
@@ -1053,9 +1088,12 @@ fn try_create_renderer(
         }
 
         if let Some(compilation) = &compiling {
-            dump_pipeline_of_lost_device(
+            dump_pipeline_refused_or_lost(
                 compilation,
-                &format!("{reason:?}"),
+                format!(
+                    "the device was lost while {} of this pipeline was being compiled",
+                    compilation.variant
+                ),
                 &message,
                 &adapter_summary,
             );
@@ -2944,15 +2982,16 @@ fn pipeline_file_stem(name: &str) -> String {
         .collect()
 }
 
-/// Writes the pipeline the device was lost around, out beside the game's other renderer files.
+/// Writes the pipeline a driver refused or lost the device around, out beside the game's other
+/// renderer files.
 ///
 /// The log line naming the pipeline is the report; the files are the evidence - the exact GLSL the
 /// driver was handed, so a shader a vendor's compiler refuses can be fed to it again rather than
 /// reconstructed from a guess. Best effort, and quiet about failing: a run directory that cannot
 /// be written to is not going to be improved by a log argument about it.
-fn dump_pipeline_of_lost_device(
+fn dump_pipeline_refused_or_lost(
     compilation: &PipelineCompilation,
-    reason: &str,
+    event: String,
     message: &str,
     adapter: &str,
 ) {
@@ -2966,14 +3005,12 @@ fn dump_pipeline_of_lost_device(
     }
 
     let info = format!(
-        "the device was lost while {} of this pipeline was being compiled\n\
-         pipeline: {}\n\
-         lost reason: {reason}\n\
-         lost message: {message}\n\
+        "pipeline: {}\n\
+         event: {event}\n\
+         detail: {message}\n\
          adapter: {adapter}\n\
          vertex shader: {} bytes\n\
          fragment shader: {} bytes\n",
-        compilation.variant,
         compilation.name,
         compilation.vertex.len(),
         compilation.fragment.len(),

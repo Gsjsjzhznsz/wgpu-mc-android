@@ -75,6 +75,13 @@ mod abi_tests;
 #[cfg(test)]
 mod adreno_front_facing;
 
+/// Task 15's diagnostics: the Adreno 830 device loss on `entity_cutout_dissolve`, the
+/// first `PER_FACE_LIGHTING` pipeline its run reached - with the Task 14 fix already in
+/// - so the hunt is for what `DISSOLVE` adds on top of a shape that already survived
+/// once, and the diff target is the pipeline that compiled right before the loss.
+#[cfg(test)]
+mod entity_dissolve;
+
 /// Checks the mod's own metadata: the version NeoForge is told in its `updates.json` against
 /// the version this tree builds. See the module for why nothing else can notice that they disagree.
 #[cfg(test)]
