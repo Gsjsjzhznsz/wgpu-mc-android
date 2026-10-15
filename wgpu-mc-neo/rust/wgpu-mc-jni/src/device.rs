@@ -4548,6 +4548,49 @@ pub extern "C" fn set_scissor_rect(
     pass.pass_mut().set_scissor_rect(x, y, width, height);
 }
 
+/// Runs `create` under one error scope of every filter, and answers what the scopes caught.
+///
+/// **Why this exists:** wgpu's creation API answers no error. `create_render_pipeline` hands back a
+/// `RenderPipeline` either way, and a refused one - a driver that does not like the SPIR-V - is a
+/// handle wgpu registers as *invalid*, with the refusal delivered through the error sink. Which is
+/// where it went to die: a `DeviceLost`-classified error is dropped before any handler sees it (see
+/// the wgpu-core fork note on `handle_hal_error_keeping_device_on_driver_refusal`), and the
+/// android.12 run compiled a whole session of pipelines, used one, and lost every frame to a
+/// validation error that had no first cause anywhere in the log.
+///
+/// A scope catches the error **at the call that raised it, on this thread**, whatever it ends up
+/// classified as: one scope per filter, all three pushed, all three popped. The answer is the first
+/// error any of them carried, or `None` when every creation under them succeeded - which is the
+/// only answer that says the handle this side is about to hand the JVM is one a `set_pipeline` can
+/// actually bind.
+fn run_under_error_scopes<T>(
+    device: &wgpu::Device,
+    create: impl FnOnce() -> T,
+) -> (T, Option<wgpu::Error>) {
+    let out_of_memory_guard = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let internal_guard = device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let validation_guard = device.push_error_scope(wgpu::ErrorFilter::Validation);
+
+    let created = create();
+
+    // LIFO, one per pushed scope. Popped and resolved before anything else can raise an error on
+    // this thread: the creations this wraps are synchronous driver calls, so whatever they were
+    // going to say, they have said it by the time `create` answers.
+    let validation = wgpu_mc::resolve_error_scope_now(validation_guard.pop());
+    let internal = wgpu_mc::resolve_error_scope_now(internal_guard.pop());
+    let out_of_memory = wgpu_mc::resolve_error_scope_now(out_of_memory_guard.pop());
+
+    let refusal =
+        [validation, internal, out_of_memory]
+            .into_iter()
+            .find_map(|caught| match caught {
+                wgpu_mc::ScopeResult::Error(error) => Some(error),
+                _ => None,
+            });
+
+    (created, refusal)
+}
+
 pub struct BlazePipeline {
     pub(crate) pipeline: wgpu::RenderPipeline,
     /// The topology the pipeline was built with, which decides how a vertex run is grouped.
@@ -4562,6 +4605,24 @@ pub struct BlazePipeline {
     /// every later bind costs one relaxed load - the name is not even read again. It used to be a
     /// `HashSet<String>` behind a mutex, which was locked and hashed on every bind of every draw.
     pub logged: AtomicBool,
+    /// **Whether the driver actually built this pipeline**, which is decided at creation and never
+    /// changes: a driver that refuses the SPIR-V - wgpu's `Unexpected`, the
+    /// `VK_ERROR_INVALID_SHADER_NV` class some Adreno parts answer with - leaves a handle wgpu
+    /// registers as invalid, and **the first `set_pipeline` of an invalid handle poisons the whole
+    /// frame's command encoder**, so `Queue::submit` discards every command of that frame and the
+    /// screen shows nothing at all (the android.12 black screen on two Adreno devices was exactly
+    /// this, with the refusal itself silently dropped by wgpu's error sink - see the fork note on
+    /// `handle_hal_error_keeping_device_on_driver_refusal`). A refused pipeline is skipped instead:
+    /// the game loses the draws this pipeline would have made, which is a missing entity where it
+    /// would otherwise have been a missing world.
+    ///
+    /// The creations run under error scopes (see `run_under_error_scopes`), which is how the
+    /// refusal is caught even though wgpu's own creation API answers no error: it hands back a
+    /// handle that only *says* invalid at first use, on a frame, far from the cause.
+    pub valid: AtomicBool,
+    /// Diagnostics: whether the refusal of this pipeline has been logged, once per pipeline -
+    /// a refused draw happens per entity per frame, and a log has to stay a report.
+    pub refusal_logged: AtomicBool,
     /// Everything the *other* depth variant is built from, so building it costs no shader work.
     recipe: PipelineRecipe,
 }
@@ -4764,8 +4825,36 @@ pub extern "C" fn create_pipeline_variant(
         });
     }
 
+    // The variant's own creation runs under the scopes too: the same driver that refused the
+    // first variant's shaders refuses this one, and an invalid variant must be *marked*, not
+    // silently born - see `BlazePipeline::valid`.
+    let (pipeline, refusal) =
+        run_under_error_scopes(&wm.gpu.device, || source.recipe.create(wm, depth_stencil));
+
+    let valid = refusal.is_none();
+    if let Some(error) = &refusal {
+        let compiling = LAST_PIPELINE_COMPILING.lock().take();
+        if let Some(compilation) = &compiling {
+            error!(
+                "wgpu-mc: the driver refused {} ({}): {error} - the pipeline was born invalid, \
+                 and every draw with it would poison the frame, so its draws are skipped",
+                compilation.name, compilation.variant
+            );
+            dump_pipeline_refused_or_lost(
+                compilation,
+                format!(
+                    "the driver refused it while {} of this pipeline was being compiled - \
+                     the device was not lost, and the pipeline's draws are skipped",
+                    compilation.variant
+                ),
+                &error.to_string(),
+                "",
+            );
+        }
+    }
+
     Box::new(BlazePipeline {
-        pipeline: source.recipe.create(wm, depth_stencil),
+        pipeline,
         topology: source.topology,
         name: source.name.clone(),
         // The plan is the pipeline's description of its bindings, and the depth state is not part
@@ -4773,8 +4862,28 @@ pub extern "C" fn create_pipeline_variant(
         plan: source.plan.clone(),
         bind_group_layouts: source.bind_group_layouts.clone(),
         logged: AtomicBool::new(false),
+        valid: AtomicBool::new(valid),
+        refusal_logged: AtomicBool::new(false),
         recipe: source.recipe.clone(),
     })
+}
+
+/// Whether the driver actually built this pipeline, which the JVM asks once per compiled pipeline
+/// and answers its own `CompiledRenderPipeline#isValid` with.
+///
+/// Null answers yes: a null pipeline is the empty variant slot the JVM clears on release, and
+/// nobody draws through it. See [`BlazePipeline::valid`] for why this exists at all - the short
+/// version is that a refused pipeline is one wgpu registers as invalid, and the first draw that
+/// binds an invalid pipeline discards the whole frame's command stream.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn is_render_pipeline_valid(pipeline: *mut BlazePipeline) -> bool {
+    if pipeline.is_null() {
+        return true;
+    }
+
+    // Safety: the pointer is a live `Box<BlazePipeline>` the JVM holds a slot for, as in every
+    // other getter that takes one of these handles.
+    unsafe { (*pipeline).valid.load(Ordering::Relaxed) }
 }
 
 #[unsafe(no_mangle)]
@@ -5011,148 +5120,186 @@ pub unsafe extern "C" fn compile_render_pipeline(
         fragment: frag_processed.clone(),
     });
 
-    let vert_module = wm
-        .gpu
-        .device
-        .create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: None,
-            source: ShaderSource::Glsl {
-                shader: Cow::Borrowed(&vert_processed),
-                stage: naga::ShaderStage::Vertex,
-                // Don't pass any defines, the shader is already preprocessed above
-                defines: &[],
-            },
-        });
+    // **Everything the driver is asked to build for this pipeline runs under error scopes.** The
+    // two modules, the layout and the pipeline are one creation story: a driver that refuses any
+    // of them answers wgpu's infallible API with a handle that only *says* invalid at first use,
+    // and the first use is a world frame, far from this cause. The scopes catch the refusal here,
+    // where the pipeline's name and its exact GLSL are still in hand - and a refused pipeline is
+    // built with `valid` false, so the draw path skips it instead of poisoning the frame that
+    // binds it. See `BlazePipeline::valid` for the shape the android.12 black screen took.
+    let ((pipeline, recipe, bind_group_layouts), refusal) =
+        run_under_error_scopes(&wm.gpu.device, || {
+            let vert_module = wm
+                .gpu
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: None,
+                    source: ShaderSource::Glsl {
+                        shader: Cow::Borrowed(&vert_processed),
+                        stage: naga::ShaderStage::Vertex,
+                        // Don't pass any defines, the shader is already preprocessed above
+                        defines: &[],
+                    },
+                });
 
-    let frag_module = wm
-        .gpu
-        .device
-        .create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: None,
-            source: ShaderSource::Glsl {
-                shader: Cow::Borrowed(&frag_processed),
-                stage: naga::ShaderStage::Fragment,
-                defines: &[],
-            },
-        });
+            let frag_module = wm
+                .gpu
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: None,
+                    source: ShaderSource::Glsl {
+                        shader: Cow::Borrowed(&frag_processed),
+                        stage: naga::ShaderStage::Fragment,
+                        defines: &[],
+                    },
+                });
 
-    let bind_group_layouts: Vec<wgpu::BindGroupLayout> = plan.create_layouts(&wm.gpu.device);
-    let vertex_buffers = render_pipeline_description
-        .vertex_formats
-        .iter()
-        // A format with no elements describes no attributes at all, and declaring a vertex buffer
-        // for it would make slot 0 *mandatory* at draw time. Minecraft never binds one for those:
-        // `LIGHTMAP`, the `POST_*` passes and `ANIMATE_SPRITE` all use `DefaultVertexFormat.EMPTY`
-        // and synthesise the full-screen triangle from `gl_VertexIndex` in `core/screenquad`, then
-        // draw with `renderPass.draw(0, 3)`. That is exactly the "requires vertex buffer 0 to be
-        // set" failure.
-        .filter(|vertex_format| !vertex_format.elements.is_empty())
-        .scan(0, |shader_location, vertex_format| {
-            Some(VertexBufferAttributes {
-                stride: vertex_format.vertex_size,
-                attributes: vertex_format
-                    .elements
+            let bind_group_layouts: Vec<wgpu::BindGroupLayout> =
+                plan.create_layouts(&wm.gpu.device);
+            let vertex_buffers = render_pipeline_description
+                .vertex_formats
+                .iter()
+                // A format with no elements describes no attributes at all, and declaring a vertex buffer
+                // for it would make slot 0 *mandatory* at draw time. Minecraft never binds one for those:
+                // `LIGHTMAP`, the `POST_*` passes and `ANIMATE_SPRITE` all use `DefaultVertexFormat.EMPTY`
+                // and synthesise the full-screen triangle from `gl_VertexIndex` in `core/screenquad`, then
+                // draw with `renderPass.draw(0, 3)`. That is exactly the "requires vertex buffer 0 to be
+                // set" failure.
+                .filter(|vertex_format| !vertex_format.elements.is_empty())
+                .scan(0, |shader_location, vertex_format| {
+                    Some(VertexBufferAttributes {
+                    stride: vertex_format.vertex_size,
+                    attributes: vertex_format
+                        .elements
+                        .iter()
+                        .filter_map(|element| {
+                            // Locations are numbered the way GL numbers attribute indices, so an
+                            // element that cannot be expressed still consumes its location rather
+                            // than shifting every element after it.
+                            let location = *shader_location;
+                            *shader_location += 1;
+
+                            let Some(format) = element.format.to_wgpu_vertex_format() else {
+                                error!(
+                                    "wgpu-mc: vertex element {} is {:?}, which has no wgpu vertex \
+                                     format; the pipeline will not validate",
+                                    element.name, element.format
+                                );
+                                return None;
+                            };
+
+                            // Three-component 8- and 16-bit formats are widened to four components
+                            // (see `GpuFormat::to_wgpu_vertex_format`), which reads one component
+                            // past the element. Minecraft pads its vertex formats to a multiple of
+                            // four bytes so that byte exists, but say so rather than relying on it
+                            // silently.
+                            let end = element.offset + format.size();
+                            if end > vertex_format.vertex_size {
+                                error!(
+                                    "wgpu-mc: vertex element {} ({:?}) needs bytes {}..{} but a \
+                                     vertex is only {} bytes; it will read into the next vertex",
+                                    element.name,
+                                    element.format,
+                                    element.offset,
+                                    end,
+                                    vertex_format.vertex_size
+                                );
+                            }
+
+                            Some(wgpu::VertexAttribute {
+                                format,
+                                offset: element.offset,
+                                shader_location: location,
+                            })
+                        })
+                        .collect::<Vec<wgpu::VertexAttribute>>(),
+                })
+                })
+                .collect::<Vec<VertexBufferAttributes>>();
+
+            let layout = wm
+                .gpu
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: None,
+                    bind_group_layouts: &bind_group_layouts
+                        .iter()
+                        .map(Option::from)
+                        .collect::<Vec<_>>(),
+                    immediate_size: 0,
+                });
+
+            // Whether the depth bias a pipeline asks for is allowed to reach wgpu at all: it is a polygon
+            // offset, and wgpu rejects it outright on line and point topologies.
+            let is_polygon = matches!(
+                render_pipeline_description.primitive_topology.to_wgpu(),
+                wgpu::PrimitiveTopology::TriangleList | wgpu::PrimitiveTopology::TriangleStrip
+            );
+
+            // Everything the pipeline is made of except its depth state. Both variants are written from
+            // this recipe, and only the one something draws with is written at all: the Kotlin side asks
+            // for the variant a pass needs, and the first one it asks for is the only one compiled here.
+            let recipe = PipelineRecipe {
+                // Named after `RenderPipeline#getLocation`, so wgpu's own validation errors say which
+                // pipeline they are about instead of showing an empty label.
+                label: render_pipeline_description.name.to_string(),
+                vertex_module: vert_module,
+                fragment_module: frag_module,
+                layout,
+                vertex_buffers,
+                color_targets: render_pipeline_description
+                    .color_target_states
                     .iter()
-                    .filter_map(|element| {
-                        // Locations are numbered the way GL numbers attribute indices, so an
-                        // element that cannot be expressed still consumes its location rather
-                        // than shifting every element after it.
-                        let location = *shader_location;
-                        *shader_location += 1;
-
-                        let Some(format) = element.format.to_wgpu_vertex_format() else {
-                            error!(
-                                "wgpu-mc: vertex element {} is {:?}, which has no wgpu vertex \
-                                 format; the pipeline will not validate",
-                                element.name, element.format
-                            );
-                            return None;
-                        };
-
-                        // Three-component 8- and 16-bit formats are widened to four components
-                        // (see `GpuFormat::to_wgpu_vertex_format`), which reads one component
-                        // past the element. Minecraft pads its vertex formats to a multiple of
-                        // four bytes so that byte exists, but say so rather than relying on it
-                        // silently.
-                        let end = element.offset + format.size();
-                        if end > vertex_format.vertex_size {
-                            error!(
-                                "wgpu-mc: vertex element {} ({:?}) needs bytes {}..{} but a \
-                                 vertex is only {} bytes; it will read into the next vertex",
-                                element.name,
-                                element.format,
-                                element.offset,
-                                end,
-                                vertex_format.vertex_size
-                            );
-                        }
-
-                        Some(wgpu::VertexAttribute {
-                            format,
-                            offset: element.offset,
-                            shader_location: location,
+                    .map(|state| {
+                        Some(wgpu::ColorTargetState {
+                            format: state.format.to_wgpu_texture_format(),
+                            // Straight from the pipeline. This used to be a hardcoded
+                            // `ALPHA_BLENDING` with every channel written, which is wrong for most of
+                            // Minecraft's pipelines: the GUI and its background use `OVERLAY`
+                            // (`src * alpha + dst`), `INVERT`, `ADDITIVE` and premultiplied alpha, and
+                            // several write to a subset of the channels or to none at all.
+                            blend: state.to_wgpu_blend(),
+                            write_mask: wgpu::ColorWrites::from_bits_truncate(state.write_mask),
                         })
                     })
-                    .collect::<Vec<wgpu::VertexAttribute>>(),
-            })
-        })
-        .collect::<Vec<VertexBufferAttributes>>();
+                    .collect(),
+                topology: render_pipeline_description.primitive_topology.to_wgpu(),
+                cull: render_pipeline_description.cull != 0,
+                is_polygon,
+            };
 
-    let layout = wm
-        .gpu
-        .device
-        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &bind_group_layouts
-                .iter()
-                .map(Option::from)
-                .collect::<Vec<_>>(),
-            immediate_size: 0,
+            let pipeline = recipe.create(
+                wm,
+                render_pipeline_description.depth_stencil_state.as_deref(),
+            );
+
+            (pipeline, recipe, bind_group_layouts)
         });
 
-    // Whether the depth bias a pipeline asks for is allowed to reach wgpu at all: it is a polygon
-    // offset, and wgpu rejects it outright on line and point topologies.
-    let is_polygon = matches!(
-        render_pipeline_description.primitive_topology.to_wgpu(),
-        wgpu::PrimitiveTopology::TriangleList | wgpu::PrimitiveTopology::TriangleStrip
-    );
-
-    // Everything the pipeline is made of except its depth state. Both variants are written from
-    // this recipe, and only the one something draws with is written at all: the Kotlin side asks
-    // for the variant a pass needs, and the first one it asks for is the only one compiled here.
-    let recipe = PipelineRecipe {
-        // Named after `RenderPipeline#getLocation`, so wgpu's own validation errors say which
-        // pipeline they are about instead of showing an empty label.
-        label: render_pipeline_description.name.to_string(),
-        vertex_module: vert_module,
-        fragment_module: frag_module,
-        layout,
-        vertex_buffers,
-        color_targets: render_pipeline_description
-            .color_target_states
-            .iter()
-            .map(|state| {
-                Some(wgpu::ColorTargetState {
-                    format: state.format.to_wgpu_texture_format(),
-                    // Straight from the pipeline. This used to be a hardcoded
-                    // `ALPHA_BLENDING` with every channel written, which is wrong for most of
-                    // Minecraft's pipelines: the GUI and its background use `OVERLAY`
-                    // (`src * alpha + dst`), `INVERT`, `ADDITIVE` and premultiplied alpha, and
-                    // several write to a subset of the channels or to none at all.
-                    blend: state.to_wgpu_blend(),
-                    write_mask: wgpu::ColorWrites::from_bits_truncate(state.write_mask),
-                })
-            })
-            .collect(),
-        topology: render_pipeline_description.primitive_topology.to_wgpu(),
-        cull: render_pipeline_description.cull != 0,
-        is_polygon,
-    };
-
-    let pipeline = recipe.create(
-        wm,
-        render_pipeline_description.depth_stencil_state.as_deref(),
-    );
+    let valid = refusal.is_none();
+    if let Some(error) = &refusal {
+        // The refusal is attributed here, where the pipeline's name and its exact GLSL are in
+        // hand: the scopes caught it before wgpu's sink could route it anywhere, so this is the
+        // one place the driver's answer is ever written down.
+        let compiling = LAST_PIPELINE_COMPILING.lock().take();
+        if let Some(compilation) = &compiling {
+            error!(
+                "wgpu-mc: the driver refused {} ({}): {error} - the pipeline was born invalid, \
+                 and every draw with it would poison the frame, so its draws are skipped",
+                compilation.name, compilation.variant
+            );
+            dump_pipeline_refused_or_lost(
+                compilation,
+                format!(
+                    "the driver refused it while {} of this pipeline was being compiled - \
+                     the device was not lost, and the pipeline's draws are skipped",
+                    compilation.variant
+                ),
+                &error.to_string(),
+                "",
+            );
+        }
+    }
 
     // The driver's compilation results are worth carrying into the next launch, and the only
     // moment they change is here.
@@ -5165,6 +5312,8 @@ pub unsafe extern "C" fn compile_render_pipeline(
         plan,
         bind_group_layouts,
         logged: AtomicBool::new(false),
+        valid: AtomicBool::new(valid),
+        refusal_logged: AtomicBool::new(false),
         recipe,
     })
 }

@@ -234,13 +234,19 @@ impl WmRenderer {
 /// So one poll with a no-op waker is the whole of it, and the third case is the one that must not be
 /// guessed at: a `Pending` answer means a backend that resolves later, and the honest response is to say
 /// so rather than to block the render thread on a promise or to read "not yet" as "no error".
-enum ScopeResult {
+///
+/// The `Pending` variant is treated as clean by every caller: the errors this side scopes are raised
+/// synchronously at the call that raised them, so a promise that is not ready now will never carry
+/// anything.
+pub enum ScopeResult {
     Error(wgpu::Error),
     Clean,
     Pending,
 }
 
-fn resolve_error_scope_now(
+/// Pops an error scope's promise the way this side always pops them: right away, on the thread that
+/// pushed the scope, without a device poll in between.
+pub fn resolve_error_scope_now(
     future: impl std::future::Future<Output = Option<wgpu::Error>>,
 ) -> ScopeResult {
     use std::task::{Context, Poll, Waker};

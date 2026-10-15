@@ -1537,6 +1537,30 @@ fn bind_for_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) -
     // compiled pipeline alive for as long as any pass can draw with it.
     let pipeline = unsafe { &*call.pipeline };
 
+    // **A pipeline the driver refused is not bound at all.** wgpu registers a refused pipeline as
+    // invalid, and the first `set_pipeline` of an invalid pipeline fails the render pass - which
+    // poisons the whole frame's command encoder, so `Queue::submit` discards every pass of that
+    // frame and the screen shows nothing: the android.12 black screen was exactly one refused
+    // entity pipeline doing this to every world frame on two Adreno devices. The refusal is known
+    // at creation (see `BlazePipeline::valid` and `run_under_error_scopes`), so it is answered
+    // here, before anything is recorded into the pass: the draw is skipped, the rest of the frame
+    // renders, and the game is missing one pipeline's draws instead of all of them.
+    //
+    // `false` is the refusal `draw_call` already documents - the JVM re-sends its bindings once,
+    // is refused again, and reports it once per pipeline - and nothing has been recorded into the
+    // pass on this path, so the second attempt is as harmless as the first.
+    if !pipeline.valid.load(Ordering::Relaxed) {
+        if crate::debug::logging() && !pipeline.refusal_logged.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "wgpu-mc: {} was refused by the driver at compilation, so every draw that binds \
+                 it is skipped; the rest of the frame renders",
+                pipeline.plan.name
+            );
+        }
+
+        return false;
+    }
+
     // The pass keeps one offset list per set, so a plan with more sets than that would index past
     // them. Like the binding count above, this is the two sides disagreeing about the table rather
     // than one wrong draw, and is not served quietly.
