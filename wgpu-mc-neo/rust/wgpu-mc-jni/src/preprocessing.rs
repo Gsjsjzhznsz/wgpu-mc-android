@@ -1513,13 +1513,32 @@ pub fn process_shaders(
     // See `rewrite_per_draw_blocks`.
     if !per_draw_storage.is_empty() {
         match per_draw_pad(directives) {
-            Some(pad) => rewrite_per_draw_blocks(
-                &mut vert_stage_ast,
-                &mut frag_stage_ast,
-                per_draw_storage,
-                &uniform_locations,
-                pad,
-            ),
+            Some(pad) => {
+                // **Say what the device's alignment made of the ring.** The pad is a
+                // vendor-dependent number - it is whatever the uniform offset alignment leaves
+                // over - so the shader a device compiles is not literally the shader another
+                // device compiles, and a fault that only one vendor shows deserves to have that
+                // difference written down. Reported when the value changes, not per pipeline:
+                // every terrain pipeline of a launch carries the same one.
+                static PAD_REPORTED: std::sync::atomic::AtomicI64 =
+                    std::sync::atomic::AtomicI64::new(i64::MIN);
+                let pad = pad as i64;
+                if PAD_REPORTED.swap(pad, std::sync::atomic::Ordering::Relaxed) != pad {
+                    log::info!(
+                        "wgpu-mc: per-draw ring padding: {pad} vec4(s) ({} extra bytes per record, \
+                         from the device's uniform offset alignment)",
+                        pad * 16
+                    );
+                }
+
+                rewrite_per_draw_blocks(
+                    &mut vert_stage_ast,
+                    &mut frag_stage_ast,
+                    per_draw_storage,
+                    &uniform_locations,
+                    pad as usize,
+                )
+            }
             None => error!(
                 "wgpu-mc: a pipeline declares the per-draw block(s) {per_draw_storage:?} but its \
                  directives carry no WM_CHUNK_PAD, so the block stays a uniform block and the storage \

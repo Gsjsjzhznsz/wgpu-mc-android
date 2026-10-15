@@ -470,6 +470,13 @@ pub unsafe extern "C" fn configure_surface(
     height: u32,
     present_mode: u32,
 ) {
+    // The JVM asks on every frame the window's size differs in, which it keeps doing for a while
+    // after the device died; a lost device gets no swapchain, and the acquire path has already
+    // said so once.
+    if DEVICE_LOST.load(Ordering::Relaxed) {
+        return;
+    }
+
     let lock = wm.gpu.surface.lock();
     let Some(surface) = lock.as_ref() else {
         warn!("wgpu-mc: configure_surface was called before a surface existed");
@@ -1020,9 +1027,55 @@ fn try_create_renderer(
     // with no line naming it until some util panic blamed a buffer it had just failed to
     // create. This is the one place the trigger is ever written down, so it is logged loudly
     // and always: a loss happens once, not per frame.
-    device.set_device_lost_callback(|reason, message| {
-        error!("wgpu-mc: the device was lost ({reason:?}): {message}");
+    //
+    // And when the loss landed in the middle of a pipeline compilation - the one vendor-specific
+    // shape a Vulkan loss takes with no validation error anywhere - the callback names the
+    // pipeline whose compilation was last started and writes its shaders out, which is the only
+    // way the driver's refusal can be reproduced, let alone worked around.
+    let adapter_summary = {
+        let info = adapter.get_info();
+        format!(
+            "{} ({:?}, {:?}), driver {}",
+            info.name, info.backend, info.device_type, info.driver
+        )
+    };
+    device.set_device_lost_callback(move |reason, message| {
+        DEVICE_LOST.store(true, Ordering::Relaxed);
+
+        let compiling = LAST_PIPELINE_COMPILING.lock().take();
+        match &compiling {
+            Some(compilation) => error!(
+                "wgpu-mc: the device was lost ({reason:?}): {message} - the last pipeline whose \
+                 compilation was started is {} ({}); writing its shaders out now",
+                compilation.name, compilation.variant
+            ),
+            None => error!("wgpu-mc: the device was lost ({reason:?}): {message}"),
+        }
+
+        if let Some(compilation) = &compiling {
+            dump_pipeline_of_lost_device(
+                compilation,
+                &format!("{reason:?}"),
+                &message,
+                &adapter_summary,
+            );
+        }
     });
+
+    // **The limits the device answered with, once per launch.** Alignment is the one limit a port
+    // has to reason about on the JVM side - the per-draw ring's stride comes from
+    // `min_uniform_buffer_offset_alignment` (see `perDrawPad` in the mod) - and vendors differ,
+    // which is exactly the kind of detail a vendor-specific fault hides behind. So the log
+    // carries it without anyone having to ask.
+    let limits = device.limits();
+    info!(
+        "wgpu-mc: device limits: uniform offset alignment {}, storage offset alignment {}, max \
+         immediate (push constant) size {}, max texture dimension {}",
+        limits.min_uniform_buffer_offset_alignment,
+        limits.min_storage_buffer_offset_alignment,
+        limits.max_immediate_size,
+        limits.max_texture_dimension_2d,
+    );
 
     let pipeline_cache = create_pipeline_cache(&device, &adapter);
 
@@ -2838,6 +2891,113 @@ static LIVE_PASS_COUNT: AtomicU64 = AtomicU64::new(0);
 pub static LIVE_BIND_GROUP_COUNT: AtomicU64 = AtomicU64::new(0);
 static LIVE_PIPELINE_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// **The pipeline whose driver compilation was started most recently.**
+///
+/// A Vulkan driver that refuses a shader does not say so: the failing `VkResult` arrives with no
+/// resource attached, wgpu maps every unexpected variant to a fatal `DeviceError::Unexpected`,
+/// and `lose()` names no object - so a device that died mid-compilation, which is the one
+/// vendor-specific way an Android GPU loses its device with no validation error anywhere in the
+/// log, died anonymously. The Adreno 830 loss was exactly that shape: the first frame presented,
+/// Minecraft's own precompile pass was walking the pipeline list, and the log jumped from a
+/// pipeline-cache write straight to the loss, with nothing in between to say which pipeline the
+/// driver had choked on.
+///
+/// This is the answer to "which pipeline was it". It is written before the shader modules and the
+/// pipeline go to the driver, and the device-lost callback reads it: the loss is logged with the
+/// pipeline's name, and the pipeline's processed shaders are written beside the game's other
+/// files, so a driver that refuses them can be confronted with the exact text instead of guessed
+/// at. One line per pipeline per launch is the cost; a nameable death is the point.
+struct PipelineCompilation {
+    name: String,
+    /// Which of the two depth variants was being built. Both are driver compilations of the same
+    /// shaders, and either can be the one the driver refuses.
+    variant: &'static str,
+    /// The processed GLSL that went to `create_shader_module`, kept so the dump can write it.
+    vertex: String,
+    fragment: String,
+}
+
+static LAST_PIPELINE_COMPILING: Mutex<Option<PipelineCompilation>> = Mutex::new(None);
+
+/// Whether the device-lost callback has fired.
+///
+/// A lost device answers every later call with a contagious-invalidity resource, and the per-frame
+/// acquire would otherwise spend every frame reconfiguring a swapchain the device can never fill -
+/// which is a log line per frame for the rest of the session, and a `PresentBlit` built per frame
+/// on top. When this is set, the frame path short-circuits instead: one announcement, then quiet.
+static DEVICE_LOST: AtomicBool = AtomicBool::new(false);
+
+/// Flattens a pipeline's location (`minecraft:pipeline/core/particle`) into one filename-safe stem.
+///
+/// A dot is flattened along with everything else: a name that is only dots would otherwise come
+/// out as `..`, which joined onto a directory is the parent directory, and no pipeline is worth
+/// writing its shaders one level up.
+fn pipeline_file_stem(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Writes the pipeline the device was lost around, out beside the game's other renderer files.
+///
+/// The log line naming the pipeline is the report; the files are the evidence - the exact GLSL the
+/// driver was handed, so a shader a vendor's compiler refuses can be fed to it again rather than
+/// reconstructed from a guess. Best effort, and quiet about failing: a run directory that cannot
+/// be written to is not going to be improved by a log argument about it.
+fn dump_pipeline_of_lost_device(
+    compilation: &PipelineCompilation,
+    reason: &str,
+    message: &str,
+    adapter: &str,
+) {
+    let Some(run_directory) = crate::RUN_DIRECTORY.get() else {
+        return;
+    };
+
+    let directory = run_directory.join("wgpu_mc_lost_pipeline");
+    if std::fs::create_dir_all(&directory).is_err() {
+        return;
+    }
+
+    let info = format!(
+        "the device was lost while {} of this pipeline was being compiled\n\
+         pipeline: {}\n\
+         lost reason: {reason}\n\
+         lost message: {message}\n\
+         adapter: {adapter}\n\
+         vertex shader: {} bytes\n\
+         fragment shader: {} bytes\n",
+        compilation.variant,
+        compilation.name,
+        compilation.vertex.len(),
+        compilation.fragment.len(),
+    );
+
+    let stem = pipeline_file_stem(&compilation.name);
+    let _ = std::fs::write(directory.join("info.txt"), info);
+    let _ = std::fs::write(
+        directory.join(format!("{stem}.vert.glsl")),
+        &compilation.vertex,
+    );
+    let _ = std::fs::write(
+        directory.join(format!("{stem}.frag.glsl")),
+        &compilation.fragment,
+    );
+
+    info!(
+        "wgpu-mc: the shaders of {} were written to {} - the driver saw exactly this text, so \
+         please send the directory",
+        compilation.name,
+        directory.display()
+    );
+}
+
 static DEAD_TEXTURES: Mutex<Option<std::collections::HashMap<usize, DeadTexture>>> =
     Mutex::new(None);
 
@@ -4545,6 +4705,28 @@ pub extern "C" fn create_pipeline_variant(
 ) -> Box<BlazePipeline> {
     LIVE_PIPELINE_COUNT.fetch_add(1, Ordering::Relaxed);
 
+    // **The other depth variant is a driver compilation of its own.** The shaders are the first
+    // variant's, so the static keeps them under the same name - and the log line keeps the two
+    // variants distinguishable, because either can be the one a driver refuses.
+    info!(
+        "wgpu-mc: compiling the other depth variant of {}",
+        source.name
+    );
+    {
+        let mut last = LAST_PIPELINE_COMPILING.lock();
+        let (vertex, fragment) = last
+            .as_ref()
+            .filter(|compilation| compilation.name == source.name)
+            .map(|compilation| (compilation.vertex.clone(), compilation.fragment.clone()))
+            .unwrap_or_default();
+        *last = Some(PipelineCompilation {
+            name: source.name.clone(),
+            variant: "its other depth variant",
+            vertex,
+            fragment,
+        });
+    }
+
     Box::new(BlazePipeline {
         pipeline: source.recipe.create(wm, depth_stencil),
         topology: source.topology,
@@ -4564,6 +4746,20 @@ pub unsafe extern "C" fn compile_render_pipeline(
     render_pipeline_description: &RenderPipeline,
 ) -> Box<BlazePipeline> {
     LIVE_PIPELINE_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    // **Name the pipeline before anything of it goes to the driver.** One line per pipeline per
+    // launch: the shader modules and the pipeline are created a few dozen lines down, and a
+    // driver that loses the device over one of them leaves this line as the last thing before
+    // the loss - which, read together with the device-lost callback, is the attribution.
+    info!(
+        "wgpu-mc: compiling pipeline {} ({})",
+        render_pipeline_description.name,
+        if render_pipeline_description.depth_stencil_state.is_some() {
+            "with depth"
+        } else {
+            "without depth"
+        },
+    );
 
     let directives = format!("#version 440\n{}\n", render_pipeline_description.directives);
 
@@ -4767,6 +4963,16 @@ pub unsafe extern "C" fn compile_render_pipeline(
     plan.add_implicit_uniforms(&implicit_uniforms);
     plan.apply_sampler_types(&sampler_types);
     plan.apply_block_sizes(&block_sizes);
+
+    // **The shaders are settled; from here on the driver sees them.** This is the state the
+    // device-lost callback reports and dumps: whichever module or pipeline creation dies, the
+    // death is attributed to this pipeline, carrying the exact text it was handed.
+    *LAST_PIPELINE_COMPILING.lock() = Some(PipelineCompilation {
+        name: render_pipeline_description.name.to_string(),
+        variant: "its first variant",
+        vertex: vert_processed.clone(),
+        fragment: frag_processed.clone(),
+    });
 
     let vert_module = wm
         .gpu
@@ -5439,6 +5645,28 @@ pub extern "C" fn allocate_gpu_buffer_mapped(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn acquire_next_texture(wm: &WmRenderer) -> *mut SurfaceTexture {
+    if DEVICE_LOST.load(Ordering::Relaxed) {
+        // Said once: the loss itself was logged loudly, and everything after it is a renderer
+        // that cannot draw answering a game that keeps asking. Without this the acquire path
+        // would reconfigure the swapchain every frame - a log line per frame, a PresentBlit per
+        // frame, and no picture ever - until the process ended.
+        static ANNOUNCED: AtomicBool = AtomicBool::new(false);
+        if !ANNOUNCED.swap(true, Ordering::Relaxed) {
+            error!(
+                "wgpu-mc: the device is lost, so no further frames will be rendered this session; \
+                 the game keeps running against a renderer that cannot draw. Restart the game to \
+                 render again. The loss trigger is named a few lines up, and the shaders of the \
+                 pipeline it died on are in wgpu_mc_lost_pipeline/ beside the game's other files - \
+                 please send both."
+            );
+        }
+
+        // A game loop that keeps asking without the pacing a present would have had spins hot;
+        // eight milliseconds is the difference between a paused renderer and a busy-wait.
+        std::thread::sleep(std::time::Duration::from_millis(8));
+        return ptr::null_mut();
+    }
+
     let lock = wm.gpu.surface.lock();
     let Some(surface) = lock.as_ref() else {
         warn!("wgpu-mc: acquire_next_texture was called before a surface existed");
@@ -7282,5 +7510,35 @@ mod created_buffer_size_tests {
 
         // Below the floor, the floor: the util's `.max(COPY_BUFFER_ALIGNMENT)`.
         assert_eq!(buffer_size_for_contents(1), 4);
+    }
+}
+
+#[cfg(test)]
+mod pipeline_file_stem_tests {
+    use super::*;
+
+    /// **A pipeline's location has to survive becoming a filename.** The dump that lands beside
+    /// the game's other files is named after the pipeline whose shaders it holds, and locations
+    /// are namespaced paths - `minecraft:pipeline/core/particle` and its friends - whose
+    /// separators are not filename characters on the filesystems Android mounts the game
+    /// directory on. Everything that is not plainly filename-safe flattens to `_`; the readable
+    /// parts keep their shape so the file can be matched back to its pipeline by eye.
+    #[test]
+    fn locations_flatten_to_one_safe_stem() {
+        assert_eq!(
+            pipeline_file_stem("minecraft:pipeline/core/particle"),
+            "minecraft_pipeline_core_particle"
+        );
+
+        assert_eq!(pipeline_file_stem("rendertype_solid"), "rendertype_solid");
+
+        // An empty name is an empty stem - degenerate, but not a path traversal.
+        assert_eq!(pipeline_file_stem(""), "");
+
+        // The separators that would escape the directory, dots included: a name of only dots
+        // must not become `..`, which joined onto a directory is the parent directory.
+        assert_eq!(pipeline_file_stem("../escape:name"), "___escape_name");
+        assert_eq!(pipeline_file_stem(".."), "__");
+        assert_eq!(pipeline_file_stem("a.b-c_d"), "a_b-c_d");
     }
 }
