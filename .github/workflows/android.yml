@@ -59,9 +59,11 @@ jobs:
         # silently. Checked first, so the failure costs seconds rather than a full build.
         run: |
           tag="${GITHUB_REF#refs/tags/}"
-          number="$(echo "$tag" | grep -oE '[0-9]+$')"
+          # The number sits in the middle of `v0.1.K-android`, so it is the last run of digits in
+          # the whole tag, not the suffix: grep them all and take the last.
+          number="$(echo "$tag" | grep -oE '[0-9]+' | tail -n1)"
           if [ -z "$number" ]; then
-            echo "::error::tag $tag does not end in a number; the version mapping v0.1.K-android -> android.(K+1) cannot be checked"
+            echo "::error::tag $tag carries no version number; the mapping v0.1.K-android -> android.(K+1) cannot be checked"
             exit 1
           fi
           want="2612.0.8-android.$((number + 1))"
