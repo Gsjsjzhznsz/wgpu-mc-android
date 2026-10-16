@@ -1735,23 +1735,13 @@ public class WgpuRenderPass implements RenderPassBackend {
         capturedForeign = false;
 
         if (draw.uniformUploaderConsumer() != null) {
-            // The adapter is made once and reused: `this::captureUniform` here allocated a fresh
-            // lambda object per draw of every frame - one small object, thousands of them a second,
-            // on a heap this device is already squeezing. A cast is free; the allocation was not.
-            @SuppressWarnings("unchecked")
-            java.util.function.BiConsumer<T, GpuBufferSlice> adapter =
-                (java.util.function.BiConsumer<T, GpuBufferSlice>) captureUniformAdapter;
-            if (adapter == null) {
-                adapter = this::captureUniform;
-                captureUniformAdapter = adapter;
-            }
-
-            draw.uniformUploaderConsumer().accept(uniformArgument, adapter);
+            // Caching this adapter (one small object per draw) wanted the uploader interface named
+            // for a field's type, and that type is the game's to move; the method reference rides
+            // the accept call's own target typing instead. The put/get dedupe below is the part of
+            // this path that was a real lookup per draw.
+            draw.uniformUploaderConsumer().accept(uniformArgument, this::captureUniform);
         }
     }
-
-    /** The per-draw capture adapter, made on the first draw and reused. See [captureUniformUploads]. */
-    private Object captureUniformAdapter;
 
     /** One uniform a draw uploaded. See [captureUniformUploads]. */
     private void captureUniform(String name, GpuBufferSlice value) {
