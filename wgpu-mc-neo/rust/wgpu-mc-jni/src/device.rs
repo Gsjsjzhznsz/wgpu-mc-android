@@ -2567,6 +2567,33 @@ pub extern "C" fn create_render_pass(
     Box::new(BlazeRenderPass::new(render_pass.forget_lifetime()))
 }
 
+/// Answers whether the JVM handed a NULL render pass in, and reports it once.
+///
+/// The pass arrives as the pointer the JVM holds, and a JVM that passes NULL is one whose pass was
+/// taken away from under it: the graph takeover closes a pass's native side and leaves `nativePass`
+/// null on the Java side from there on, so a draw that reaches the native side past a missing guard
+/// dereferences the pass inside `bind_for_call` - a SIGSEGV at a low address, which reads as a Rust
+/// bug rather than the JVM-side missing guard it is. Answered here as the refusal each entry already
+/// documents, so the picture loses draws and the log names the mistake instead of the process dying.
+/// The android.18 crash was exactly one missing guard (`batch`) reaching here with a NULL pass.
+static NULL_PASS_REPORTED: AtomicBool = AtomicBool::new(false);
+
+fn null_pass(pass: &mut BlazeRenderPass) -> bool {
+    if !std::ptr::from_mut(pass).is_null() {
+        return false;
+    }
+
+    if !NULL_PASS_REPORTED.swap(true, Ordering::Relaxed) {
+        error!(
+            "wgpu-mc: a native call arrived with a NULL render pass - the JVM called into a pass \
+             whose native side the graph takeover closed; the call is refused rather than \
+             dereferenced"
+        );
+    }
+
+    true
+}
+
 /// Records one draw, bindings and all.
 ///
 /// The whole per-draw ABI: the call carries the pipeline, the vertex and index buffers, the draw
@@ -2578,6 +2605,10 @@ pub extern "C" fn create_render_pass(
 /// them and ask again. See `DrawCall::combo`.
 #[unsafe(no_mangle)]
 pub extern "C" fn draw_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) -> bool {
+    if null_pass(pass) {
+        return false;
+    }
+
     crate::blaze::draw_call(wm, pass, call)
 }
 
@@ -2599,6 +2630,10 @@ pub extern "C" fn draw_call_batch(
     template: &DrawCall,
     records: &RawArray<BatchRecord>,
 ) -> u32 {
+    if null_pass(pass) {
+        return 0;
+    }
+
     crate::blaze::draw_call_batch(wm, pass, template, records)
 }
 
@@ -4545,6 +4580,10 @@ pub extern "C" fn set_scissor_rect(
     width: u32,
     height: u32,
 ) {
+    if null_pass(pass) {
+        return;
+    }
+
     pass.pass_mut().set_scissor_rect(x, y, width, height);
 }
 

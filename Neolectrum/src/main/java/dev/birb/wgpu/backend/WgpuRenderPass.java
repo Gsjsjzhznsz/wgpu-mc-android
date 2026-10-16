@@ -1564,6 +1564,17 @@ public class WgpuRenderPass implements RenderPassBackend {
             VertexFormat.IndexType defaultIndexType,
             @NonNull Collection<String> dynamicUniforms,
             @NonNull T uniformArgument) {
+        if (graphTerrain) {
+            // The graph drew this pass's terrain from the Rust baker's meshes; Minecraft's own
+            // meshes for the same layer are what it replaced, and `record` already drops them one
+            // draw at a time. The multi-draw path has to drop them before anything else, because
+            // `batch` is one native call that hands the pass over - and the takeover closed this
+            // pass's native side, so that pass is NULL. This is the android.18 crash: the first
+            // frame the graph took the opaque pass, Minecraft's own section draws for the same
+            // pass arrived here and the batch dereferenced a NULL pass inside `bind_for_call`.
+            return;
+        }
+
         if (Diagnostics.loggingEnabled()) {
             countMultiDraw(draws, defaultIndexBuffer, defaultIndexType);
         }
@@ -1774,6 +1785,15 @@ public class WgpuRenderPass implements RenderPassBackend {
      */
     private <T> int batch(
             List<RenderPass.Draw<T>> run, GpuBuffer indexBuffer, VertexFormat.IndexType indexType) {
+        if (graphTerrain) {
+            // The pass this batch would be recorded into was closed by the takeover - the native
+            // side is gone and `nativePass` is NULL - so there is nothing to hand the run to. Zero
+            // sends the caller down the one-draw-at-a-time path, where `record` drops the draws as
+            // well. Kept beside the same guard in `drawMultipleIndexed` because this is the one
+            // method that reaches the native side without going through `record`.
+            return 0;
+        }
+
         if (activePipelineInvalid) {
             // The driver refused this pipeline - see `activePipelineInvalid`. Zero sends the caller
             // down the one-draw-at-a-time path, where `record` skips every draw of it as well.
