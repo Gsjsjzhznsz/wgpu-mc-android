@@ -773,7 +773,7 @@ impl Settings {
     /// Loads the settings from disk, or returns the defaults.
     pub fn load_or_default() -> Settings {
         let config_path = Self::config_path_get_or_init();
-        let setting = if config_path.exists() {
+        let mut setting = if config_path.exists() {
             let contents = std::fs::read_to_string(config_path).unwrap_or_default();
             match serde_json::from_str(&contents) {
                 Ok(settings) => settings,
@@ -789,8 +789,38 @@ impl Settings {
             default.write();
             default
         };
+        setting.enforce_android_terrain();
         log::info!("Loaded settings: {setting:?}");
         setting
+    }
+
+    /// On Android the terrain is always drawn by this side's own path, whatever the config says.
+    ///
+    /// **Why a setting the player owns gets overridden here.** The devices this port runs on have
+    /// carried a config whose `terrain` answers off since the builds that first wrote it - before
+    /// the game-pipeline path behind it had ever drawn a world - and that answer has survived every
+    /// release since, because a config file outlives the code that wrote it. The path it selects
+    /// has now been shown (android.16's log) to submit its draws and paint nothing, on the one
+    /// device that can reach a world at all, while the path this switch turns off is the one the
+    /// renderer is built around and the one every earlier mobile fix (`WM_CHUNK_PAD`, the per-draw
+    /// block, the lightmap handover) was written for. Until the game-pipeline path has drawn terrain
+    /// once, anywhere, Android does not trust a config that asks for it - and the value this writes
+    /// is persisted, so the next launch reads a config that agrees.
+    pub fn enforce_android_terrain(&mut self) {
+        self.enforce_android_terrain_on(cfg!(target_os = "android"));
+    }
+
+    /// [`Settings::enforce_android_terrain`] with the platform handed in, so the rule itself has a
+    /// test on every host rather than only on the phone it fires on.
+    fn enforce_android_terrain_on(&mut self, android: bool) {
+        if android && !self.terrain.value {
+            log::info!(
+                "wgpu-mc: the config asks for Minecraft's own terrain path, which has not drawn \
+                 terrain on any device this port runs on; the terrain comes from this side's own \
+                 path instead, and `terrain` is held on until that changes"
+            );
+            self.terrain.value = true;
+        }
     }
 
     /// Where the renderer config lives, under the game directory.
@@ -2355,6 +2385,42 @@ mod tests {
             serde_json::from_str(r#"{ "terrain_indirect": { "type": "bool", "value": true } }"#)
                 .expect("config asking for the batching");
         assert!(asked.terrain_indirect.value);
+    }
+
+    /// Android runs the terrain this side draws, whatever the config it was handed says.
+    ///
+    /// The devices this port ships to have carried configs whose `terrain` answers off since the
+    /// builds that first wrote them - and the path that answer selects is the one android.16's log
+    /// showed submitting its terrain draws and painting nothing. See
+    /// [`Settings::enforce_android_terrain`]. The rule is tested through the platform-injected
+    /// form, because the phone is the only place `cfg!(target_os = "android")` answers true and
+    /// CI is not the phone.
+    #[test]
+    fn android_holds_the_terrain_switch_on_whatever_the_config_says() {
+        let off = r#"{ "terrain": { "type": "bool", "value": false } }"#;
+
+        let mut settings: Settings =
+            serde_json::from_str(off).expect("a config that asks for the game's own terrain");
+        settings.enforce_android_terrain_on(true);
+        assert!(
+            settings.terrain.value,
+            "android runs this side's terrain path over the config's answer"
+        );
+
+        let mut settings: Settings = serde_json::from_str(
+            r#"{ "terrain": { "type": "bool", "value": true } }"#,
+        )
+        .expect("a config that already agrees");
+        settings.enforce_android_terrain_on(true);
+        assert!(settings.terrain.value, "an agreeing config is left alone");
+
+        let mut settings: Settings =
+            serde_json::from_str(off).expect("the same off config, off the phone");
+        settings.enforce_android_terrain_on(false);
+        assert!(
+            !settings.terrain.value,
+            "off the phone the config's answer stands in both directions"
+        );
     }
 
     #[test]

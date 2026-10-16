@@ -748,10 +748,15 @@ pub fn sendSettings(mut env: JNIEnv, _class: JClass, settings: JString) -> bool 
     }
 
     let json: String = env.get_string(&settings).unwrap().into();
-    let Ok(settings) = serde_json::from_str::<Settings>(json.as_str()) else {
+    let Ok(mut settings) = serde_json::from_str::<Settings>(json.as_str()) else {
         log::error!("wgpu-mc: the options screen sent settings that could not be parsed");
         return false;
     };
+
+    // Before the write, so the persisted document agrees with what this session runs: on Android
+    // the terrain comes from this side's own path whatever the screen sent - see
+    // `Settings::enforce_android_terrain`.
+    settings.enforce_android_terrain();
 
     if !settings.write() {
         // The settings are still applied below, so the running game behaves as asked; only the
