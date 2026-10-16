@@ -527,6 +527,12 @@ pub struct Scene {
     pub entity_instances: Mutex<HashMap<String, BundledEntityInstances>>,
     pub sky_state: ArcSwap<SkyState>,
 
+    /// The sky's geometry, built once per scene and reused every frame: the sun, the domes and the
+    /// fog sphere are constants and the moon is one buffer per phase, and rebuilding them every
+    /// frame was eight GPU allocations a frame for nothing. See
+    /// [`crate::render::sky::SkyGeometry`].
+    pub sky_geometry: std::sync::OnceLock<crate::render::sky::SkyGeometry>,
+
     pub render_effects: ArcSwap<RenderEffectsData>,
 
     pub depth_texture: RwLock<wgpu::Texture>,
@@ -702,6 +708,7 @@ impl Scene {
 
             entity_instances: Default::default(),
             sky_state: Default::default(),
+            sky_geometry: Default::default(),
             render_effects: Default::default(),
             depth_texture: wm
                 .gpu
@@ -878,9 +885,15 @@ impl MinecraftState {
                                                     return None;
                                                 }
 
+                                                // A pair without its `=` is a pack's typo, and it
+                                                // used to be an `unwrap` on the block-cache
+                                                // thread: the pair is skipped, the rest kept.
+                                                let name = split.next()?;
+                                                let value = split.next()?;
+
                                                 Some((
-                                                    split.next().unwrap().to_string(),
-                                                    match split.next().unwrap() {
+                                                    name.to_string(),
+                                                    match value {
                                                         "true" => StateValue::Bool(true),
                                                         "false" => StateValue::Bool(false),
                                                         other => StateValue::String(other.into()),

@@ -696,7 +696,7 @@ impl ResourceProvider for MinecraftResourceManagerAdapter {
 /// Two callers, and the sentence is deliberately about neither of them: the resource path, where a
 /// resource could not be read, and the class loader's own resolution of
 /// [`TintHelpers`], where a class could not be loaded.
-fn describe_and_clear(env: &mut JNIEnv, what: &str) {
+pub(crate) fn describe_and_clear(env: &mut JNIEnv, what: &str) {
     if !env.exception_check().unwrap_or(false) {
         return;
     }
@@ -2507,14 +2507,21 @@ pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
             state_key
                 .split(',')
                 .filter_map(|kv_pair| {
+                    // A pair without its `=` (a pack or a mod wrote `{"facing": {...}}` where
+                    // `"facing=north"` belongs) is skipped with the rest kept: it used to panic
+                    // on the block-cache thread, and a malformed key closing the game is the
+                    // server's typo winning.
                     let mut split = kv_pair.split('=');
                     if kv_pair.is_empty() {
                         return None;
                     }
 
+                    let name = split.next()?;
+                    let value = split.next()?;
+
                     Some((
-                        split.next().unwrap(),
-                        match split.next().unwrap() {
+                        name,
+                        match value {
                             "true" => StateValue::Bool(true),
                             "false" => StateValue::Bool(false),
                             other => StateValue::String(other.into()),
@@ -2526,7 +2533,19 @@ pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
             vec![]
         };
         let atlases = wm.mc.texture_manager.atlases.write();
-        let atlas = &atlases[BLOCK_ATLAS];
+        // The sprite-drain branch above answers a missing atlas by hand; this loop serves the
+        // state the same way instead of indexing into what is not there.
+        let Some(atlas) = atlases.get(BLOCK_ATLAS) else {
+            note_unmodelled(block_name);
+            mappings.push((
+                BlockstateKey {
+                    block: fallback_id as u16,
+                    augment: 0,
+                },
+                global_ref,
+            ));
+            return;
+        };
 
         let wm_block = &block_manager.blocks[id_key];
         let model = wm_block.get_model_by_key(
@@ -2584,7 +2603,10 @@ pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
     drop(stdout);
 
     mappings.iter().for_each(|(blockstate_key, global_ref)| {
-        env.call_static_method(
+        // Thirty thousand callbacks per reload: one pending Java exception inside one of them
+        // (an OOM, a shutdown race) is skipped with the rest kept, where an `unwrap` on the JNI
+        // error aborted the process from the block-cache thread.
+        if let Err(err) = env.call_static_method(
             "dev/birb/wgpu/render/Wgpu",
             "helperSetBlockStateIndex",
             "(Ljava/lang/Object;I)V",
@@ -2592,8 +2614,14 @@ pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
                 JValue::Object(global_ref.as_obj()),
                 JValue::Int(blockstate_key.pack() as i32),
             ],
-        )
-        .unwrap();
+        ) {
+            describe_and_clear(&mut env, "cacheBlockStates: helperSetBlockStateIndex threw");
+            log::warn!(
+                "wgpu-mc: helperSetBlockStateIndex failed ({err}); the rest of the states are \
+                 skipped"
+            );
+            return;
+        }
     });
 
     // The block models are baked in two passes and this is the seam between them: `bake_blocks` baked

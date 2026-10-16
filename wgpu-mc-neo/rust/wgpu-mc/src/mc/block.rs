@@ -1296,7 +1296,13 @@ fn get_atlas_uv(
             90 => ((tw.1 - uv[1], uv[0]), (tw.1 - uv[3], uv[2])),
             180 => ((tw.0 - uv[0], tw.1 - uv[1]), (tw.0 - uv[2], tw.1 - uv[3])),
             270 => ((uv[1], tw.0 - uv[0]), (uv[3], tw.0 - uv[2])),
-            _ => unreachable!(),
+            // The schema takes the model file's word for the turn, and a pack can write
+            // anything - `"rotation": 45` used to be `unreachable!()` inside a bake, on a
+            // worker whose panic closes the game. The face is drawn unturned instead.
+            _ => {
+                warn_once_non_quarter_turn(rotation);
+                ((uv[0], uv[1]), (uv[2], uv[3]))
+            }
         };
         (
             (tex.0.0 + uvs.0.0, tex.0.1 + uvs.0.1),
@@ -1322,7 +1328,24 @@ fn sprite_fractions(uv: [f32; 4], rotation: u32) -> ((f32, f32), (f32, f32)) {
         90 => ((1.0 - uv[1], uv[0]), (1.0 - uv[3], uv[2])),
         180 => ((1.0 - uv[0], 1.0 - uv[1]), (1.0 - uv[2], 1.0 - uv[3])),
         270 => ((uv[1], 1.0 - uv[0]), (uv[3], 1.0 - uv[2])),
-        _ => unreachable!("a model face is turned by one of four quarter turns"),
+        // [`get_atlas_uv`] says why: a pack's turn that is not a quarter turn is drawn
+        // unturned rather than reached.
+        _ => {
+            warn_once_non_quarter_turn(rotation);
+            ((uv[0], uv[1]), (uv[2], uv[3]))
+        }
+    }
+}
+
+/// The once line for a model face whose `rotation` the game's four quarter turns do not name.
+fn warn_once_non_quarter_turn(rotation: u32) {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        log::warn!(
+            "wgpu-mc: a model face is turned by {rotation} degrees, which is not one of the \
+             game's four quarter turns - it is drawn unturned"
+        );
     }
 }
 

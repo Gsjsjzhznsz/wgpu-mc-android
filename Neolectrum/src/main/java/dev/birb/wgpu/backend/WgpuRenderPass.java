@@ -357,6 +357,21 @@ public class WgpuRenderPass implements RenderPassBackend {
         }
     }
 
+    /**
+     * One draw, the typed way: {@code invokeExact} against a handle whose type is
+     * {@code (MemorySegment, MemorySegment, MemorySegment)boolean} - which is what
+     * {@link WmNative#drawCall} is - carries no varargs array, no boxing and no {@code asType}
+     * adaptation, all of which {@link #invoke} pays per call and the per-draw path is the hottest
+     * caller of.
+     */
+    private static boolean invokeDrawCall(MemorySegment renderer, MemorySegment pass, MemorySegment call) {
+        try {
+            return (boolean) WmNative.drawCall.invokeExact(renderer, pass, call);
+        } catch (Throwable throwable) {
+            throw new IllegalStateException("wgpu: a per-draw native call failed", throwable);
+        }
+    }
+
     @Override
     public void pushDebugGroup(@NonNull Supplier<String> label) {
         openDebugGroups++;
@@ -1393,7 +1408,7 @@ public class WgpuRenderPass implements RenderPassBackend {
         // build a bind group from it, and this names the culprit before that happens.
         reportEmptySlots();
 
-        boolean recorded = (boolean) invoke(WmNative.drawCall, device.renderer(), nativePass, drawCall);
+        boolean recorded = invokeDrawCall(device.renderer(), nativePass, drawCall);
 
         if (!recorded) {
             // The native side does not know this combination and was not given the bindings to build
@@ -1403,7 +1418,7 @@ public class WgpuRenderPass implements RenderPassBackend {
             // and the same call is made again: the pipeline and the vertex buffers it recorded before
             // it looked at the bindings are the same ones, so re-recording them changes nothing.
             drawCall.set(WmNative.INT, WmNative.DRAW_CALL_BINDINGS_PRESENT, 1);
-            recorded = (boolean) invoke(WmNative.drawCall, device.renderer(), nativePass, drawCall);
+            recorded = invokeDrawCall(device.renderer(), nativePass, drawCall);
             reportRefusedDraw(recorded);
         }
 
@@ -1720,9 +1735,23 @@ public class WgpuRenderPass implements RenderPassBackend {
         capturedForeign = false;
 
         if (draw.uniformUploaderConsumer() != null) {
-            draw.uniformUploaderConsumer().accept(uniformArgument, this::captureUniform);
+            // The adapter is made once and reused: `this::captureUniform` here allocated a fresh
+            // lambda object per draw of every frame - one small object, thousands of them a second,
+            // on a heap this device is already squeezing. A cast is free; the allocation was not.
+            @SuppressWarnings("unchecked")
+            java.util.function.BiConsumer<T, GpuBufferSlice> adapter =
+                (java.util.function.BiConsumer<T, GpuBufferSlice>) captureUniformAdapter;
+            if (adapter == null) {
+                adapter = this::captureUniform;
+                captureUniformAdapter = adapter;
+            }
+
+            draw.uniformUploaderConsumer().accept(uniformArgument, adapter);
         }
     }
+
+    /** The per-draw capture adapter, made on the first draw and reused. See [captureUniformUploads]. */
+    private Object captureUniformAdapter;
 
     /** One uniform a draw uploaded. See [captureUniformUploads]. */
     private void captureUniform(String name, GpuBufferSlice value) {
@@ -1740,8 +1769,9 @@ public class WgpuRenderPass implements RenderPassBackend {
         // whole block per record, so the slice's offset over its own length is the record it is, and
         // nothing here has to ask a device for a stride.
         GpuBuffer buffer = value.buffer();
-        boundBindings.put(name, Bound.buffer(((WgpuBuffer) buffer).nativeBuffer(), 0L, buffer.size()));
-        writeSlot(slot, boundBindings.get(name));
+        Bound bound = Bound.buffer(((WgpuBuffer) buffer).nativeBuffer(), 0L, buffer.size());
+        boundBindings.put(name, bound);
+        writeSlot(slot, bound);
 
         capturedInstance = value.length() > 0L ? (int) (value.offset() / value.length()) : 0;
     }

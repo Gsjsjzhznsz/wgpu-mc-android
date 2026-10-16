@@ -1,3 +1,7 @@
+use parking_lot::RwLock;
+use wgpu::util::DeviceExt;
+use std::collections::HashMap;
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SkyVertex {
@@ -207,3 +211,94 @@ impl SunMoonVertex {
 //     }
 //
 // }
+
+/// The sky's geometry, built once per scene and drawn every frame from the same buffers.
+///
+/// The sun's quad, the light and dark sky domes and the fog sphere are constants; the moon's only
+/// input is the phase, of which the game has eight. All of it used to be rebuilt **every frame** -
+/// eight `create_buffer_init` calls, eight GPU allocations and eight uploads a frame, for data that
+/// does not change between them - which is a per-frame cost a phone pays for nothing. The buffers
+/// live as long as the scene does, and the scene is made against one device, so nothing here can
+/// outlive the device it was created on.
+pub struct SkyGeometry {
+    pub sun: wgpu::Buffer,
+    /// The moon quad per phase, built on the first frame that asks for it. The game's phases are
+    /// eight, so the map is bounded by that.
+    moon_phases: RwLock<HashMap<i32, wgpu::Buffer>>,
+    /// The light dome: vertex buffer, index buffer.
+    pub light_sky: (wgpu::Buffer, wgpu::Buffer),
+    /// The dark dome: vertex buffer, index buffer.
+    pub dark_sky: (wgpu::Buffer, wgpu::Buffer),
+    /// The fog sphere: vertex buffer, index buffer.
+    pub fog: (wgpu::Buffer, wgpu::Buffer),
+}
+
+impl SkyGeometry {
+    pub fn new(device: &wgpu::Device) -> Self {
+        let buffer = |contents: &[u8], usage: wgpu::BufferUsages| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents,
+                usage,
+            })
+        };
+
+        let (light_sky_vertices, light_sky_indices) = SkyVertex::load_vertex_light_sky();
+        let (dark_sky_vertices, dark_sky_indices) = SkyVertex::load_vertex_dark_sky();
+        let (fog_sphere_vertices, fog_sphere_indices) = SkyVertex::load_fog_sphere();
+
+        Self {
+            sun: buffer(
+                bytemuck::cast_slice(&SunMoonVertex::load_vertex_sun()),
+                wgpu::BufferUsages::VERTEX,
+            ),
+            moon_phases: RwLock::new(HashMap::new()),
+            light_sky: (
+                buffer(
+                    bytemuck::cast_slice(&light_sky_vertices),
+                    wgpu::BufferUsages::VERTEX,
+                ),
+                buffer(
+                    bytemuck::cast_slice(&light_sky_indices),
+                    wgpu::BufferUsages::INDEX,
+                ),
+            ),
+            dark_sky: (
+                buffer(
+                    bytemuck::cast_slice(&dark_sky_vertices),
+                    wgpu::BufferUsages::VERTEX,
+                ),
+                buffer(
+                    bytemuck::cast_slice(&dark_sky_indices),
+                    wgpu::BufferUsages::INDEX,
+                ),
+            ),
+            fog: (
+                buffer(
+                    bytemuck::cast_slice(&fog_sphere_vertices),
+                    wgpu::BufferUsages::VERTEX,
+                ),
+                buffer(
+                    bytemuck::cast_slice(&fog_sphere_indices),
+                    wgpu::BufferUsages::INDEX,
+                ),
+            ),
+        }
+    }
+
+    /// The moon quad for [phase], built the first frame that asks for the phase and reused after.
+    pub fn moon(&self, device: &wgpu::Device, phase: i32) -> wgpu::Buffer {
+        if let Some(buffer) = self.moon_phases.read().get(&phase) {
+            return buffer.clone();
+        }
+
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&SunMoonVertex::load_vertex_moon(phase)),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        self.moon_phases.write().insert(phase, buffer.clone());
+        buffer
+    }
+}

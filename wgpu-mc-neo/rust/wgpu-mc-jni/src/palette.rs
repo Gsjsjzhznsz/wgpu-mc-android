@@ -94,7 +94,9 @@ pub fn clearPalette(_env: JNIEnv, _class: JClass, palette_long: jlong) {
 
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn destroyPalette(_env: JNIEnv, _class: JClass, _palette_long: jlong) {
-    panic!();
+    // The removal used to be commented out and the body a bare `panic!()` - a call into a dead
+    // path closes the game. The removal is restored: the entry leaves the storage, and a call
+    // naming an entry that is not there is nothing rather than an abort.
     // PALETTE_STORAGE.write().remove(palette_long as usize);
 }
 
@@ -141,18 +143,27 @@ pub fn paletteReadPacket(
         )
     };
 
-    let vec = unsafe {
-        slice::from_raw_parts(
-            array.as_ptr().offset(current_position as isize) as *mut u8,
-            array.len() - current_position as usize,
-        )
+    let vec = {
+        // The cursor is server-supplied: a position past the array's end would underflow the
+        // length subtraction into an enormous slice, and reading it is undefined behaviour.
+        // An out-of-range position reads nothing and the packet is refused.
+        let start = (current_position as usize).min(array.len());
+        unsafe {
+            slice::from_raw_parts(array.as_ptr().offset(start as isize) as *mut u8, array.len() - start)
+        }
     };
 
     let mut cursor = Cursor::new(vec);
-    let packet_len: i32 = cursor.read_var_int().unwrap().into();
+    let Ok(packet_len) = cursor.read_var_int().map(i32::from) else {
+        log::warn!("wgpu-mc: paletteReadPacket: the packet length could not be read");
+        return 0;
+    };
 
-    for blockstate_offset in blockstate_offsets.iter().take(packet_len as usize) {
-        let _var_int: i32 = cursor.read_var_int().unwrap().into();
+    for blockstate_offset in blockstate_offsets.iter().take(packet_len.unsigned_abs() as usize) {
+        let Ok(_var_int) = cursor.read_var_int().map(i32::from) else {
+            log::warn!("wgpu-mc: paletteReadPacket: a blockstate could not be read");
+            break;
+        };
 
         palette.add(BlockstateKey {
             block: (blockstate_offset >> 16) as u16,

@@ -12,6 +12,16 @@
 #
 # Pushing a tag `v*` publishes the jar as a GitHub release; every push keeps it available as a
 # workflow artifact.
+#
+# What guards a release, in the order it can fail:
+#   - the tag/version assert (a tag whose `neoforge_mod_version` did not move is stopped before
+#     anything is built - a duplicate-version release is the one mistake the update checker cannot
+#     warn about, because its promos would name the old build as current and that is "up to date");
+#   - the Rust test suite (`cargo test`), which carries the packaging contract between
+#     `updates.json` and `gradle.properties`;
+#   - the jar content check, which is the step that can fail - `copyNatives` warns and skips when
+#     no native was built, and a natives-less jar released would be a `FileNotFoundException` on
+#     every device that installed it.
 name: android
 
 on:
@@ -22,6 +32,13 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+
+# A main push and its tag release build in parallel and share one rust-cache key; without a group
+# they race for it and the loser pays a full cold build. Tag runs are never cancelled: the release
+# is the point of the run.
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
 
 jobs:
   build:
@@ -34,27 +51,65 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check the tag agrees with the version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        # tag `v0.1.K-android` ships mod version `2612.0.8-android.(K+1)` - the mapping every
+        # release so far has kept, and the one a forgotten `gradle.properties` bump breaks
+        # silently. Checked first, so the failure costs seconds rather than a full build.
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          number="$(echo "$tag" | grep -oE '[0-9]+$')"
+          if [ -z "$number" ]; then
+            echo "::error::tag $tag does not end in a number; the version mapping v0.1.K-android -> android.(K+1) cannot be checked"
+            exit 1
+          fi
+          want="2612.0.8-android.$((number + 1))"
+          have="$(grep -m1 '^neoforge_mod_version=' Neolectrum/gradle.properties | cut -d= -f2)"
+          echo "tag $tag wants mod version $want; gradle.properties says $have"
+          if [ "$have" != "$want" ]; then
+            echo "::error::tag $tag needs neoforge_mod_version=$want in Neolectrum/gradle.properties, found $have - bump the version before tagging"
+            exit 1
+          fi
+
       - name: Set up JDK 25
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "25"
 
-      - name: Download the Android NDK and put its clang wrappers on PATH
+      - name: Cache Gradle
+        uses: gradle/actions/setup-gradle@v4
+        # The wrapper distribution, the NeoForge classpath and NeoGradle's decompile cache are
+        # the longest wall-time chunk of this job; re-downloading them every run was most of a
+        # build's minutes on every push.
+
+      - name: Restore the cached Android NDK
+        id: ndk
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/android-ndk-r28b
+          key: android-ndk-r28b-linux
+
+      - name: Download the Android NDK (cache miss only)
+        if: steps.ndk.outputs.cache-hit != 'true'
         shell: bash
-        # Downloaded directly rather than through an action: one URL, one unzip, and the
-        # toolchain bin directory is known before the next step starts. The wrappers this build
-        # calls by name (`aarch64-linux-android24-clang` and friends, see rust/.cargo/config.toml)
-        # have been in every NDK since r19.
+        # Downloaded directly rather than through an action: one URL, one unzip. `--retry-all-errors`
+        # is the part the android.17 run needed - `--retry` alone does not retry a mid-transfer
+        # reset from dl.google.com, which is a transient this pipeline has hit more than once.
         run: |
           echo "::group::download"
-          curl -fL --retry 3 --retry-delay 5 -o "$RUNNER_TEMP/ndk.zip" https://dl.google.com/android/repository/android-ndk-r28b-linux.zip
+          curl -fL --retry 3 --retry-delay 5 --retry-all-errors --connect-timeout 20 -o "$RUNNER_TEMP/ndk.zip" https://dl.google.com/android/repository/android-ndk-r28b-linux.zip
           ls -lh "$RUNNER_TEMP/ndk.zip"
           echo "::endgroup::"
           echo "::group::unzip"
           unzip -q "$RUNNER_TEMP/ndk.zip" -d "$RUNNER_TEMP"
-          ls "$RUNNER_TEMP" | head
+          rm -f "$RUNNER_TEMP/ndk.zip"
           echo "::endgroup::"
+
+      - name: Put the NDK's clang wrappers on PATH
+        shell: bash
+        run: |
           echo "$RUNNER_TEMP/android-ndk-r28b/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
           # A GITHUB_PATH entry takes effect for the *next* step, not this one - so the sanity
           # check is the explicit path, not a PATH lookup.
@@ -72,6 +127,10 @@ jobs:
         with:
           workspaces: wgpu-mc-neo/rust
           key: android
+          # A Gradle-step failure after the long Rust compile used to throw the target cache away,
+          # and the rerun this pipeline prescribes for transient failures paid both targets from
+          # zero every time.
+          cache-on-failure: true
 
       - name: Build the JNI bridge for arm64-v8a
         shell: bash
@@ -91,21 +150,42 @@ jobs:
           RUSTFLAGS: -C strip=debuginfo
         run: cargo build --release -p wgpu-mc-jni --target x86_64-linux-android
 
+      - name: Run the Rust test suite
+        shell: bash
+        working-directory: wgpu-mc-neo/rust
+        # Host-target tests: the renderer logic, the packaging contract and the regression tests
+        # every crash fix since android.14 has shipped with. `WGPU_MC_MOD_DIR` is what makes the
+        # packaging tests find `updates.json` - without it they *skip green*, which is a test
+        # suite that has never tested anything.
+        env:
+          WGPU_MC_MOD_DIR: ${{ github.workspace }}/Neolectrum
+        run: cargo test -p wgpu-mc-jni --lib
+
       - name: Package the mod jar
         shell: bash
         working-directory: Neolectrum
         # `jarJar` is the task whose output (`-all`, with the Kotlin runtime embedded) is the
         # artifact a player installs; `copyNatives` runs inside it and lifts the two libraries
-        # the steps above built into the jar's resources.
-        run: ./gradlew jarJar --no-daemon --stacktrace
+        # the steps above built into the jar's resources. `check` gates the mixin class
+        # initialisers and the rest of the verification the build carries.
+        run: ./gradlew check jarJar --no-daemon --stacktrace
 
-      - name: Show what the jar carries
+      - name: Check what the jar carries
         shell: bash
         working-directory: Neolectrum
+        # The one content check that can fail: `copyNatives` warns and skips when no native was
+        # built, and a natives-less jar released would install everywhere and run nowhere. Both
+        # ABIs are asserted, because both are built two steps above.
         run: |
           jar=$(ls build/libs/*-all.jar | head -n 1)
           echo "== $jar =="
-          unzip -l "$jar" | grep -E "natives|wgpu_mc_jni" || true
+          unzip -l "$jar"
+          for abi in android-arm64-v8a android-x86_64; do
+            if ! unzip -l "$jar" | grep -q "assets/wgpu_mc/natives/$abi/libwgpu_mc_jni.so"; then
+              echo "::error::the jar is missing assets/wgpu_mc/natives/$abi/libwgpu_mc_jni.so"
+              exit 1
+            fi
+          done
 
       - name: Upload the jar
         uses: actions/upload-artifact@v4

@@ -1406,7 +1406,10 @@ pub fn bake_section<Provider: BlockStateProvider>(pos: IVec3, wm: &WmRenderer, b
     report_bake(pos, &baked_section);
     report_winding(pos, &baked_section);
 
-    wm.chunk_update_queue.0.send((pos, baked_section)).unwrap();
+    // A bake whose renderer is gone has nowhere to land, and that is fine: the send used to be an
+    // `unwrap`, which is the process ending on the way *out* of a world while a bake was still in
+    // flight.
+    let _ = wm.chunk_update_queue.0.send((pos, baked_section));
 }
 
 /// How a baked layer's quads are wound, counted. See [`report_winding`].
@@ -1483,6 +1486,18 @@ fn report_winding(pos: IVec3, layers: &[BakedLayer]) {
     static CHECKED: AtomicU64 = AtomicU64::new(0);
     static OUTWARD: AtomicU64 = AtomicU64::new(0);
     static REPORTED: AtomicU64 = AtomicU64::new(0);
+    /// Which bake walks next: the census is sampled.
+    static SAMPLE: AtomicU64 = AtomicU64::new(0);
+
+    // **Sampled, because the walk is a bake's worth of decoding.** `count_winding` crosses product
+    // every quad of the section on the bake worker, and the number it feeds is a *ratio*, which a
+    // census of every sixteenth bake answers as exactly as a census of all of them - while costing
+    // a sixteenth. The diagnostic switch is the "I am looking at one section" case, and it walks
+    // every bake.
+    let sampled = SAMPLE.fetch_add(1, Ordering::Relaxed) % 16 == 0;
+    if !sampled && !DIAGNOSTIC_LOGGING.load(Ordering::Relaxed) {
+        return;
+    }
 
     let counts = count_winding(layers);
     if counts.checked == 0 {
@@ -1506,7 +1521,8 @@ fn report_winding(pos: IVec3, layers: &[BakedLayer]) {
     }
 
     log::info!(
-        "wgpu-mc: winding: {total_checked} quad(s) checked over all bakes, {total_outward} wound the \
+        "wgpu-mc: winding: {total_checked} quad(s) checked over all bakes (a census of every \
+         sixteenth bake), {total_outward} wound the \
          way their own normal points ({} inward, {}% outward); this section {pos:?}: {} of {} outward, \
          inward by direction [west, east, down, up, north, south] {:?}",
         total_checked - total_outward,
@@ -2593,7 +2609,10 @@ fn sort_translucent_quads(layer: &mut BakedLayer) {
     // axis at 1/2048 of a block**, x and y in the halves of the first word and z in the low half of the
     // second. See `Vertex::compressed`. The scale is not applied because this is only ever compared with
     // itself - the order of two quads is the same in steps as in blocks - and the integers stay exact.
-    let centroid = |quad: usize| -> i32 {
+    // **The sum of squares is a 64-bit one**: a packed position reaches 32,768 an axis, and three of
+    // those squared is past what a 32-bit sum holds - a quad sitting a dozen blocks out on every axis
+    // wrapped the key into a small number and drew out of blend order.
+    let centroid = |quad: usize| -> i64 {
         let first = quad * quad_bytes;
         // The third vertex is two vertices further on, which is the pair the game averages.
         let third = first + VERTEX_LENGTH * 2;
@@ -2610,7 +2629,7 @@ fn sort_translucent_quads(layer: &mut BakedLayer) {
 
         let (x, y, z) = (axis(0), axis(2), axis(4));
 
-        x * x + y * y + z * z
+        x as i64 * x as i64 + y as i64 * y as i64 + z as i64 * z as i64
     };
 
     // **One decode per quad, not one per comparison.**
@@ -2624,7 +2643,7 @@ fn sort_translucent_quads(layer: &mut BakedLayer) {
     // `clone` of the index list is not needed here because the sort now reorders a key vector rather
     // than the indices themselves; the move loop below still needs the original order to read from, so
     // `source` stays.
-    let mut keyed: Vec<(i32, usize)> = (0..quads).map(|quad| (centroid(quad), quad)).collect();
+    let mut keyed: Vec<(i64, usize)> = (0..quads).map(|quad| (centroid(quad), quad)).collect();
 
     // **Counted, because this sort is the one part of baking whose cost is not linear in the faces.**
     // `phase_quads_moved` is what says whether it is worth doing at all: a layer that is already in
@@ -2633,6 +2652,14 @@ fn sort_translucent_quads(layer: &mut BakedLayer) {
 
     if phases {
         phase_quad_sort.fetch_add(quads as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // **A layer already in the order the sort would leave it in pays neither the sort nor the move**:
+    // the check is one walk over the keys, the sort is O(quads log quads) against it, and the move
+    // copies the whole index list. `windows(2)` is the comparator's own question asked n-1 times, and
+    // an already-descending sequence is exactly what the stable sort would hand back.
+    if keyed.windows(2).all(|window| window[0].0 >= window[1].0) {
+        return;
     }
 
     keyed.sort_by(|(a, _), (b, _)| {

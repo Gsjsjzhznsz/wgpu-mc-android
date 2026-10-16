@@ -88,6 +88,17 @@ pub fn setMatrix(mut env: JNIEnv, _class: JClass, id: jint, float_array: JFloatA
         converted.push(cursor.read_f32::<LittleEndian>().unwrap());
     }
 
+    // A matrix is sixteen floats, and `from_bytes` panics on anything else - which, called three
+    // times a frame, is the game closing over a wrong-sized array. A mismatch is refused with a
+    // line instead, the way `setFogEnvironment` refuses a short fog block.
+    if converted.len() != 16 {
+        log::warn!(
+            "wgpu-mc: setMatrix got {} floats where a 4x4 matrix is 16 - the update is skipped",
+            converted.len()
+        );
+        return;
+    }
+
     let slice_4x4: [[f32; 4]; 4] = *bytemuck::from_bytes(bytemuck::cast_slice(&converted));
 
     match id {

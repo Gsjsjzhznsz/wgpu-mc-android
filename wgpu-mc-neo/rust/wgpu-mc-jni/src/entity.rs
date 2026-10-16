@@ -255,9 +255,20 @@ pub fn tmd_to_wm(name: String, part: &ModelPartData) -> Option<EntityPart> {
 
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn registerEntities(mut env: JNIEnv, _class: JClass, string: JString) {
-    let wm = RENDERER.get().unwrap();
+    let Some(wm) = RENDERER.get() else {
+        log::warn!(
+            "wgpu-mc: registerEntities arrived before the renderer exists - the upload is skipped"
+        );
+        return;
+    };
 
-    let entities_json_javastr = env.get_string(&string).unwrap();
+    let entities_json_javastr = match env.get_string(&string) {
+        Ok(string) => string,
+        Err(err) => {
+            log::warn!("wgpu-mc: registerEntities could not read the JVM's string: {err}");
+            return;
+        }
+    };
     let entities_json: String = entities_json_javastr.into();
 
     // What arrives is Gson's reflection over the game's own layer definitions, not a shape this side
@@ -337,12 +348,27 @@ pub fn registerEntities(mut env: JNIEnv, _class: JClass, string: JString) {
         .collect();
 
     entities.iter().for_each(|(_entity_name, entity)| {
-        let entity_string = env.new_string(&entity.name).unwrap();
+        // A pending Java exception or a failed string turn is skipped part by part, the way the
+        // tint path describes and clears: one failed callback used to be an `unwrap` on a JNI
+        // error - a panic across the JNI frame, and the game with it.
+        let Ok(entity_string) = env.new_string(&entity.name) else {
+            crate::describe_and_clear(
+                &mut env,
+                "registerEntities: the entity name could not be made into a JVM string",
+            );
+            return;
+        };
 
         entity.parts.iter().for_each(|(name, index)| {
-            let part_string = env.new_string(name).unwrap();
+            let Ok(part_string) = env.new_string(name) else {
+                crate::describe_and_clear(
+                    &mut env,
+                    "registerEntities: the part name could not be made into a JVM string",
+                );
+                return;
+            };
 
-            env.call_static_method(
+            if let Err(err) = env.call_static_method(
                 "dev/birb/wgpu/render/Wgpu",
                 "helperSetPartIndex",
                 "(Ljava/lang/String;Ljava/lang/String;I)V",
@@ -351,8 +377,14 @@ pub fn registerEntities(mut env: JNIEnv, _class: JClass, string: JString) {
                     JValue::Object(&part_string),
                     JValue::Int(*index as jint),
                 ],
-            )
-            .unwrap();
+            ) {
+                crate::describe_and_clear(&mut env, "registerEntities: helperSetPartIndex threw");
+                log::warn!(
+                    "wgpu-mc: registerEntities: helperSetPartIndex failed ({err}); the rest of \
+                     this entity's parts are skipped"
+                );
+                return;
+            }
         });
     });
 

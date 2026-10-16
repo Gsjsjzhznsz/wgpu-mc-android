@@ -4,10 +4,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use treeculler::{AABB, BVol, Frustum, Vec3};
-use wgpu::util::{BufferInitDescriptor, DeviceExt};
+use wgpu::util::DeviceExt;
 
 use wgpu::{
-    BufferUsages, Color, IndexFormat, LoadOp, Operations, RenderPassColorAttachment,
+    Color, IndexFormat, LoadOp, Operations, RenderPassColorAttachment,
     RenderPassDepthStencilAttachment, RenderPassDescriptor, SamplerBindingType, ShaderStages,
     StoreOp,
 };
@@ -3391,27 +3391,24 @@ impl RenderGraph {
                             WmBindGroup::Resource(_) => {}
                         }
                     }
-                    let sun_buffer = wm.gpu.device.create_buffer_init(&BufferInitDescriptor {
-                        label: None,
-                        contents: bytemuck::cast_slice(&SunMoonVertex::load_vertex_sun()),
-                        usage: BufferUsages::VERTEX,
-                    });
-                    let moon_buffer = wm.gpu.device.create_buffer_init(&BufferInitDescriptor {
-                        label: None,
-                        contents: bytemuck::cast_slice(&SunMoonVertex::load_vertex_moon(
-                            scene.sky_state.load().moon_phase,
-                        )),
-                        usage: BufferUsages::VERTEX,
+
+                    // Built once per scene: the sun never changes and the moon is one buffer per
+                    // phase, and rebuilding both every frame was two GPU allocations and two
+                    // uploads a frame for data that does not change between them.
+                    let sky = scene.sky_geometry.get_or_init(|| {
+                        crate::render::sky::SkyGeometry::new(&wm.gpu.device)
                     });
 
                     render_pass.set_pipeline(&bound_pipeline.pipeline);
                     let pc = get_environmental_push_constants(scene);
                     set_push_constants(pipeline_config, &mut render_pass, Some(pc));
 
-                    render_pass.set_vertex_buffer(0, sun_buffer.slice(..));
+                    render_pass.set_vertex_buffer(0, sky.sun.slice(..));
                     render_pass.draw(0..6, 0..1);
 
-                    render_pass.set_vertex_buffer(0, moon_buffer.slice(..));
+                    let moon_phase = scene.sky_state.load().moon_phase;
+                    render_pass
+                        .set_vertex_buffer(0, sky.moon(&wm.gpu.device, moon_phase).slice(..));
                     render_pass.draw(0..6, 0..1);
                 }
                 "@geo_sky_scatter" => {
@@ -3424,45 +3421,23 @@ impl RenderGraph {
                         }
                     }
 
-                    let (light_sky_vertices, light_sky_indices) =
-                        SkyVertex::load_vertex_light_sky();
-                    let light_sky_buffer = (
-                        wm.gpu.device.create_buffer_init(&BufferInitDescriptor {
-                            label: None,
-                            contents: bytemuck::cast_slice(&light_sky_vertices),
-                            usage: BufferUsages::VERTEX,
-                        }),
-                        wm.gpu.device.create_buffer_init(&BufferInitDescriptor {
-                            label: None,
-                            contents: bytemuck::cast_slice(&light_sky_indices),
-                            usage: BufferUsages::INDEX,
-                        }),
-                    );
-
-                    let (dark_sky_vertices, dark_sky_indices) = SkyVertex::load_vertex_dark_sky();
-                    let dark_sky_buffer = (
-                        wm.gpu.device.create_buffer_init(&BufferInitDescriptor {
-                            label: None,
-                            contents: bytemuck::cast_slice(&dark_sky_vertices),
-                            usage: BufferUsages::VERTEX,
-                        }),
-                        wm.gpu.device.create_buffer_init(&BufferInitDescriptor {
-                            label: None,
-                            contents: bytemuck::cast_slice(&dark_sky_indices),
-                            usage: BufferUsages::INDEX,
-                        }),
-                    );
+                    // Built once per scene: the two domes are constants.
+                    let sky = scene.sky_geometry.get_or_init(|| {
+                        crate::render::sky::SkyGeometry::new(&wm.gpu.device)
+                    });
 
                     render_pass.set_pipeline(&bound_pipeline.pipeline);
                     let pc = get_environmental_push_constants(scene);
                     set_push_constants(pipeline_config, &mut render_pass, Some(pc));
 
-                    render_pass.set_vertex_buffer(0, light_sky_buffer.0.slice(..));
-                    render_pass.set_index_buffer(light_sky_buffer.1.slice(..), IndexFormat::Uint32);
+                    render_pass.set_vertex_buffer(0, sky.light_sky.0.slice(..));
+                    render_pass
+                        .set_index_buffer(sky.light_sky.1.slice(..), IndexFormat::Uint32);
                     render_pass.draw_indexed(0..24, 0, 0..1);
 
-                    render_pass.set_vertex_buffer(0, dark_sky_buffer.0.slice(..));
-                    render_pass.set_index_buffer(dark_sky_buffer.1.slice(..), IndexFormat::Uint32);
+                    render_pass.set_vertex_buffer(0, sky.dark_sky.0.slice(..));
+                    render_pass
+                        .set_index_buffer(sky.dark_sky.1.slice(..), IndexFormat::Uint32);
                     render_pass.draw_indexed(0..24, 0, 0..1);
                 }
                 "@geo_sky_fog" => {
@@ -3475,26 +3450,17 @@ impl RenderGraph {
                         }
                     }
 
-                    let (fog_sphere_vertices, fog_sphere_indices) = SkyVertex::load_fog_sphere();
-                    let fog_sphere = (
-                        wm.gpu.device.create_buffer_init(&BufferInitDescriptor {
-                            label: None,
-                            contents: bytemuck::cast_slice(&fog_sphere_vertices),
-                            usage: BufferUsages::VERTEX,
-                        }),
-                        wm.gpu.device.create_buffer_init(&BufferInitDescriptor {
-                            label: None,
-                            contents: bytemuck::cast_slice(&fog_sphere_indices),
-                            usage: BufferUsages::INDEX,
-                        }),
-                    );
+                    // Built once per scene: the fog sphere is a constant.
+                    let sky = scene.sky_geometry.get_or_init(|| {
+                        crate::render::sky::SkyGeometry::new(&wm.gpu.device)
+                    });
 
                     render_pass.set_pipeline(&bound_pipeline.pipeline);
                     let pc = get_environmental_push_constants(scene);
                     set_push_constants(pipeline_config, &mut render_pass, Some(pc));
 
-                    render_pass.set_vertex_buffer(0, fog_sphere.0.slice(..));
-                    render_pass.set_index_buffer(fog_sphere.1.slice(..), IndexFormat::Uint32);
+                    render_pass.set_vertex_buffer(0, sky.fog.0.slice(..));
+                    render_pass.set_index_buffer(sky.fog.1.slice(..), IndexFormat::Uint32);
                     render_pass.draw_indexed(0..51, 0, 0..1);
                 }
                 // "@geo_sky_stars" => {

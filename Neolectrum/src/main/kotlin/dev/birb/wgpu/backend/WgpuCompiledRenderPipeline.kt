@@ -91,6 +91,15 @@ class WgpuCompiledRenderPipeline private constructor(
     private fun createVariant(wantsDepth: Boolean): MemorySegment = synchronized(variants.lock) {
         variants[wantsDepth]?.let { return it }
 
+        // The precompiler thread can be inside here while the render thread closes this pipeline
+        // for a reload. A variant built from a source that was read before the release and written
+        // into the slots after it is one nobody drops - a native pipeline leaked per reload. The
+        // same lock the release holds says so: a released pipeline builds nothing, and a draw that
+        // asked for one is skipped the way a NULL variant always was.
+        if (variants.isReleased) {
+            return MemorySegment.NULL
+        }
+
         val source = variants.withDepth ?: variants.withoutDepth
             ?: throw IllegalStateException("wgpu: ${pipeline.location} has no compiled variant to build from")
 
@@ -710,6 +719,9 @@ private class Variants(withDepth: MemorySegment?, withoutDepth: MemorySegment?) 
     /** Frees both slots once, whoever gets there first: [WgpuCompiledRenderPipeline.close] or the
      *  cleaner. */
     private val released = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Whether [release] has run: a variant written into released slots is one nobody drops. */
+    val isReleased: Boolean get() = released.get()
 
     operator fun get(wantsDepth: Boolean): MemorySegment? =
         if (wantsDepth) withDepth else withoutDepth

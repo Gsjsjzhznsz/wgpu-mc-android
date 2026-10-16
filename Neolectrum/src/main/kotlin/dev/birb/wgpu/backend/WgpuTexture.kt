@@ -47,8 +47,15 @@ class WgpuTexture(
     override fun close() {
         if (closed.compareAndSet(false, true)) {
             WmNative.dropTexture.invokeExact(nativeTexture) as Unit
+            // The label bookkeeping goes with the texture: `texturesByLabel` held every texture ever
+            // created under its label forever, which is a small map that never shrank - closed
+            // textures are filtered when read, but their entries outlived them.
+            onClose?.invoke()
         }
     }
+
+    /** Run once, from [close], so the device's label map can forget this texture. */
+    var onClose: (() -> Unit)? = null
 
     override fun isClosed(): Boolean = closed.get()
 }

@@ -138,6 +138,9 @@ class WgpuDevice(
 
     private fun register(texture: WgpuTexture): WgpuTexture {
         texturesByLabel[texture.label] = texture
+        // A closed texture forgets its own entry - and only its own: the two-argument remove keeps
+        // a newer texture registered under the same label alive, which is the one that matters.
+        texture.onClose = { texturesByLabel.remove(texture.label, texture) }
         return texture
     }
 

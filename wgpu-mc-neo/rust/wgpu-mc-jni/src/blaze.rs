@@ -1017,35 +1017,47 @@ fn trace_draw_textures(pipeline: &BlazePipeline, call: &DrawCall) {
 ///
 /// The pointers a `DrawCall` carries are the ones Rust handed the JVM, so they name live buffers -
 /// the caller keeps a pass's resources alive for as long as the pass records. A mismatch here is a
-/// JVM-side bug (a name resolved to the wrong slot), and it is worth a panic rather than a draw with
-/// the wrong resource bound.
+/// JVM-side bug (a name resolved to the wrong slot, or a slot left unbound), and it is answered
+/// `None`, which the callers turn into the documented refusal - the JVM re-sends its bindings and
+/// the draw is attempted again. It used to be a panic, and a panic across the JNI frame closes the
+/// game: a refused draw is a missing thing, a panic is a dead process.
 fn call_buffer<'a>(
     plan: &str,
     binding: &PlannedBinding,
     entry: &DrawBinding,
-) -> (&'a wgpu::Buffer, usize) {
+) -> Option<(&'a wgpu::Buffer, usize)> {
     if entry.kind != DRAW_BINDING_BUFFER || entry.resource.is_null() {
-        panic!(
-            "wgpu-mc: {plan}: nothing bound in slot '{}', which the plan declares as a buffer",
-            binding.name
-        );
+        if !UNBOUND_SLOT_REPORTED.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "wgpu-mc: {plan}: nothing bound in slot '{}', which the plan declares as a buffer - \
+                 the draw is refused, and the JVM re-sends its bindings",
+                binding.name
+            );
+        }
+
+        return None;
     }
 
     // Safety: the pointer is a live `wgpu::Buffer` box the JVM holds for this pass.
     let buffer = unsafe { &*(entry.resource as *const wgpu::Buffer) };
-    (buffer, entry.resource as usize)
+    Some((buffer, entry.resource as usize))
 }
 
 fn call_texture<'a>(
     plan: &str,
     binding: &PlannedBinding,
     entry: &DrawBinding,
-) -> (&'a wgpu::TextureView, usize) {
+) -> Option<(&'a wgpu::TextureView, usize)> {
     if entry.kind != DRAW_BINDING_TEXTURE || entry.resource.is_null() {
-        panic!(
-            "wgpu-mc: {plan}: nothing bound in slot '{}', which the plan declares as a texture",
-            binding.name
-        );
+        if !UNBOUND_SLOT_REPORTED.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "wgpu-mc: {plan}: nothing bound in slot '{}', which the plan declares as a texture - \
+                 the draw is refused, and the JVM re-sends its bindings",
+                binding.name
+            );
+        }
+
+        return None;
     }
 
     let address = entry.resource as usize;
@@ -1053,7 +1065,7 @@ fn call_texture<'a>(
 
     // Safety: as above, for a `wgpu::TextureView`.
     let view = unsafe { &*(entry.resource as *const wgpu::TextureView) };
-    (view, address)
+    Some((view, address))
 }
 
 /// Diagnostics: which view a texture slot actually got, and whether it was still there.
@@ -1117,18 +1129,32 @@ fn call_sampler<'a>(
     plan: &str,
     binding: &PlannedBinding,
     entry: &DrawBinding,
-) -> (&'a wgpu::Sampler, usize) {
+) -> Option<(&'a wgpu::Sampler, usize)> {
     if entry.kind != DRAW_BINDING_SAMPLER || entry.resource.is_null() {
-        panic!(
-            "wgpu-mc: {plan}: nothing bound in slot '{}', which the plan declares as a sampler",
-            binding.name
-        );
+        if !UNBOUND_SLOT_REPORTED.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "wgpu-mc: {plan}: nothing bound in slot '{}', which the plan declares as a sampler - \
+                 the draw is refused, and the JVM re-sends its bindings",
+                binding.name
+            );
+        }
+
+        return None;
     }
 
     // Safety: as above, for a `wgpu::Sampler`.
     let sampler = unsafe { &*(entry.resource as *const wgpu::Sampler) };
-    (sampler, entry.resource as usize)
+    Some((sampler, entry.resource as usize))
 }
+
+/// The report-once flags of the draw-path refusals. Each of these used to be a panic or a wild
+/// dereference - the android.18 crash class: a field the safety comment calls an invariant, NULL
+/// on the day. Every one after the first is refused quietly: a missing draw, not a dead process.
+static NULL_BUFFERS_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static NO_PIPELINE_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static BINDING_OVERFLOW_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SET_OVERFLOW_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static UNBOUND_SLOT_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The bit that tells a JVM-numbered combination apart from a folded key.
 ///
@@ -1267,7 +1293,13 @@ fn bind_groups_for_call(
                         continue;
                     }
 
-                    let (buffer, address) = call_buffer(&plan.name, binding, &entry);
+                    let Some((buffer, address)) = call_buffer(&plan.name, binding, &entry) else {
+                        return GroupsForCall {
+                            key,
+                            groups: None,
+                            unknown: true,
+                        };
+                    };
                     let size = binding_size(buffer, &range, *min_size);
 
                     key = fold(key, address as u64);
@@ -1292,7 +1324,13 @@ fn bind_groups_for_call(
                         continue;
                     }
 
-                    let (buffer, address) = call_buffer(&plan.name, binding, &entry);
+                    let Some((buffer, address)) = call_buffer(&plan.name, binding, &entry) else {
+                        return GroupsForCall {
+                            key,
+                            groups: None,
+                            unknown: true,
+                        };
+                    };
                     let range = entry.offset..entry.offset + entry.length;
 
                     key = fold(key, address as u64);
@@ -1304,7 +1342,13 @@ fn bind_groups_for_call(
                         continue;
                     }
 
-                    let (_, address) = call_texture(&plan.name, binding, &entry);
+                    let Some((_, address)) = call_texture(&plan.name, binding, &entry) else {
+                        return GroupsForCall {
+                            key,
+                            groups: None,
+                            unknown: true,
+                        };
+                    };
 
                     key = fold(key, address as u64);
                 }
@@ -1313,7 +1357,13 @@ fn bind_groups_for_call(
                         continue;
                     }
 
-                    let (_, address) = call_sampler(&plan.name, binding, &entry);
+                    let Some((_, address)) = call_sampler(&plan.name, binding, &entry) else {
+                        return GroupsForCall {
+                            key,
+                            groups: None,
+                            unknown: true,
+                        };
+                    };
 
                     key = fold(key, address as u64);
                 }
@@ -1380,7 +1430,10 @@ fn bind_groups_for_call(
 
                     match &binding.resource {
                         PlannedResource::Uniform { min_size } => {
-                            let (buffer, address) = call_buffer(&plan.name, binding, &entry);
+                            let Some((buffer, address)) = call_buffer(&plan.name, binding, &entry)
+                            else {
+                                return None;
+                            };
                             let range = entry.offset..entry.offset + entry.length;
 
                             addresses.push(address);
@@ -1400,61 +1453,86 @@ fn bind_groups_for_call(
                                 range.start
                             };
 
-                            wgpu::BindGroupEntry {
+                            Some(wgpu::BindGroupEntry {
                                 binding: binding.binding,
                                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                                     buffer,
                                     offset,
                                     size: BufferSize::new(binding_size(buffer, &range, *min_size)),
                                 }),
-                            }
+                            })
                         }
                         PlannedResource::Storage | PlannedResource::PerDrawStorage => {
-                            let (buffer, address) = call_buffer(&plan.name, binding, &entry);
+                            let Some((buffer, address)) = call_buffer(&plan.name, binding, &entry)
+                            else {
+                                return None;
+                            };
                             let range = entry.offset..entry.offset + entry.length;
 
                             addresses.push(address);
 
-                            wgpu::BindGroupEntry {
+                            Some(wgpu::BindGroupEntry {
                                 binding: binding.binding,
                                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                                     buffer,
                                     offset: range.start,
                                     size: BufferSize::new(binding_size(buffer, &range, None)),
                                 }),
-                            }
+                            })
                         }
                         PlannedResource::Texture { .. } => {
-                            let (view, address) = call_texture(&plan.name, binding, &entry);
+                            let Some((view, address)) = call_texture(&plan.name, binding, &entry)
+                            else {
+                                return None;
+                            };
 
                             addresses.push(address);
 
-                            wgpu::BindGroupEntry {
+                            Some(wgpu::BindGroupEntry {
                                 binding: binding.binding,
                                 resource: wgpu::BindingResource::TextureView(view),
-                            }
+                            })
                         }
                         PlannedResource::Sampler => {
-                            let (sampler, address) = call_sampler(&plan.name, binding, &entry);
+                            let Some((sampler, address)) = call_sampler(&plan.name, binding, &entry)
+                            else {
+                                return None;
+                            };
 
                             addresses.push(address);
 
-                            wgpu::BindGroupEntry {
+                            Some(wgpu::BindGroupEntry {
                                 binding: binding.binding,
                                 resource: wgpu::BindingResource::Sampler(sampler),
-                            }
+                            })
                         }
                     }
                 })
-                .collect::<Vec<_>>();
+                .collect::<Option<Vec<_>>>();
 
-            wm.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(&plan.name),
-                layout,
-                entries: &entries,
-            })
+            let Some(entries) = entries else {
+                return None;
+            };
+
+            Some(
+                wm.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&plan.name),
+                    layout,
+                    entries: &entries,
+                }),
+            )
         })
-        .collect::<Vec<wgpu::BindGroup>>();
+        .collect::<Option<Vec<wgpu::BindGroup>>>();
+
+    // An unbound slot the construction met is the same refusal the key-fold half answers: the JVM
+    // re-sends its bindings and the draw is attempted again.
+    let Some(bind_groups) = bind_groups else {
+        return GroupsForCall {
+            key,
+            groups: None,
+            unknown: true,
+        };
+    };
 
     LIVE_BIND_GROUP_COUNT.fetch_add(bind_groups.len() as u64, Ordering::Relaxed);
     count_bind_groups(bind_groups.len() as u64);
@@ -1519,18 +1597,29 @@ pub fn draw_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) -
 /// have been set either way, and both are idempotent, so the JVM's second attempt changes nothing.
 fn bind_for_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) -> bool {
     if call.pipeline.is_null() {
-        panic!("wgpu-mc: a draw arrived with no pipeline bound");
+        if !NO_PIPELINE_REPORTED.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "wgpu-mc: a draw arrived with no pipeline bound - the draw is refused rather \
+                 than dereferenced"
+            );
+        }
+
+        return false;
     }
 
     // The slots the JVM filled in, against the array they live in. The plan is what says which slot
     // means what, so a count past the capacity would mean the two sides disagree about the table
     // rather than about one binding - a wrong draw either way, and not one to serve quietly.
     if call.bindings_len as usize > MAX_DRAW_BINDINGS {
-        panic!(
-            "wgpu-mc: a draw carries {} binding slots, more than the {MAX_DRAW_BINDINGS} this ABI \
-             has room for",
-            call.bindings_len
-        );
+        if !BINDING_OVERFLOW_REPORTED.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "wgpu-mc: a draw carries {} binding slots, more than the {MAX_DRAW_BINDINGS} this ABI \
+                 has room for - the two sides disagree about the table, and the draw is refused",
+                call.bindings_len
+            );
+        }
+
+        return false;
     }
 
     // Safety: the pipeline pointer comes from `compile_render_pipeline` and the JVM keeps the
@@ -1565,12 +1654,16 @@ fn bind_for_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) -
     // them. Like the binding count above, this is the two sides disagreeing about the table rather
     // than one wrong draw, and is not served quietly.
     if pipeline.plan.sets.len() > MAX_DRAW_SETS {
-        panic!(
-            "wgpu-mc: {} has {} bind group sets, more than the {MAX_DRAW_SETS} a pass keeps offsets \
-             for",
-            pipeline.plan.name,
-            pipeline.plan.sets.len()
-        );
+        if !SET_OVERFLOW_REPORTED.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "wgpu-mc: {} has {} bind group sets, more than the {MAX_DRAW_SETS} a pass keeps offsets \
+                 for - draws that bind it are refused rather than served",
+                pipeline.plan.name,
+                pipeline.plan.sets.len()
+            );
+        }
+
+        return false;
     }
 
     // Diagnostics: one line per draw naming the texture every texture slot of this draw carries, in
@@ -1616,7 +1709,23 @@ fn bind_for_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) -
         }
 
         let vertex_buffer = &call.vertex_buffers[slot];
-        // Safety: a live buffer box the JVM holds for this pass, or the bit would not be set.
+
+        // The mask bit is the invariant, and android.18 taught what an invariant is worth the day
+        // the JVM side misses it: `draw_call_batch` declines a NULL index buffer explicitly, which
+        // proves the field can arrive NULL. A refused draw is a missing thing; a dereferenced NULL
+        // is a dead process.
+        if vertex_buffer.buffer.is_null() {
+            if !NULL_BUFFERS_REPORTED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "wgpu-mc: a draw arrived with a NULL vertex buffer in slot {slot} under a set \
+                     mask bit - the draw is refused rather than dereferenced"
+                );
+            }
+
+            return false;
+        }
+
+        // Safety: a live buffer box the JVM holds for this pass, null-checked above.
         let buffer = unsafe { &*(vertex_buffer.buffer as *const wgpu::Buffer) };
 
         raw_pass.set_vertex_buffer(
@@ -1656,7 +1765,18 @@ fn bind_for_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) -
     }
 
     if call.indexed != 0 {
-        // Safety: a live buffer box, as above.
+        if call.index_buffer.is_null() {
+            if !NULL_BUFFERS_REPORTED.swap(true, Ordering::Relaxed) {
+                log::warn!(
+                    "wgpu-mc: an indexed draw arrived with a NULL index buffer - the draw is \
+                     refused rather than dereferenced"
+                );
+            }
+
+            return false;
+        }
+
+        // Safety: a live buffer box, as above, null-checked just now.
         let buffer = unsafe { &*(call.index_buffer as *const wgpu::Buffer) };
 
         raw_pass.set_index_buffer(
@@ -1840,43 +1960,65 @@ fn trace_call(plan: &BindGroupPlan, call: &DrawCall, alignment: u64, key: u64) {
 
             let described = match &binding.resource {
                 PlannedResource::Uniform { min_size } => {
-                    let (buffer, address) = call_buffer(&plan.name, binding, &entry);
-                    let range = entry.offset..entry.offset + entry.length;
-                    let size = binding_size(buffer, &range, *min_size);
-                    let dynamic =
-                        dynamic_offset(plan, binding, &range, alignment, min_size.is_some());
+                    match call_buffer(&plan.name, binding, &entry) {
+                        Some((buffer, address)) => {
+                            let range = entry.offset..entry.offset + entry.length;
+                            let size = binding_size(buffer, &range, *min_size);
+                            let dynamic =
+                                dynamic_offset(plan, binding, &range, alignment, min_size.is_some());
 
-                    format!(
-                        "s{set}/b{} {} id={address:#x} start={} len={} size={} min={:?} {}",
-                        binding.binding,
-                        binding.name,
-                        range.start,
-                        range.end - range.start,
-                        size,
-                        min_size,
-                        if dynamic { "DYNAMIC" } else { "baked" }
-                    )
+                            format!(
+                                "s{set}/b{} {} id={address:#x} start={} len={} size={} min={:?} {}",
+                                binding.binding,
+                                binding.name,
+                                range.start,
+                                range.end - range.start,
+                                size,
+                                min_size,
+                                if dynamic { "DYNAMIC" } else { "baked" }
+                            )
+                        }
+                        None => format!(
+                            "s{set}/b{} {} NOTHING BOUND",
+                            binding.binding, binding.name
+                        ),
+                    }
                 }
                 PlannedResource::Storage | PlannedResource::PerDrawStorage => {
-                    let (_, address) = call_buffer(&plan.name, binding, &entry);
-                    format!(
-                        "s{set}/b{} {} storage id={address:#x} start={}",
-                        binding.binding, binding.name, entry.offset
-                    )
+                    match call_buffer(&plan.name, binding, &entry) {
+                        Some((_, address)) => format!(
+                            "s{set}/b{} {} storage id={address:#x} start={}",
+                            binding.binding, binding.name, entry.offset
+                        ),
+                        None => format!(
+                            "s{set}/b{} {} NOTHING BOUND",
+                            binding.binding, binding.name
+                        ),
+                    }
                 }
                 PlannedResource::Texture { .. } => {
-                    let (_, address) = call_texture(&plan.name, binding, &entry);
-                    format!(
-                        "s{set}/b{} {} tex={address:#x}",
-                        binding.binding, binding.name
-                    )
+                    match call_texture(&plan.name, binding, &entry) {
+                        Some((_, address)) => format!(
+                            "s{set}/b{} {} tex={address:#x}",
+                            binding.binding, binding.name
+                        ),
+                        None => format!(
+                            "s{set}/b{} {} NOTHING BOUND",
+                            binding.binding, binding.name
+                        ),
+                    }
                 }
                 PlannedResource::Sampler => {
-                    let (_, address) = call_sampler(&plan.name, binding, &entry);
-                    format!(
-                        "s{set}/b{} {} sampler={address:#x}",
-                        binding.binding, binding.name
-                    )
+                    match call_sampler(&plan.name, binding, &entry) {
+                        Some((_, address)) => format!(
+                            "s{set}/b{} {} sampler={address:#x}",
+                            binding.binding, binding.name
+                        ),
+                        None => format!(
+                            "s{set}/b{} {} NOTHING BOUND",
+                            binding.binding, binding.name
+                        ),
+                    }
                 }
             };
 

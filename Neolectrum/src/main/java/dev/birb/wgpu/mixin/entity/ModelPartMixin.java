@@ -54,17 +54,11 @@ public abstract class ModelPartMixin implements ModelPartNameAccessor, ModelPart
                     this.compile(matrices.last(), vertices, light, overlay, color);
                 }
 
-                Matrix4f mat4 = matrices.last().pose();
-                String thisPartName = ((ModelPartNameAccessor) (Object) this).getName();
-                if (thisPartName == null) {
-                    thisPartName = "root";
-                }
-
-                EntityState.ModelPartState state = new EntityState.ModelPartState();
-                state.overlay = color;
-                state.mat = mat4;
-                EntityState.entityModelPartStates.put(thisPartName, state);
-
+                // The per-part state used to be collected into `EntityState.entityModelPartStates`
+                // - a map nothing in the monorepo reads - which was one allocation and one hash put
+                // per rendered model part per frame, on a device whose heap is two gigabytes. The
+                // map and the writes are gone; the part index the renderer actually reads is set
+                // below, where it was.
                 for (ModelPart modelPart : this.children.values()) {
                     modelPart.render(matrices, vertices, light, overlay, color);
                 }

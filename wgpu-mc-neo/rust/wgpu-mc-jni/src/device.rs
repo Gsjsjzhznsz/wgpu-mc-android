@@ -2430,7 +2430,17 @@ pub extern "C" fn bind_game_block_atlas(_wm: &WmRenderer, texture: &wgpu::Textur
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn drop_render_pass(_: Box<BlazeRenderPass>) {
+pub extern "C" fn drop_render_pass(pass: *mut BlazeRenderPass) {
+    // Null-tolerant, the way [`drop_render_pipeline`] is: a `Box` reconstructed from NULL is
+    // undefined behaviour rather than a crash, the JVM guards the call today, and android.18 was
+    // one missed guard of exactly this family - so the pointer is checked here, and a NULL drops
+    // as nothing.
+    if pass.is_null() {
+        return;
+    }
+
+    drop(unsafe { Box::from_raw(pass) });
+
     LIVE_PASS_COUNT.fetch_sub(1, Ordering::Relaxed);
 }
 
