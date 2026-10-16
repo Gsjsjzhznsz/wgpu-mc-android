@@ -1930,6 +1930,219 @@ pub struct BakedLayer {
     pub indices: Vec<u8>,
 }
 
+/// The corner the ambient-occlusion sampling reads the world by, for one vertex of one face.
+///
+/// The face axis is the face's own direction, and the two tangent axes follow the corner: which
+/// corner of the two-by-two patch of cells around it the game averages is the corner's answer,
+/// but *which layer* those cells sit in is the face's - the game samples across the face, so the
+/// offset along the face axis is the face direction itself.
+///
+/// It used to be the corner's answer on every axis, which a full cube gives back identical (a
+/// face's vertices sit on its plane, so the corner says what the face says) and anything inset
+/// does not: a slab top's corners sit at `y = 0`, the corner's answer pointed *away* from the
+/// face, and a third axis joined the two tangents - more than the two-slot `axes` holds. The
+/// bake died on the push (`CapacityError: insufficient capacity`, in a Rayon worker, so the
+/// process died with it), and inset geometry is everywhere - slabs, carpets, snow layers,
+/// chests, farmland - which is why the first bake that carried real model data took the game
+/// down. See the [`ao_tangent_axes`] tests for the shape of it.
+fn ao_corner_biases(dir_vec: IVec3, position: Vec3) -> IVec3 {
+    ivec3(
+        if dir_vec.x != 0 {
+            dir_vec.x
+        } else if position.x as i32 == 0 {
+            -1
+        } else {
+            1
+        },
+        if dir_vec.y != 0 {
+            dir_vec.y
+        } else if position.y as i32 == 0 {
+            -1
+        } else {
+            1
+        },
+        if dir_vec.z != 0 {
+            dir_vec.z
+        } else if position.z as i32 == 0 {
+            -1
+        } else {
+            1
+        },
+    )
+}
+
+/// The two tangent directions of a face, each toward the sampled corner: the offsets that walk
+/// the two-by-two patch of cells the game's smooth lighting and occlusion average.
+///
+/// Exactly two by construction - the face axis cancels in `dir - biases` because
+/// [`ao_corner_biases`] carries the face direction there - so the two-slot `ArrayVec` cannot
+/// overflow and the callers can index `[0]` and `[1]` without a check. The old inline version
+/// could grow a third entry out of an inset face, which was the crash.
+fn ao_tangent_axes(dir_vec: IVec3, biases: IVec3) -> ArrayVec<IVec3, 2> {
+    let axis = dir_vec - biases; //equivalent to -(biases - dir_vec)
+
+    let mut axes: ArrayVec<IVec3, 2> = ArrayVec::new_const();
+
+    if axis.x != 0 {
+        axes.push(ivec3(axis.x, 0, 0));
+    }
+
+    if axis.y != 0 {
+        axes.push(ivec3(0, axis.y, 0));
+    }
+
+    if axis.z != 0 {
+        axes.push(ivec3(0, 0, axis.z));
+    }
+
+    axes
+}
+
+#[cfg(test)]
+mod ao_corner_tests {
+    use super::{ao_corner_biases, ao_tangent_axes};
+    use glam::{IVec3, Vec3, ivec3, vec3};
+
+    /// The six face directions, as the bake emits them.
+    fn all_dirs() -> [IVec3; 6] {
+        [
+            ivec3(1, 0, 0),
+            ivec3(-1, 0, 0),
+            ivec3(0, 1, 0),
+            ivec3(0, -1, 0),
+            ivec3(0, 0, 1),
+            ivec3(0, 0, -1),
+        ]
+    }
+
+    /// The positions that decide the answer: the full cube's two planes, and the insets the
+    /// models actually carry - a carpet's 1/16, a slab's and button's 1/2, a chest's 15/16.
+    fn all_positions() -> [f32; 5] {
+        [0.0, 0.0625, 0.5, 0.9375, 1.0]
+    }
+
+    fn face_axis_of(dir_vec: IVec3) -> usize {
+        if dir_vec.x != 0 {
+            0
+        } else if dir_vec.y != 0 {
+            1
+        } else {
+            2
+        }
+    }
+
+    fn at(v: IVec3, axis: usize) -> i32 {
+        match axis {
+            0 => v.x,
+            1 => v.y,
+            _ => v.z,
+        }
+    }
+
+    fn at_f32(v: Vec3, axis: usize) -> f32 {
+        match axis {
+            0 => v.x,
+            1 => v.y,
+            _ => v.z,
+        }
+    }
+
+    /// The face axis always points across the face and the tangents always follow the corner,
+    /// over every direction and every position the models carry. The face-axis half is what
+    /// changed; the tangent half is what stayed.
+    #[test]
+    fn the_face_axis_points_across_the_face_and_the_tangents_follow_the_corner() {
+        for dir in all_dirs() {
+            let face_axis = face_axis_of(dir);
+
+            for x in all_positions() {
+                for y in all_positions() {
+                    for z in all_positions() {
+                        let position = vec3(x, y, z);
+                        let biases = ao_corner_biases(dir, position);
+
+                        assert_eq!(
+                            at(biases, face_axis),
+                            at(dir, face_axis),
+                            "the face axis must say what the face says, dir {dir:?} position {position:?}"
+                        );
+
+                        for axis in 0..3 {
+                            if axis == face_axis {
+                                continue;
+                            }
+
+                            let expected = if at_f32(position, axis) as i32 == 0 { -1 } else { 1 };
+                            assert_eq!(
+                                at(biases, axis),
+                                expected,
+                                "the tangent must follow the corner, dir {dir:?} position {position:?} axis {axis}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The crash: an inset face used to put a third entry into the two-slot `axes` and the bake
+    /// died on the push. The tangents are two directions by construction now, over the whole
+    /// matrix - and indexing `[0]` and `[1]`, which the bake does right after, stays in range.
+    #[test]
+    fn the_tangents_fill_exactly_the_two_slots_the_bake_indexes() {
+        for dir in all_dirs() {
+            for x in all_positions() {
+                for y in all_positions() {
+                    for z in all_positions() {
+                        let position = vec3(x, y, z);
+                        let axes = ao_tangent_axes(dir, ao_corner_biases(dir, position));
+
+                        assert_eq!(
+                            axes.len(),
+                            2,
+                            "dir {dir:?} position {position:?}: the bake indexes [0] and [1]"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A full cube's corners read exactly what the old formula read, so the shipped look does
+    /// not move by one step of light: on the face axis the old corner answer already agreed with
+    /// the face (a face's vertices sit on its plane), and the tangents were never touched.
+    #[test]
+    fn a_full_cubes_corners_read_what_the_old_formula_read() {
+        let old_formula = |position: [f32; 3]| -> IVec3 {
+            ivec3(
+                if position[0] as i32 == 0 { -1 } else { 1 },
+                if position[1] as i32 == 0 { -1 } else { 1 },
+                if position[2] as i32 == 0 { -1 } else { 1 },
+            )
+        };
+
+        for dir in all_dirs() {
+            let face_axis = face_axis_of(dir);
+
+            for x in [0.0f32, 1.0] {
+                for y in [0.0f32, 1.0] {
+                    for z in [0.0f32, 1.0] {
+                        // The vertex sits on the face's own plane.
+                        let mut corner = [x, y, z];
+                        corner[face_axis] = if at(dir, face_axis) > 0 { 1.0 } else { 0.0 };
+
+                        assert_eq!(
+                            ao_corner_biases(dir, vec3(corner[0], corner[1], corner[2])),
+                            old_formula(corner),
+                            "a full cube's AO must not move, dir {dir:?} corner {corner:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn bake_layers<Provider: BlockStateProvider>(
     section_pos: IVec3,
     block_manager: &BlockManager,
@@ -2087,39 +2300,10 @@ fn bake_layers<Provider: BlockStateProvider>(
                                     model_mesh.ambient_occlusion,
                                     model_mesh.any.is_empty(),
                                 ) {
-                                    let vertex_biases = ivec3(
-                                        if model_vertex.position.x as i32 == 0 {
-                                            -1
-                                        } else {
-                                            1
-                                        },
-                                        if model_vertex.position.y as i32 == 0 {
-                                            -1
-                                        } else {
-                                            1
-                                        },
-                                        if model_vertex.position.z as i32 == 0 {
-                                            -1
-                                        } else {
-                                            1
-                                        },
-                                    );
+                                    let vertex_biases =
+                                        ao_corner_biases(dir_vec, model_vertex.position);
 
-                                    let axis = dir_vec - vertex_biases; //equivalent to -(vertex_biases - dir_vec)
-
-                                    let mut axes: ArrayVec<IVec3, 2> = ArrayVec::new_const();
-
-                                    if axis.x != 0 {
-                                        axes.push(ivec3(axis.x, 0, 0));
-                                    }
-
-                                    if axis.y != 0 {
-                                        axes.push(ivec3(0, axis.y, 0));
-                                    }
-
-                                    if axis.z != 0 {
-                                        axes.push(ivec3(0, 0, axis.z));
-                                    }
+                                    let axes = ao_tangent_axes(dir_vec, vertex_biases);
 
                                     let p1 = vertex_biases + pos;
                                     let p2 = p1 + axes[0];
