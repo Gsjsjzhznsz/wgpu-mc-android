@@ -4886,6 +4886,24 @@ pub unsafe extern "C" fn is_render_pipeline_valid(pipeline: *mut BlazePipeline) 
     unsafe { (*pipeline).valid.load(Ordering::Relaxed) }
 }
 
+/// Drops the `PER_FACE_LIGHTING` define from a pipeline's directives when the adapter is an
+/// Adreno. Returns `None` when there is nothing to drop - either the pipeline never had the
+/// define, or the adapter is not one of the Qualcomm parts this works around. The rationale
+/// lives in the call site, where the full history is written out once.
+fn strip_per_face_lighting_for_adreno(adapter_name: &str, directives: &str) -> Option<String> {
+    if !adapter_name.contains("Adreno") || !directives.contains("PER_FACE_LIGHTING") {
+        return None;
+    }
+
+    let mut stripped = directives
+        .lines()
+        .filter(|line| !line.contains("PER_FACE_LIGHTING"))
+        .collect::<Vec<&str>>()
+        .join("\n");
+    stripped.push('\n');
+    Some(stripped)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn compile_render_pipeline(
     wm: &WmRenderer,
@@ -4907,7 +4925,36 @@ pub unsafe extern "C" fn compile_render_pipeline(
         },
     );
 
-    let directives = format!("#version 440\n{}\n", render_pipeline_description.directives);
+    let mut directives = format!("#version 440\n{}\n", render_pipeline_description.directives);
+
+    // **Qualcomm's proprietary compiler refuses every pipeline whose fragment stage reads
+    // `gl_FrontFacing`, and has done so across two driver generations.** The first device was the
+    // Adreno 640 (Snapdragon 855): the 2026-10-15 log lost the device the moment the first
+    // `PER_FACE_LIGHTING` pipeline - `armor_decal_cutout_no_cull` - was handed over, while the ten
+    // pipelines before it in the same precompile pass went through. Removing the `Flat` decoration
+    // from the `FrontFacing` builtin (the naga fork, Task 14) was the plausible reading then, but
+    // the Adreno 830 (Snapdragon 8 Elite, Task 15) kept refusing `entity_cutout_dissolve` with that
+    // fix already in the build, and android.14's Adreno 640 log still refuses the same eight
+    // pipelines - exactly the ones whose shaders say `gl_FrontFacing ? front : back` - while every
+    // sibling without that read builds. The SPIR-V itself is valid: naga validates it, the entry
+    // point interface carries every input and output, the decorations are the ordinary ones, and
+    // Mali runs the same modules untouched. Whatever the Qualcomm compiler is reacting to inside
+    // that construct, it is not reachable from here, so the port stops feeding it: on an Adreno
+    // adapter, `PER_FACE_LIGHTING` is dropped from the defines, which turns the affected pipelines
+    // into the same shape as the `_cull` variants that provably build - one vertex color, cardinal
+    // lighting, no per-face select. Back faces are then lit like front faces, the cost being a
+    // subtle lighting difference on the inside of two-sided geometry, against the alternative
+    // these eight pipelines had since android.11: the resource reload fails, Minecraft reloads,
+    // fails again, and every screen after the loading logo comes up black.
+    let adapter_name = wm.gpu.adapter.get_info().name;
+    if let Some(stripped) = strip_per_face_lighting_for_adreno(&adapter_name, &directives) {
+        info!(
+            "wgpu-mc: {} refuses the gl_FrontFacing pipelines, so {} loses PER_FACE_LIGHTING; \
+             back faces will be lit like front faces on this device",
+            adapter_name, render_pipeline_description.name,
+        );
+        directives = stripped;
+    }
 
     // A list, not a map, because the key below has to be canonical and the same list is turned into
     // the map `process_shaders` wants.
@@ -7768,5 +7815,64 @@ mod pipeline_file_stem_tests {
         assert_eq!(pipeline_file_stem("../escape:name"), "___escape_name");
         assert_eq!(pipeline_file_stem(".."), "__");
         assert_eq!(pipeline_file_stem("a.b-c_d"), "a_b-c_d");
+    }
+}
+
+#[cfg(test)]
+mod per_face_strip_tests {
+    use super::*;
+
+    /// **The Adreno workaround drops exactly the `PER_FACE_LIGHTING` line and nothing else.**
+    /// The 2026-10-16 log pinned the shape of the failure: the eight pipelines the Adreno 640
+    /// refuses are exactly the ones whose fragment reads `gl_FrontFacing`, the SPIR-V is valid
+    /// (so there is nothing to fix in the module), and Mali builds the same modules fine - so
+    /// the fix is a define-level substitution at compile time, and the test pins its edges:
+    /// the other defines survive byte-for-byte, a non-Adreno adapter keeps the define, and an
+    /// Adreno adapter leaves a pipeline without the define untouched (same `None` the caller
+    /// already handles by doing nothing).
+    #[test]
+    fn adreno_loses_per_face_and_only_per_face() {
+        let armor = "#version 440\n\
+                     #define ALPHA_CUTOUT 0.1\n\
+                     #define NO_OVERLAY true\n\
+                     #define PER_FACE_LIGHTING true\n\
+                     \n#define WM_CHUNK_PAD 2\n";
+
+        let stripped =
+            strip_per_face_lighting_for_adreno("Adreno (TM) 640", armor).expect("strips");
+
+        assert!(!stripped.contains("PER_FACE_LIGHTING"));
+        assert!(stripped.contains("#define ALPHA_CUTOUT 0.1"));
+        assert!(stripped.contains("#define NO_OVERLAY true"));
+        assert!(stripped.contains("#define WM_CHUNK_PAD 2"));
+        // The version line the caller prepended stays first.
+        assert!(stripped.starts_with("#version 440\n"));
+
+        // A second call is the identity: the define is gone, so there is nothing to strip and
+        // the caller logs no second substitution for the same pipeline.
+        assert_eq!(
+            strip_per_face_lighting_for_adreno("Adreno (TM) 640", &stripped),
+            None
+        );
+    }
+
+    #[test]
+    fn non_adreno_and_define_free_directives_are_untouched() {
+        let armor = "#version 440\n#define PER_FACE_LIGHTING true\n";
+
+        // Mali runs these pipelines as they are; the 2026-10-15 log is the proof.
+        assert_eq!(
+            strip_per_face_lighting_for_adreno("Mali-G710", armor),
+            None
+        );
+
+        // An Adreno adapter compiles the ten pipelines that never had the define unchanged.
+        assert_eq!(
+            strip_per_face_lighting_for_adreno(
+                "Adreno (TM) 830",
+                "#version 440\n#define ALPHA_CUTOUT 0.1\n"
+            ),
+            None
+        );
     }
 }
