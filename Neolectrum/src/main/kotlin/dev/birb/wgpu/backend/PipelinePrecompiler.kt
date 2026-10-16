@@ -78,7 +78,7 @@ object PipelinePrecompiler {
                                         // attachment, and Minecraft uses both for the same pipeline - the same terrain
                                         // pipeline draws into the main target and into the shadow pass.
                                         WgpuCompiledRenderPipeline
-                                                .of(device, pipeline, device.defaultShaderSource, false)
+                                                .of(device, pipeline, device.liveShaderSource, false)
                                                 .forDepth(true)
 
                                         // A driver that refused a pipeline still hands back a handle, so nothing above
@@ -86,7 +86,7 @@ object PipelinePrecompiler {
                                         // keeps the report below saying so - on the android.12 run two entity pipelines
                                         // were refused and the log reported ninety-two successes, with the first draw
                                         // that bound one of them poisoning the frame as the only symptom.
-                                        if (WgpuCompiledRenderPipeline.of(device, pipeline, device.defaultShaderSource, false)
+                                        if (WgpuCompiledRenderPipeline.of(device, pipeline, device.liveShaderSource, false)
                                                         .isValid()
                                         ) {
                                                 compiled++

@@ -45,6 +45,26 @@ class WgpuDevice(
     val surface = WgpuSurface(this, surfaceAttached)
 
     /**
+     * The freshest `ShaderSource` Minecraft has handed this device.
+     *
+     * [defaultShaderSource] is the one device creation was given, and a resource reload replaces
+     * the shader state behind it - the compile path that asks it after a reload got null for
+     * every shader, and the empty vertex shader that became is what aborted android.13. Every
+     * precompile ask carries the source of the reload that asked, so the newest one wins here,
+     * and the draw path compiles through it rather than through a captured one.
+     */
+    @Volatile
+    private var freshestShaderSource: ShaderSource = defaultShaderSource
+
+    /**
+     * The source a compile should ask: the newest one Minecraft passed a precompile ask with,
+     * or - before any ask has run - the one device creation was given.
+     */
+    @get:JvmName("liveShaderSource")
+    val liveShaderSource: ShaderSource
+        get() = freshestShaderSource
+
+    /**
      * What the adapter says about itself, read once.
      *
      * The four accessors below are what vanilla fills the F3 overlay's system block with, and on
@@ -258,12 +278,21 @@ class WgpuDevice(
     override fun precompilePipeline(
         pipeline: RenderPipeline,
         shaderSource: ShaderSource?,
-    ): CompiledRenderPipeline = WgpuCompiledRenderPipeline.of(
-        this,
-        pipeline,
-        shaderSource ?: defaultShaderSource,
-        wantsDepth = false,
-    )
+    ): CompiledRenderPipeline {
+        // A non-null ask carries the source of the reload that asked - the live one. Remembering
+        // it is what keeps the draw path from compiling through the object device creation
+        // captured, which a reload can leave serving null for every shader.
+        if (shaderSource != null) {
+            freshestShaderSource = shaderSource
+        }
+
+        return WgpuCompiledRenderPipeline.of(
+            this,
+            pipeline,
+            shaderSource ?: defaultShaderSource,
+            wantsDepth = false,
+        )
+    }
 
     override fun clearPipelineCache() = WgpuCompiledRenderPipeline.clearCaches()
 

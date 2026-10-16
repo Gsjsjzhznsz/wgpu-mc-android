@@ -68,7 +68,7 @@ class WgpuCompiledRenderPipeline private constructor(
      * everything except the frames that bound it, which is to say nothing at all.
      */
     private val valid: Boolean =
-        WmNative.isRenderPipelineValid.invokeExact(first) as Boolean
+        first != MemorySegment.NULL && WmNative.isRenderPipelineValid.invokeExact(first) as Boolean
 
     override fun isValid(): Boolean = valid
 
@@ -93,6 +93,15 @@ class WgpuCompiledRenderPipeline private constructor(
 
         val source = variants.withDepth ?: variants.withoutDepth
             ?: throw IllegalStateException("wgpu: ${pipeline.location} has no compiled variant to build from")
+
+        if (source == MemorySegment.NULL) {
+            // The first variant never compiled - its shader text did not parse, and the native
+            // side answers that with null (`isValid` is false). There are no shader modules to
+            // build the other depth variant from, so either depth asks for null, which the draw
+            // path skips; asking the native side to build from a null pipeline would be a crash.
+            variants[wantsDepth] = MemorySegment.NULL
+            return MemorySegment.NULL
+        }
 
         val segment = Arena.ofConfined().use { arena ->
             val depthState = if (wantsDepth) depthStencilState(arena) else MemorySegment.NULL
@@ -154,15 +163,22 @@ class WgpuCompiledRenderPipeline private constructor(
      * The plan's binding slots, read out of the native pipeline once.
      *
      * Both depth variants are built from the same plan, so one table serves them both, and it does
-     * not matter which of them the table is read from. One always exists: a compiled pipeline is
-     * created with the variant its first bind asked for.
+     * not matter which of them the table is read from. It is null only for a pipeline whose
+     * shader text never parsed - there is no native pipeline behind it, and no draws of it run.
      */
     val planBindings: PlanBindings? by lazy {
-        readPlanBindings(
-            variants.withDepth ?: variants.withoutDepth ?: MemorySegment.NULL,
-            pipeline.location.toString(),
-            perDrawStorageNames(pipeline),
-        )
+        val first = variants.withDepth ?: variants.withoutDepth
+        if (first == null || first == MemorySegment.NULL) {
+            // A pipeline whose shader text never parsed has no native pipeline to read a plan
+            // from, and no draws of it will run to use one.
+            null
+        } else {
+            readPlanBindings(
+                first,
+                pipeline.location.toString(),
+                perDrawStorageNames(pipeline),
+            )
+        }
     }
 
     /** [planBindings] for the Java side, which reads it once when a pass binds this pipeline. */
@@ -191,6 +207,22 @@ class WgpuCompiledRenderPipeline private constructor(
 
         /** Compiled shader sources keyed by (id, stage, defines): shader lookup is not cheap. */
         private val shaderSources = ConcurrentHashMap<ShaderKey, String>()
+
+        /**
+         * The last text each shader key was ever successfully served, kept across
+         * [clearCaches] - which is the whole point of it living beside [shaderSources] rather
+         * than in it.
+         *
+         * The object this device captured at creation has been known to stop serving sources
+         * after a resource reload replaced the shader state behind it: every `get` then answers
+         * null, and android.13's empty vertex shader - compiled from the directives alone - is
+         * what that null became. A source with nothing to serve gets this map's last known text,
+         * which is at worst the reload before this one's copy of the same shader.
+         */
+        private val lastKnownGoodSources = ConcurrentHashMap<ShaderKey, String>()
+
+        /** Shader keys whose missing source has been logged, so the report fires once per shader. */
+        private val sourcesWithoutShader = ConcurrentHashMap.newKeySet<ShaderKey>()
 
         /** Pipelines already described in the log, so each one is reported exactly once. */
         private val described = ConcurrentHashMap.newKeySet<Identifier>()
@@ -254,18 +286,56 @@ class WgpuCompiledRenderPipeline private constructor(
         val CLEANER: java.lang.ref.Cleaner = java.lang.ref.Cleaner.create()
 
         /**
-         * `ShaderSource#get` may return null for a shader that failed to load. Rust needs a string
-         * either way, so a null becomes the empty source and Minecraft's own shader diagnostics
-         * report the failure.
+         * The text this pipeline's shader is written in, from the [ShaderSource] the caller
+         * carries.
+         *
+         * `ShaderSource#get` returning null for a shader Minecraft itself asked to compile is
+         * not a shader that failed to load - the pipeline names a shader Minecraft read on this
+         * very reload. It is the source object being out of step with the shader state a reload
+         * installed, and it used to become `""` here, cached, and compiled: an empty vertex
+         * shader behind the directives is exactly what aborted android.13 on launch. So a null
+         * falls back to the text a previous reload served, the answer is reported once per
+         * shader, and a source with neither answer compiles the directives alone - which the
+         * native side now refuses instead of dying over.
          */
         private fun sourceFor(
             id: Identifier,
             type: ShaderType,
             defines: ShaderDefines,
             source: ShaderSource,
-        ): String = shaderSources.computeIfAbsent(ShaderKey(id, type, defines)) {
-            source.get(it.id, it.type) ?: ""
-        }
+        ): String = shaderSources.computeIfAbsent(ShaderKey(id, type, defines)) { key ->
+            val served = source.get(key.id, key.type)
+
+            if (served != null) {
+                lastKnownGoodSources[key] = served
+                served
+            } else {
+                val knownGood = lastKnownGoodSources[key]
+                if (knownGood != null) {
+                    if (sourcesWithoutShader.add(key)) {
+                        dev.birb.wgpu.WgpuMcMod.LOGGER.warn(
+                            "wgpu: the shader source has nothing for {} ({}), so the text an " +
+                                "earlier reload served is used - the source object this device " +
+                                "holds predates the shader state a reload installed",
+                            key.id, key.type,
+                        )
+                    }
+                    knownGood
+                } else {
+                    if (sourcesWithoutShader.add(key)) {
+                        dev.birb.wgpu.WgpuMcMod.LOGGER.error(
+                            "wgpu: the shader source has nothing for {} ({}) and no earlier text " +
+                                "is known; this pipeline compiles from its directives alone, the " +
+                                "native side will refuse it, and its draws are skipped",
+                            key.id, key.type,
+                        )
+                    }
+                    // Deliberately not cached: a null answer records no mapping, so a source
+                    // that can serve this shader later is asked again rather than reading "".
+                    null
+                }
+            }
+        } ?: ""
 
         /**
          * The compiled pipeline for [pipeline], compiling the variant [wantsDepth] asks for.

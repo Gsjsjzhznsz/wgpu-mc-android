@@ -373,8 +373,12 @@ public class WgpuRenderPass implements RenderPassBackend {
     public void setPipeline(@NonNull RenderPipeline pipeline) {
         // The variant this pass needs, which the compiled pipeline writes on demand the first time:
         // a pass with a depth attachment and one without cannot share a `wgpu::RenderPipeline`.
+        //
+        // The source is the freshest one a precompile ask carried, not the object device creation
+        // captured: a resource reload replaces the shader state behind the captured one, and the
+        // null every `get` then answered became the empty vertex shader that aborted android.13.
         WgpuCompiledRenderPipeline compiled =
-                WgpuCompiledRenderPipeline.of(device, pipeline, device.defaultShaderSource(), wantsDepth);
+                WgpuCompiledRenderPipeline.of(device, pipeline, device.liveShaderSource(), wantsDepth);
         this.activePipeline = compiled.forDepth(wantsDepth);
         this.activePipelineName = pipeline.getLocation().toString();
         this.activePipelineInvalid = !compiled.isValid();
@@ -389,37 +393,46 @@ public class WgpuRenderPass implements RenderPassBackend {
         // The slots of the new plan, and everything bound so far re-emitted into them: the same
         // binding name sits in a different slot under a different pipeline, so what was written for
         // the previous one is meaningless here.
+        //
+        // A plan can also be missing because the pipeline's shader text never parsed - the native
+        // side answers that with a null pipeline, `isValid` is false, and the refusal is already
+        // reported above. That one is not the "does not fit" error the throw is for: its draws are
+        // skipped below, and the pass carries on without it.
         PlanBindings slots = compiled.slotsForJava();
-        if (slots == null) {
+        if (slots == null && !activePipelineInvalid) {
             throw new IllegalStateException("wgpu: " + pipeline.getLocation()
                     + " has more bindings than the draw call can carry; see the log");
         }
         this.bindings = slots;
-        this.planHasDynamic = slots.dynamicSlotCount() > 0;
-        clearBindings();
-        // Only the names the **new** plan has, and only to keep them, not as a fresh request.
-        //
-        // The stash is per pass and shared across every pipeline the game sets in it, so a name bound
-        // under one pipeline is still in it when the next one is set - and re-emitting it blindly is how
-        // `minecraft:pipeline/animate_sprite_interpolate` came to be reported as reading a `Sprite` it
-        // does not declare, and `.../animate_sprite_blit` as reading `CurrentSprite` and `NextSprite` it
-        // does not declare either. The two pipelines are bound alternately, once per animated sprite, so
-        // each reported the other's names: a pair of warnings that says nothing about either, and that
-        // buries the one thing this diagnostic exists for - a *requested* name the shader spells
-        // differently.
-        //
-        // Dropping a name the new plan has not got is right rather than merely quiet: the game binds what
-        // each pipeline's shader declares, and it binds it after `setPipeline`, so a name that survives a
-        // pipeline change is one the previous pipeline's draw needed. `reportUnplanned` is false here
-        // because nothing is being requested - see `reportUnplannedBinding`, which the two binding entry
-        // points call for the names a caller actually asked for.
-        for (Map.Entry<String, Bound> entry : boundBindings.entrySet()) {
-            writeBinding(entry.getKey(), entry.getValue(), false);
+        if (slots != null) {
+            this.planHasDynamic = slots.dynamicSlotCount() > 0;
+            clearBindings();
+            // Only the names the **new** plan has, and only to keep them, not as a fresh request.
+            //
+            // The stash is per pass and shared across every pipeline the game sets in it, so a name bound
+            // under one pipeline is still in it when the next one is set - and re-emitting it blindly is how
+            // `minecraft:pipeline/animate_sprite_interpolate` came to be reported as reading a `Sprite` it
+            // does not declare, and `.../animate_sprite_blit` as reading `CurrentSprite` and `NextSprite` it
+            // does not declare either. The two pipelines are bound alternately, once per animated sprite, so
+            // each reported the other's names: a pair of warnings that says nothing about either, and that
+            // buries the one thing this diagnostic exists for - a *requested* name the shader spells
+            // differently.
+            //
+            // Dropping a name the new plan has not got is right rather than merely quiet: the game binds what
+            // each pipeline's shader declares, and it binds it after `setPipeline`, so a name that survives a
+            // pipeline change is one the previous pipeline's draw needed. `reportUnplanned` is false here
+            // because nothing is being requested - see `reportUnplannedBinding`, which the two binding entry
+            // points call for the names a caller actually asked for.
+            for (Map.Entry<String, Bound> entry : boundBindings.entrySet()) {
+                writeBinding(entry.getKey(), entry.getValue(), false);
+            }
+            for (Map.Entry<String, Sampled> entry : boundSamplers.entrySet()) {
+                writeSampled(entry.getKey(), entry.getValue(), false);
+            }
+            reportPlanOnce(slots);
+        } else {
+            this.planHasDynamic = false;
         }
-        for (Map.Entry<String, Sampled> entry : boundSamplers.entrySet()) {
-            writeSampled(entry.getKey(), entry.getValue(), false);
-        }
-        reportPlanOnce(slots);
 
         // The Rust terrain path: a pass Minecraft has opened for one of the two terrain groups is the
         // one the render graph draws, so this is where it is handed over - the pipeline is what says
