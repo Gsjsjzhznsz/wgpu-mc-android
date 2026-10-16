@@ -432,7 +432,7 @@ fn vert(
     // which for a nibble is `nibble / 16 + 1/32` - the centre of texel `nibble`. The clamp in the
     // game's line is a formality for a nibble, so there is none here. A vertex shader has no
     // derivatives, so the level is explicit; the lightmap has one level to fetch from.
-    var light_pair = vec2<f32>(f32(v4 & 15u), f32((v4 >> 4u) & 15u));
+    var light_pair = vec2<f32>(f32((v4 >> 24u) & 15u), f32((v4 >> 28u) & 15u));
     var light_texel = light_pair * 0.0625 + 0.03125;
     vr.light_color = textureSampleLevel(t_lightmap, t_lightmap_sampler, light_texel, 0.0).rgb;
 

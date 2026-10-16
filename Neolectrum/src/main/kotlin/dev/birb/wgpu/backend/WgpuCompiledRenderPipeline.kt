@@ -235,7 +235,15 @@ class WgpuCompiledRenderPipeline private constructor(
          * to tell which one is to print both sides. Diagnostics.
          */
         private fun describeOnce(pipeline: RenderPipeline) {
-            if (!Diagnostics.loggingEnabled()) return
+            // **The terrain pipelines describe themselves whatever the logging switch says.** The
+            // 2612.0.8-android.15 session on the Adreno 640 produced a world whose blocks read as
+            // transparent, and that world is drawn by these very pipelines through this very
+            // translation - so the one question every next log has to answer without asking the
+            // player to find a debug switch first is what state this side gave them: the blend, the
+            // depth test, the write mask, the cull and the vertex format, exactly as the game asked
+            // for them. Three lines per session, and the logging switch keeps governing everything
+            // else.
+            if (!Diagnostics.loggingEnabled() && !pipeline.location.toString().contains("terrain")) return
             if (!described.add(pipeline.location)) return
 
             val target = pipeline.colorTargetState
