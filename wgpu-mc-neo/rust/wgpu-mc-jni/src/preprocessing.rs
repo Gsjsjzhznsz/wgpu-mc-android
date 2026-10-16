@@ -1481,15 +1481,23 @@ pub fn process_shaders(
     uniform_locations: &HashMap<String, (u32, u32)>,
     vertex_stage_input_layout: HashMap<String, u32>,
     per_draw_storage: &HashSet<String>,
-) -> ProcessedShaderResult {
+) -> Result<ProcessedShaderResult, String> {
     let vert_source = format!("{directives}{vert_source}");
     let frag_source = format!("{directives}{frag_source}");
 
     let preprocessed_vert = cyntax::preprocess_str(&vert_source, &[]);
     let preprocessed_frag = cyntax::preprocess_str(&frag_source, &[]);
 
-    let mut vert_stage_ast = ShaderStage::parse(preprocessed_vert).unwrap();
-    let mut frag_stage_ast = ShaderStage::parse(preprocessed_frag).unwrap();
+    // **A shader that does not parse is a refused pipeline, not a dead game.** The JVM side can
+    // hand over an empty or truncated source - android.13's launcher did exactly that when its
+    // shader source went stale after a resource reload, and the `unwrap` that stood here turned
+    // one pipeline's empty vertex shader into `abort()` for the whole process. The error travels
+    // to the caller, which names the pipeline, keeps the raw text for the record, and refuses
+    // the pipeline the way a driver refusal is refused.
+    let mut vert_stage_ast = ShaderStage::parse(preprocessed_vert)
+        .map_err(|error| format!("the vertex shader did not parse: {error}"))?;
+    let mut frag_stage_ast = ShaderStage::parse(preprocessed_frag)
+        .map_err(|error| format!("the fragment shader did not parse: {error}"))?;
 
     vert_stage_ast.visit_mut(&mut MatrixPatcher);
     vert_stage_ast.visit_mut(&mut EmulateGlClipSpace);
@@ -1584,12 +1592,12 @@ pub fn process_shaders(
     show_translation_unit(&mut vert, &vert_stage_ast);
     show_translation_unit(&mut frag, &frag_stage_ast);
 
-    ProcessedShaderResult {
+    Ok(ProcessedShaderResult {
         frag,
         vert,
         sampler_types,
         implicit_uniforms,
-    }
+    })
 }
 
 pub fn shim_samplers(
@@ -2016,7 +2024,8 @@ void main() {
             &locations,
             [("Position".to_string(), 0u32)].into_iter().collect(),
             &per_draw,
-        );
+        )
+        .expect("the terrain shaders parse");
 
         (result.vert, result.frag)
     }
@@ -2107,7 +2116,8 @@ void main() {
             &locations,
             [("Position".to_string(), 0u32)].into_iter().collect(),
             &HashSet::new(),
-        );
+        )
+        .expect("the terrain shaders parse");
 
         assert!(
             result.vert.contains("uniform ChunkSection"),
@@ -2183,6 +2193,97 @@ void main() {
         if let Some(error) = naga_error(&frag, naga::ShaderStage::Fragment) {
             panic!("naga rejects the zero-pad terrain fragment shader: {error}\n{frag}");
         }
+    }
+}
+
+#[cfg(test)]
+mod empty_source_regression {
+    use crate::preprocessing::process_shaders;
+
+    /// The android.13 abort, kept as a regression test: what the JVM hands over when its
+    /// `ShaderSource` has nothing for a shader is directives with no shader text behind them,
+    /// and the preprocessor's output for that must be **an error**, not a panic. The device
+    /// log's parse error is reproduced here character for character by the failure mode this
+    /// replaced - `unwrap` on exactly this input aborted the whole game.
+    #[test]
+    fn directives_with_no_shader_text_are_an_error_not_a_panic() {
+        // The shape of a pipeline with no defines and the per-draw pad line: the same input the
+        // launcher served for the GUI pipeline's depth variant.
+        let directives = format!("#version 440\n{}\n", "\n#define WM_CHUNK_PAD 6\n");
+        let error = process_shaders("", "", &directives, &Default::default(), Default::default(), &Default::default())
+            .err()
+            .expect("an empty shader source must not translate");
+
+        assert!(
+            error.contains("the vertex shader did not parse"),
+            "the error names the stage that failed to parse: {error}"
+        );
+        assert!(
+            error.contains("expected ';', got end of input"),
+            "the parser's own words are kept, so a log line is searchable against the \
+             device log that showed the crash: {error}"
+        );
+
+        // The fragment stage gets the same treatment, and is named the same way: a real vertex
+        // shader behind directives, and a fragment source that is not there at all.
+        let frag_only = "#version 440\n#define WM_CHUNK_PAD 6\n";
+        let error = process_shaders(
+            "void main() { gl_Position = vec4(1.0); }",
+            "",
+            frag_only,
+            &Default::default(),
+            Default::default(),
+            &Default::default(),
+        )
+        .err()
+        .expect("an empty fragment source must not translate");
+        assert!(
+            error.contains("the fragment shader did not parse"),
+            "the error names the stage that failed to parse: {error}"
+        );
+    }
+
+    /// The real `core/gui.vsh` Minecraft 26.1 ships, behind the same directive prefix, must
+    /// translate - the empty-source crash was never about this shader's text.
+    #[test]
+    fn real_gui_vsh_parses() {
+        let gui_vsh = r#"#version 330
+
+// Can't moj_import in things used during startup, when resource packs don't exist.
+// This is a copy of dynamicimports.glsl and projection.glsl
+layout(std140) uniform DynamicTransforms {
+    mat4 ModelViewMat;
+    vec4 ColorModulator;
+    vec3 ModelOffset;
+    mat4 TextureMat;
+};
+layout(std140) uniform Projection {
+    mat4 ProjMat;
+};
+
+in vec3 Position;
+in vec4 Color;
+
+out vec4 vertexColor;
+
+void main() {
+    gl_Position = ProjMat * ModelViewMat * vec4(Position, 1.0);
+
+    vertexColor = Color;
+}
+"#;
+        let directives = format!("#version 440\n{}\n", "\n#define WM_CHUNK_PAD 6\n");
+        let processed = process_shaders(
+            gui_vsh,
+            gui_vsh,
+            &directives,
+            &Default::default(),
+            Default::default(),
+            &Default::default(),
+        )
+        .expect("Minecraft's own gui.vsh translates");
+
+        assert!(processed.vert.contains("vertexColor"), "{}", processed.vert);
     }
 }
 

@@ -4890,7 +4890,7 @@ pub unsafe extern "C" fn is_render_pipeline_valid(pipeline: *mut BlazePipeline) 
 pub unsafe extern "C" fn compile_render_pipeline(
     wm: &WmRenderer,
     render_pipeline_description: &RenderPipeline,
-) -> Box<BlazePipeline> {
+) -> *mut BlazePipeline {
     LIVE_PIPELINE_COUNT.fetch_add(1, Ordering::Relaxed);
 
     // **Name the pipeline before anything of it goes to the driver.** One line per pipeline per
@@ -5034,12 +5034,7 @@ pub unsafe extern "C" fn compile_render_pipeline(
                 (vert, frag, samplers, implicit_uniforms, block_sizes)
             }
             None => {
-                let ProcessedShaderResult {
-                    frag,
-                    vert,
-                    sampler_types,
-                    implicit_uniforms,
-                } = process_shaders(
+                let (vert, frag, sampler_types, implicit_uniforms) = match process_shaders(
                     &render_pipeline_description.vertex_shader,
                     &render_pipeline_description.fragment_shader,
                     &directives,
@@ -5049,7 +5044,52 @@ pub unsafe extern "C" fn compile_render_pipeline(
                     // said so (see `UniformType::StorageBuffer`), and the shader has to be rewritten to
                     // match it before anything is annotated. See `rewrite_per_draw_blocks`.
                     &plan.per_draw_storage(),
-                );
+                ) {
+                    Ok(ProcessedShaderResult {
+                        frag,
+                        vert,
+                        sampler_types,
+                        implicit_uniforms,
+                    }) => (vert, frag, sampler_types, implicit_uniforms),
+                    Err(message) => {
+                        // **The translation was handed text that never parsed.** The JVM side can
+                        // serve an empty or truncated shader - android.13 died here on an empty
+                        // vertex shader its stale `ShaderSource` answered with null, and the
+                        // `unwrap` that stood under this match turned one such pipeline into
+                        // `abort()` for the whole process. What the game gets now is what a
+                        // driver refusal gets: a named refusal, the raw text on the record, and
+                        // a pipeline whose draws are skipped.
+                        error!(
+                            "wgpu-mc: {} cannot be compiled: {message} - the pipeline was born \
+                             refused, and every draw with it is skipped",
+                            render_pipeline_description.name,
+                        );
+
+                        let compilation = PipelineCompilation {
+                            name: render_pipeline_description.name.to_string(),
+                            variant: "its first variant, before the driver saw any of it",
+                            // The **raw** description, not a processed form: what went wrong is
+                            // the text itself - empty, truncated, or otherwise not GLSL - and
+                            // that is what the dump has to show.
+                            vertex: render_pipeline_description.vertex_shader.to_string(),
+                            fragment: render_pipeline_description.fragment_shader.to_string(),
+                        };
+                        dump_pipeline_refused_or_lost(
+                            &compilation,
+                            "the GLSL did not parse after preprocessing, so the driver was \
+                             never asked for anything".to_string(),
+                            &message,
+                            "",
+                        );
+
+                        // Nothing was attributed to a later pipeline, and no pipeline was born:
+                        // hand the JVM a null, which its draw path treats as a pipeline whose
+                        // every draw is skipped.
+                        *LAST_PIPELINE_COMPILING.lock() = None;
+                        LIVE_PIPELINE_COUNT.fetch_sub(1, Ordering::Relaxed);
+                        return std::ptr::null_mut();
+                    }
+                };
 
                 // A translation is a miss whether or not it survives: the counter is the report's
                 // "translated" half, and whether to keep it is the decision just below.
@@ -5305,7 +5345,9 @@ pub unsafe extern "C" fn compile_render_pipeline(
     // moment they change is here.
     save_pipeline_cache(wm);
 
-    Box::new(BlazePipeline {
+    // Null is a pipeline whose shader text never parsed (the early return above); every other
+    // caller gets a live handle the JVM frees with `drop_render_pipeline`.
+    Box::into_raw(Box::new(BlazePipeline {
         pipeline,
         topology: render_pipeline_description.primitive_topology,
         name: plan.name.clone(),
@@ -5315,7 +5357,7 @@ pub unsafe extern "C" fn compile_render_pipeline(
         valid: AtomicBool::new(valid),
         refusal_logged: AtomicBool::new(false),
         recipe,
-    })
+    }))
 }
 
 /// How many pipelines are compiled between two writes of the pipeline cache.

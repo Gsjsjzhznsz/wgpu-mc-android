@@ -77,7 +77,8 @@ fn final_glsl(directives: &str, with_dissolve_mask: bool) -> (String, String) {
         &locations,
         entity_vertex_layout(),
         &HashSet::new(),
-    );
+    )
+    .expect("the entity shaders parse");
 
     (result.vert, result.frag)
 }

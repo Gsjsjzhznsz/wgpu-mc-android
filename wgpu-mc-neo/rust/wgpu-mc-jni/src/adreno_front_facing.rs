@@ -97,7 +97,8 @@ fn final_glsl(directives: &str, with_overlay: bool) -> (String, String) {
         // The log pins this: the per-draw pad line first fires on `translucent_terrain`,
         // long after every entity pipeline - none of them declare a per-draw block.
         &HashSet::new(),
-    );
+    )
+    .expect("the armor shaders parse");
 
     (result.vert, result.frag)
 }
