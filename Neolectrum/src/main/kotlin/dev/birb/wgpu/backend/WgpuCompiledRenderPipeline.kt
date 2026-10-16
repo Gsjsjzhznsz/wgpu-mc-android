@@ -303,39 +303,49 @@ class WgpuCompiledRenderPipeline private constructor(
             type: ShaderType,
             defines: ShaderDefines,
             source: ShaderSource,
-        ): String = shaderSources.computeIfAbsent(ShaderKey(id, type, defines)) { key ->
-            val served = source.get(key.id, key.type)
+        ): String {
+            val key = ShaderKey(id, type, defines)
 
+            shaderSources[key]?.let { return it }
+
+            val served = source.get(id, type)
             if (served != null) {
                 lastKnownGoodSources[key] = served
-                served
-            } else {
-                val knownGood = lastKnownGoodSources[key]
-                if (knownGood != null) {
-                    if (sourcesWithoutShader.add(key)) {
-                        dev.birb.wgpu.WgpuMcMod.LOGGER.warn(
-                            "wgpu: the shader source has nothing for {} ({}), so the text an " +
-                                "earlier reload served is used - the source object this device " +
-                                "holds predates the shader state a reload installed",
-                            key.id, key.type,
-                        )
-                    }
-                    knownGood
-                } else {
-                    if (sourcesWithoutShader.add(key)) {
-                        dev.birb.wgpu.WgpuMcMod.LOGGER.error(
-                            "wgpu: the shader source has nothing for {} ({}) and no earlier text " +
-                                "is known; this pipeline compiles from its directives alone, the " +
-                                "native side will refuse it, and its draws are skipped",
-                            key.id, key.type,
-                        )
-                    }
-                    // Deliberately not cached: a null answer records no mapping, so a source
-                    // that can serve this shader later is asked again rather than reading "".
-                    null
-                }
+                shaderSources[key] = served
+                return served
             }
-        } ?: ""
+
+            // The source has nothing for a shader Minecraft itself asked to compile. The last
+            // text that shader was ever served is the best answer there is, and it is cached so
+            // the pass keeps drawing while the source stays out of step with the reload.
+            val knownGood = lastKnownGoodSources[key]
+            if (knownGood != null) {
+                if (sourcesWithoutShader.add(key)) {
+                    dev.birb.wgpu.WgpuMcMod.LOGGER.warn(
+                        "wgpu: the shader source has nothing for {} ({}), so the text an " +
+                            "earlier reload served is used - the source object this device " +
+                            "holds predates the shader state a reload installed",
+                        key.id, key.type,
+                    )
+                }
+                shaderSources[key] = knownGood
+                return knownGood
+            }
+
+            // Nothing known at all: reported once, answered with the empty source, and left
+            // uncached, so a source that can serve this shader later is asked again rather than
+            // finding "" here forever. The native side refuses what comes of it instead of
+            // dying over it.
+            if (sourcesWithoutShader.add(key)) {
+                dev.birb.wgpu.WgpuMcMod.LOGGER.error(
+                    "wgpu: the shader source has nothing for {} ({}) and no earlier text " +
+                        "is known; this pipeline compiles from its directives alone, the " +
+                        "native side will refuse it, and its draws are skipped",
+                    key.id, key.type,
+                )
+            }
+            return ""
+        }
 
         /**
          * The compiled pipeline for [pipeline], compiling the variant [wantsDepth] asks for.
