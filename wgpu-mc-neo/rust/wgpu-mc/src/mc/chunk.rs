@@ -785,6 +785,16 @@ impl SectionStorage {
     /// given back, and it is not replaced - because the alternative is a section that vanishes from the
     /// world and stays gone until something else asks for it: stale geometry is a wrong picture, and no
     /// geometry is a hole.
+    ///
+    /// `None` also when a bake wrote a local vertex id past the [`crate::mc::LOCAL_VERTEX_MASK`] the
+    /// index format holds. That guard used to be a `debug_assert` on the packing loop, which is to say
+    /// it did not exist in what ships: a release build took the overflowing ids, OR-ed the record slot
+    /// over bits the local id already occupied, and drew the result - a record slot shifted by the
+    /// spill reads another section's record, whose `word_base` and origin fetch somebody else's
+    /// vertices at this section's transform, and a u32 of index bytes read as a vertex position is a
+    /// triangle stretched across the world. The long thin streaks a 32-chunk view produced while the
+    /// world was still loading are what that looks like. A refused section keeps its game mesh and
+    /// costs a re-scan per drain - which is the whole price of never drawing it wrong.
     pub fn allocate(
         &mut self,
         pos: IVec3,
@@ -792,6 +802,48 @@ impl SectionStorage {
     ) -> Option<(Section, Vec<ReleasedRange>)> {
         let mut freed = Vec::new();
         let mut replaced_records = Vec::new();
+
+        // **The cliff, checked while the bytes are still plain local ids.** One pass over the bake's
+        // indices, which the packing loop below walks anyway, so the cost is a second read of memory
+        // that is already resident - tens of thousands of u32 per section against a drain that runs
+        // once a frame. The count and the rate-limited line are what a field log needs to name the
+        // mesher path that produced the overflow: the position, the layer, and how far past the mask
+        // the bake reached. The walk is by hand rather than a `bytemuck` cast because a scan that
+        // runs before the packing loop has no reason to inherit its alignment assumption.
+        for (layer_index, layer) in baked_layers.iter().enumerate() {
+            let mut over = None;
+
+            for word in layer.indices.as_chunks::<4>().0 {
+                let value = u32::from_ne_bytes([word[0], word[1], word[2], word[3]]);
+
+                if value > crate::mc::LOCAL_VERTEX_MASK {
+                    over = Some(value);
+                    break;
+                }
+            }
+
+            if let Some(worst) = over {
+                let seen =
+                    LOCAL_VERTEX_OVERFLOWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+
+                if seen <= 16 || seen.is_multiple_of(4096) {
+                    log::warn!(
+                        "wgpu-mc: a bake at ({}, {}, {}) wrote layer {} with a local vertex id of {}, \
+                         past the {} the index format holds ({} overflow(s) so far); the layer is \
+                         refused and the section keeps its game mesh",
+                        pos.x,
+                        pos.y,
+                        pos.z,
+                        layer_index,
+                        worst,
+                        crate::mc::LOCAL_VERTEX_MASK,
+                        seen,
+                    );
+                }
+
+                return None;
+            }
+        }
 
         if let Some(previous_section) = self.storage.get(&pos) {
             for layer in &previous_section.layers {
@@ -809,8 +861,6 @@ impl SectionStorage {
             }
         }
 
-        self.defer_free_records(replaced_records);
-
         let section = self.allocate_ranges(baked_layers);
 
         if self.refused {
@@ -823,8 +873,21 @@ impl SectionStorage {
             // flag is a field on a section that is already in the map.
             self.refused_pending.insert(pos);
 
+            // **And the record slots it replaced are not given back either.** The deferral used to
+            // sit above the allocation, which put the previous section's slots into the deferred ring
+            // on *every* attempt - including the ones that end here, with the old section kept. A
+            // kept section still names the slots it was baked with, and a slot that the ring returns
+            // to the free list while its section lives is a slot the next bake takes and writes its
+            // own record into: the survivor's indices then read the newcomer's `word_base` and origin,
+            // and its geometry is drawn from somebody else's vertices at somebody else's position.
+            // That is the second streak source, and unlike the spill above it needed no malformed
+            // bake - only an arena tight enough to refuse a rebuild, which is exactly the state a
+            // 32-chunk view drives the record table into. The deferral belongs to the replacement,
+            // not to the attempt.
             return None;
         }
+
+        self.defer_free_records(replaced_records);
 
         // **The indices name their record slot, and the record is written here, once.** The bake
         // wrote local vertex ids; the slot in the bits above them is what turns the same bytes into
@@ -1358,6 +1421,16 @@ static PARKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 /// view has already moved past - which is memory spent to no end, since their positions are reported
 /// to the JVM on the way out and Minecraft meshes them from scratch.
 static PARKED_TRIMMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many bakes were refused for writing a local vertex id past the [`crate::mc::LOCAL_VERTEX_MASK`]
+/// the index format holds.
+///
+/// Zero is the answer a healthy mesher gives, and the number is here so the answer is readable rather
+/// than assumed: the guard this counts used to be a `debug_assert`, which a release build compiles
+/// away, and an overflow it missed drew another section's vertices at this one's transform - the
+/// stretched triangles a 32-chunk view grew while the world loaded. Each hit also says so on the log,
+/// rate-limited, with the position and the layer, which is what names the mesher path to fix.
+static LOCAL_VERTEX_OVERFLOWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// See [PARKED].
 pub fn sections_parked() -> u64 {
@@ -6589,6 +6662,101 @@ mod arena_tests {
             sections_parked() > counted,
             "and the run counts it, which is the number that says the expensive recovery did not \
              happen"
+        );
+    }
+
+    /// **A bake past the local-vertex cliff is refused before it reaches the pool**, and the section
+    /// it would have replaced is left exactly as it was.
+    ///
+    /// The guard exists because the release build used to take the overflow silently: the record slot
+    /// was OR-ed over bits the local id already occupied, the draw read another section's record, and
+    /// the result was geometry stretched across the world. Refusing costs a re-scan per drain; drawing
+    /// it wrong costs the picture.
+    #[test]
+    fn a_bake_past_the_local_vertex_mask_is_refused_and_leaves_the_survivor_alone() {
+        let mut storage = SectionStorage::new(pool_for(2));
+
+        assert!(put(&mut storage, IVec3::new(0, 0, 0), 1));
+
+        // One index carrying a local vertex id one past the mask the format holds - what a mesher
+        // bug that lost count of a section's vertices looks like on the wire.
+        let mut overflowing = layer(1);
+        overflowing.indices[..4].copy_from_slice(&(crate::mc::LOCAL_VERTEX_MASK + 1).to_ne_bytes());
+
+        let before = LOCAL_VERTEX_OVERFLOWS.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert!(
+            storage
+                .allocate(IVec3::new(0, 0, 0), &mut [overflowing])
+                .is_none(),
+            "the bake never reaches the pool, so no range is allocated and no record is written"
+        );
+        assert!(
+            LOCAL_VERTEX_OVERFLOWS.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "counted, because a field log has to be able to name this"
+        );
+        assert!(
+            storage.storage.contains_key(&IVec3::new(0, 0, 0)),
+            "the survivor keeps its geometry: the game mesh keeps the ground drawn"
+        );
+        assert!(
+            put(&mut storage, IVec3::new(1, 0, 0), 1),
+            "and the guard is not a refusal of everything: a clean bake still lands"
+        );
+    }
+
+    /// **A replacement the pool refuses keeps the record slots of the section it keeps.**
+    ///
+    /// The deferral of the replaced records used to run before the allocation, which handed the
+    /// survivor's slots to the ring on every attempt - including the attempts that end refused. A
+    /// slot the ring returns while its section lives is a slot the next bake takes and writes its
+    /// own record into, and the survivor's indices then read the newcomer's `word_base` and origin:
+    /// geometry drawn from somebody else's vertices at somebody else's position. This is the second
+    /// of the two streak sources, and the one that needed nothing more than an arena tight enough to
+    /// refuse a rebuild.
+    #[test]
+    fn a_refused_replacement_keeps_the_record_slots_of_the_section_it_keeps() {
+        let mut storage = SectionStorage::new(pool_for(2));
+
+        assert!(put(&mut storage, IVec3::new(0, 0, 0), 1));
+
+        let survivor_slot = storage.storage[&IVec3::new(0, 0, 0)].layers[0]
+            .as_ref()
+            .expect("the survivor was put with one layer")
+            .record_slot;
+
+        // The arena holds two quads and the survivor holds one, so a two-quad replacement cannot
+        // land - a replacement allocates before the ranges it replaces come back. The attempt ends
+        // refused, with the old section kept.
+        assert!(
+            storage
+                .allocate(IVec3::new(0, 0, 0), &mut [layer(2)])
+                .is_none(),
+            "no room, which is the state a 32-chunk view drives the pool into"
+        );
+
+        assert!(
+            !storage.record_free.contains(&survivor_slot),
+            "the kept section's slot is not handed back while the section lives"
+        );
+
+        storage.free_deferred();
+
+        assert!(
+            !storage.record_free.contains(&survivor_slot),
+            "and not once the deferred ring has aged, either - this is the assertion the old order \
+             failed"
+        );
+
+        // **The success path is unchanged**: a replacement that lands gives the old slot back through
+        // the same ring, one frame later, which is the pacing the GPU needs.
+        assert!(put(&mut storage, IVec3::new(0, 0, 0), 1));
+
+        storage.free_deferred();
+
+        assert!(
+            storage.record_free.contains(&survivor_slot),
+            "a replaced section's slot does come back"
         );
     }
 

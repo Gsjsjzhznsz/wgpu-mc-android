@@ -1,8 +1,10 @@
 # wgpu-mc 适配 Iris 着色器包：可行性研究与路线图
 
-> 状态：研究文档（2026-10-18，android.32 会话产出）。
+> 状态：研究文档（2026-10-18，android.32 会话产出；同日补充 Beryl 市场实证）。
 > 结论先行：**直接安装 Iris 不可行**；**复用 Iris 的 Java 前端 + wgpu 后端**是长期可行路线；
 > 短期建议做 P0+P1 原型验证三件硬风险（GLSL 变换层、内存预算、Adreno 性能）后再决定投入。
+> **2026-10-18 市场实证**：VulkanMod 官方指路的光影方案 Beryl 也不加载 Iris 包，而是
+> 自带内置光影——"Vulkan 上能装 Iris 包"的成品至今不存在，见 §4.5。
 
 ## 1. 背景与用户诉求
 
@@ -85,6 +87,35 @@ Iris 的代码是分层的，其中**不碰 GL 的部分可以复用**（LGPL）
 短期能做出效果（bloom/阴影/水面波动的 composite 链），但**生态零兼容**——pack 不是
  interchangeable 的（Iris 作者原话），用户要的是"装 BSL"，这条路线满足不了。仅作为
  P0 阶段的管线试验场有价值。
+
+### §4.5 市场实证：VulkanMod + Beryl（2026-10-18 补充，回应"市面上已有 Vulkan 的 Iris 项目"）
+
+用户指出市面已有 Vulkan 光影项目，核实结果如下：
+
+- **VulkanMod**（xCollateral，Fabric/Quilt，LGPL，Modrinth 520 万下载，支持 1.18.2~26.1.x）
+  是与本 mod 同类的"Vulkan 渲染引擎"mod。其官方页对光影的答复只有一句：
+  "If you want to use shaders with VulkanMod, then check out **Beryl**"。
+- **Beryl**（Modrinth `rYeGeBaO`，需 VulkanMod 前置，Fabric，1.21~26.1.x）自述为
+  "an efficient shader pipeline for Vulkan"。关键架构选择在它自己的描述里：
+  **"beryl has an integrated shader pack"——内置自带光影，不加载 Iris/OptiFine 包**，
+  理由是 "full control over the rendering pipeline and to better optimize it"。
+- Iris 官方的三次表态一致：#1515（2022，"无计划支持 Vulkan 替代 mod，需要重写 Iris 管线"）、
+  #1722（2022，"不会加 Vulkan 支持"）、#3416（2026-10，"Vulkan 兼容着色方案即使自带
+  shaders，也不等于能加载现有 Iris shaderpack"）。
+
+**这组事实说明三件事**：
+
+1. **"Vulkan 上装 Iris 包"的成品至今不存在**——不是没人做，而是 legacy GLSL→Vulkan
+   升格层就是所有项目都绕开的硬骨头。本方案对路线 B 难度的判断不变。
+2. **Beryl = 路线 C 的成功先例**："Vulkan 原生管线 + 内置光影"能出成品、能拿下载量
+   （VulkanMod 生态 520 万下载证明需求真实存在）。路线 C 从"仅管线试验场"升格为
+   **可交付的近期方案**：把 P0 的离屏基础件 + 一个 BSL 风格内置包（软阴影/泛光/水面
+   波光/色调映射）做成"实验开关"后面的一档，先让用户看到效果。
+3. **包生态兼容（路线 B）仍然是唯一能满足"装 BSL"诉求的已知路径**，投入决策不变：
+   先 P0+P1 原型验证，过不了退回 C 并明示。
+
+行动调整：路线图不变，P0 之后**插入 P0.5：内置光影最小可见集**（复用 P0 的
+composite 框架，不走 pack 解析），作为路线 C 的第一块交付物。
 
 ## 5. 三大硬风险（决定要不要做）
 
