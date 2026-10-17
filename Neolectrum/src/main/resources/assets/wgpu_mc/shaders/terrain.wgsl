@@ -101,34 +101,55 @@ struct FogEnvironment {
 
 @group(1) @binding(0) var<storage> chunk_data: array<u32>;
 
-// **What one draw of this pass is: a vertex attribute, fetched instance-stepped.** The four words the
-// pass writes per draw - the section, relative to the camera's, and the arena slot its vertices start
-// at - arrive at this stage through the input assembler rather than through a binding, one fetch per
-// draw off a buffer the pass fills once before its first draw.
+/// **What one draw of this pass reads about its section, and the third channel the per-draw data has
+/// had.** One `SectionRecord` per record slot, sixteen bytes, written once per bake and never again.
+///
+/// The channel a draw finds its record through is **the index buffer itself**: every baked index is
+/// `(record_slot << 17) | local_vertex`, so `vi >> 17` names the record and `vi & 0x1ffff` names the
+/// vertex within the section - one storage fetch, and no input-assembler state at all. The two
+/// channels before this one both died on the same Adreno 640: a storage binding indexed by
+/// `@builtin(instance_index)` drew a hollow world because the driver accepted a non-zero
+/// `firstInstance` and did not carry it into the builtin, and the instance-step attribute that
+/// replaced it drew the same hollow world because the driver does not carry `firstInstance` into the
+/// fixed-function fetch either. The indices are the one channel the per-section fallback path had
+/// already proven on every device this renderer runs on - a draw's `first_index` is what selects its
+/// own slice of the arena's index buffer, and that has never been optional.
+///
+/// **The position is absolute, and the camera subtraction is `section_pos.camera_section`'s job.** A
+/// record written at bake time cannot know where the camera will be, so `x`, `y` and `z` are the
+/// section's own coordinates and the vertex stage subtracts the camera's section, which travels in
+/// the pass immediate. Three integer subtractions per vertex are what a per-frame record upload used
+/// to cost the CPU.
+struct SectionRecord {
+    x: i32,
+    y: i32,
+    z: i32,
+    word_base: u32,
+}
+
+@group(2) @binding(0) var<storage> section_records: array<SectionRecord>;
+
+// **What one draw of this pass reads, and where from.** Nothing per draw arrives through the input
+// assembler at all: the pipelines declare no vertex buffers, and the draw's only per-draw inputs are
+// its indices, which carry the section's record slot in their high bits - see `SectionRecord` above
+// for what that decode reads and how it works.
 //
-// The channel a `multi_draw_indexed_indirect` has for anything per draw is still the record's
-// `first_instance` - an immediate is set once for the whole call and one call may cover thousands of
-// sections - but the record number is now consumed by the *fixed-function* vertex fetch, which offsets
-// instance-step attributes by it, and no longer by the `instance_index` builtin in here. Both paths
-// feed the fetch: the batched one through `first_instance`, the one-draw-per-section fallback through
-// the instance range of its `draw_indexed`, so the switch between them is a switch in the number of
-// calls and not in the picture.
+// **Why the per-draw data went through three channels, and what killed the first two.** The batched
+// path shipped reading `section_draws[instance_index]` out of a storage binding, and the first device
+// it turned on on - an Adreno 640 - reported every feature the path asks for and then drew a world
+// whose sections were missing or piled into one place: the signature of a driver that accepts non-zero
+// `firstInstance` in an indirect record and does not carry it into the shader's `instance_index`.
+// wgpu hit the same class on D3D12, where `SV_InstanceID` by definition ignores it (see the exclusion
+// in `wgpu-mc-jni/src/device.rs` and wgpu#2471), and a builtin is a *compiler* path - which is exactly
+// where a driver bug hides. The record then moved to an instance-step attribute the fixed-function
+// fetch offsets by `firstInstance` - and the same Adreno 640 does not carry it through there either,
+// which the four-record probe at device creation proved and android.26-28 drew one section at a time
+// because of. The indices are the third channel, and the one nothing can refuse: the fallback path
+// had been addressing its sections through `first_index` from the beginning, on every device, which
+// is the proof a channel needs.
 //
-// **Why the builtin lost its job: a driver that does not propagate it.** The batched path shipped
-// reading `section_draws[instance_index]` out of a storage binding, and the first device it turned on
-// on - an Adreno 640 - reported every feature the path asks for and then drew a world whose sections
-// were missing or piled into one place: the signature of a driver that accepts non-zero `firstInstance`
-// in an indirect record and does not carry it into the shader's `instance_index`. wgpu hit the same
-// class on D3D12, where `SV_InstanceID` by definition ignores it (see the exclusion in
-// `wgpu-mc-jni/src/device.rs` and wgpu#2471), and a builtin is a *compiler* path - which is exactly
-// where a driver bug hides. The vertex fetch is a different unit: Vulkan folds `firstInstance` into
-// instance-rate attribute indexing at the fixed-function level, and D3D12's `StartInstanceLocation`
-// does the same for its instance-step reads. So the record moved from a binding the shader indexed to
-// a buffer the assembler fetches, which is the shape that works everywhere the batching works at all.
-//
-// See `SectionDraw` in `mc/mod.rs` for the Rust side and for `vertex_layout`, which declares the
-// attribute these four words are fetched through: one `Sint32x4` at location 0, sixteen bytes,
-// instance-stepped.
+// See `SectionRecord` in `mc/mod.rs` for the Rust side, and `SectionPositionImmediate` in
+// `render/graph.rs` for the immediate that carries the camera's section the subtraction needs.
 
 struct VertexResult {
     @builtin(position) pos: vec4<f32>,
@@ -255,6 +276,15 @@ struct SectionPosition {
     // drift apart. Two `f32` written consecutively read as one `vec2`.
     // The game's UseRgss: 1 when its textureFiltering option is RGSS, 0 otherwise. See `sample_rgss`.
     use_rgss: u32,
+    // WGSL gives a `vec3<i32>` an alignment of sixteen, so the coordinates below start at byte 32 -
+    // the four bytes after `use_rgss` are padding, and the Rust struct the pass writes has the same
+    // field named in it.
+    //
+    // **The camera's section, which every draw's record is absolute against.** The records are written
+    // once per bake and cannot know where the camera will be; the subtraction that used to happen on
+    // the CPU, per frame, per section, happens here instead - three `i32` subtractions, then the same
+    // `* 16.0` the record's relative position was multiplied by. See `SectionRecord`.
+    camera_section: vec3<i32>,
 };
 
 /// Whether a fragment's coordinates are being **stretched** rather than squeezed - which is exactly
@@ -664,21 +694,22 @@ fn frag_game_atlas(
 @vertex
 fn vert(
     @builtin(vertex_index) vi: u32,
-    // **This draw's record, fetched by the input assembler.** The four words `SectionDraw` writes:
-    // the section, relative to the camera's, then the arena slot its vertices start at. The record
-    // number is what the pass writes into `first_instance` of an indirect dispatch entry and into the
-    // instance range of a plain `draw_indexed`, and the fetch is offset by it - through the
-    // fixed-function instance indexing, not the builtin this used to read. See the note above
-    // `VertexResult` for why the two are different things to a driver.
-    @location(0) draw_record: vec4<i32>
 ) -> VertexResult {
 //    var vert1_i = (vi >> 2) << 4;
 //    var vert1_i = (vi << 2) & 0xfffffffc;
 //    var vert1_i = ((vi >> 2u) << 2u)+base_vertex;
 
-    let base_vertex = u32(draw_record.w);
-    var offset = vi & 3;
-    var vert1_i = vi & ~3u;
+    // **Which section this vertex belongs to, read out of the index itself.** The bake wrote every
+    // index as `(record_slot << 17) | local_vertex`, so the high bits name the record and the low
+    // bits name the vertex within the section - the decode the input assembler used to do with an
+    // instance-step fetch and a `first_instance` per record. See `SectionRecord` above for why the
+    // fetch lost to the index.
+    let record = section_records[vi >> 17u];
+    let local_vertex = vi & 0x1ffffu;
+
+    let base_vertex = record.word_base;
+    var offset = local_vertex & 3u;
+    var vert1_i = local_vertex & ~3u;
 
     var id = ((vert1_i + offset) << 2u) + base_vertex;
 
@@ -813,7 +844,17 @@ fn vert(
     // No flag test and no `16.0` here any more: see the decode above for where those three bits went.
     var pos = vec3<f32>(x, y, z);
 
-    var section_origin = vec3<f32>(f32(draw_record.x), f32(draw_record.y), f32(draw_record.z)) * 16.0;
+    // **The record's absolute position, made camera-relative here.** The record cannot know where
+    // the camera is - it was written at bake time - so the per-frame record's subtraction moved into
+    // the shader: three integer subtractions, then the same `* 16.0`. Everything below this line is
+    // exactly what the relative-position generations drew, because the number it names is the same
+    // number - a small one, which is the whole point (see `camera_section_pos` in `mc/mod.rs` for
+    // why absolute positions in `f32` ground sections into each other).
+    var section_origin = vec3<f32>(
+        f32(record.x - section_pos.camera_section.x),
+        f32(record.y - section_pos.camera_section.y),
+        f32(record.z - section_pos.camera_section.z),
+    ) * 16.0;
     var world_pos = pos + section_origin;
 
     vr.pos = mat4_persp * mat4_view * mat4_model * vec4(world_pos, 1.0);

@@ -13,7 +13,6 @@ use wgpu::{
 
 use crate::WmRenderer;
 use crate::mc::Scene;
-use crate::mc::SectionDraw;
 use crate::mc::chunk::RenderLayer;
 use crate::mc::chunk::SectionStorage;
 use crate::mc::entity::InstanceVertex;
@@ -67,9 +66,6 @@ static SECTIONS_TOO_NEW: AtomicU64 = AtomicU64::new(0);
 /// looked up again so that the draw loops never touch the arena's `HashMap`.
 #[derive(Debug, Clone)]
 struct VisibleSection {
-    /// The section's position relative to the camera's section: the number the push constant carries,
-    /// and the origin every vertex of the section is placed against. See the terrain pass.
-    relative_position: glam::IVec3,
     /// Per [`RenderLayer`], the `(indices, vertices)` the arena holds, or `None` for no layer.
     ///
     /// The third number is **which arena buffer** those two ranges are offsets into. It travels with
@@ -81,26 +77,24 @@ struct VisibleSection {
     distance_squared: f32,
 }
 
-/// One draw a terrain pass is about to make: the arena it reads, the indices to draw, and which
-/// [`SectionDraw`] describes it.
+/// One draw a terrain pass is about to make: the arena it reads, and the indices to draw.
 ///
-/// The gather produces *sections* and a draw needs *draws* - a section with two layers is two of them,
-/// and the record a draw fetches is per draw rather than per section - so the pass builds this list once
-/// and both draw paths below walk it. `instance` is the index of the matching record, which is what the
-/// input assembler indexes the record buffer at: through `first_instance` of an indirect record on the
-/// batched path, and through the instance range of a plain `draw_indexed` on the other. The fetched
-/// attribute is the record; the shader never sees the number itself.
+/// The gather produces *sections* and a draw needs *draws* (a section with two layers is two of
+/// them), so the pass builds this list once and both draw paths below walk it. There is no per-draw
+/// record here, and that is the point: the record a draw reads is named by the slot its own indices
+/// carry. A draw is fully described by which arena to bind and which index range to draw, which are
+/// the two things the batched and the per-section paths both need and the only two things an indirect
+/// record can carry without a per-draw channel at all.
 ///
-/// Which layer a draw belongs to is not here: the list is built layer by layer and the pass keeps the
-/// span of each layer's run instead, so a layer's draws are a contiguous slice and the layer is already
-/// known where they are walked. See `PassDraws::spans`.
+/// Which layer a draw belongs to is not here either: the list is built layer by layer and the pass
+/// keeps the span of each layer's run instead, so a layer's draws are a contiguous slice and the layer
+/// is already known where they are walked. See `PassDraws::spans`.
 #[derive(Debug)]
 struct DrawCall {
     /// Which arena buffer the section lives in. A batched call may only span one arena, because the
     /// index buffer and the bind group are per arena and a `multi_draw` has one of each.
     arena: u32,
     index_range: std::ops::Range<u32>,
-    instance: u32,
 }
 
 /// `DrawIndexedIndirectArgs` in bytes: what an indirect draw's offset into its buffer is measured in.
@@ -118,9 +112,9 @@ const INDIRECT_RECORD_SIZE: u64 = std::mem::size_of::<wgpu::util::DrawIndexedInd
 /// `size_of`'s and `align_of`'s business, and the test beside this one pins every member by name
 /// against the offsets naga reads out of the shipped shaders.
 ///
-/// See the shader's `SectionPosition` for what each one means and `SectionDraw` for the three that are
-/// *not* here - the section's position, which a `multi_draw` cannot be told per draw and which travels
-/// in the instance-step vertex buffer instead.
+/// See the shader's `SectionPosition` for what each one means and `SectionRecord` for what is *not*
+/// here - the section's position, which a record written per bake carries, and the camera's section,
+/// which the two fields at the end do.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 struct SectionPositionImmediate {
@@ -142,6 +136,22 @@ struct SectionPositionImmediate {
     /// Whether the game's `textureFiltering` option is RGSS. A `u32` rather than a `bool`, because the
     /// shader declares a `u32` and Rust's `bool` is one byte where WGSL's is four.
     use_rgss: u32,
+    /// WGSL gives a `vec3<i32>` an alignment of sixteen, so the three coordinates below start after a
+    /// four-byte hole this field names: the shader's struct has the same hole, and a Rust struct the
+    /// shader casts out of has to spell it rather than let `repr(C)` guess.
+    _alignment: u32,
+    /// **The camera's section, which turns a record's absolute position into the camera-relative one
+    /// every draw is placed at.**
+    ///
+    /// The records are written once per bake and cannot know where the camera will be, so the
+    /// subtraction that the per-frame record used to do on the CPU happens in the shader now: the
+    /// three `i32` subtractions cost a rounding error against the fetch they replaced, and the
+    /// immediate is the one per-pass channel a `multi_draw` has. See `SectionRecord` in `mc/mod.rs`.
+    camera_section: [i32; 3],
+    /// The struct's size rounds up to the `vec3<i32>`'s alignment, and `repr(C)` pads silently where
+    /// WGSL rounds the whole struct - naming the pad keeps the two honest about being the same 48
+    /// bytes, which is the size `immediate_size_of` declares and the shader contract test holds.
+    _padding: u32,
 }
 
 /// **One frame's terrain work, so the frame's three passes gather, build and upload once between them.**
@@ -177,11 +187,12 @@ struct TerrainFrame {
     /// draws and their order decides how many batched calls there are. One list would have to pick, and
     /// either choice is a real loss. Built once a frame, which is what the per-pass sort used to be.
     sorted: Vec<VisibleSection>,
-    /// One entry per **pass slot**, parallel to `Scene::section_draws` and `Scene::indirect_buffers`.
+    /// One entry per **pass slot**, parallel to `Scene::indirect_buffers`.
     ///
-    /// Per pass and not per layer because a pass is what owns a buffer and an indirect argument array:
-    /// the records a pass draws have to be in the buffer that pass binds, and two passes drawing the same
-    /// layer would otherwise write over each other.
+    /// Per pass and not per layer because a pass owns an indirect argument array of its own: the
+    /// arguments a pass draws from have to be in the buffer that pass binds, and two passes drawing
+    /// the same layer would otherwise write over each other. (The draw *records* are not per pass any
+    /// more - they are a table written per bake, `Scene::section_records`.)
     passes: Vec<PassDraws>,
     /// **The gather-level counts, which belong to the frame rather than to a pass.** How many sections
     /// the game's list did not name, how many the frustum rejected, and how many had no layer at all.
@@ -205,10 +216,9 @@ impl TerrainFrame {
     }
 }
 
-/// One terrain pass's share of a frame: the records it uploads and the draws that read them.
+/// One terrain pass's share of a frame: the draws it makes, indirect arguments and all.
 #[derive(Debug, Default)]
 struct PassDraws {
-    records: Vec<SectionDraw>,
     calls: Vec<DrawCall>,
     /// Per layer this pass draws: `(layer, first call, one past the last call)`. The calls of one layer
     /// are a contiguous run of `calls`, which is what lets a layer be handed to `multi_draw` in segments.
@@ -737,6 +747,29 @@ pub fn terrain_batches_draws() -> bool {
     terrain_indirect_requested() && TERRAIN_BATCHING_POSSIBLE.load(Ordering::Relaxed)
 }
 
+/// Whether **Minecraft's own repeated draws** may batch, which is a different question from the
+/// terrain's and a harder one.
+///
+/// The game-path batches (`draw_call_batch` on the JNI side) carry their per-draw data through the
+/// record's `first_instance` - the one channel such a call has, and the channel the terrain pass
+/// deliberately stopped using: the game's pipelines are the game's own shaders translated, and
+/// rewriting their per-draw channel is not this round's work. So the game path keeps the channel and
+/// keeps the proof: **a device batches game draws only where the first-instance probe demonstrated
+/// the fetch**, which is a stricter answer than the terrain's and a separate flag for it. The first
+/// device the probe ever failed on - the Adreno 640 this port targets - draws its terrain in batches
+/// through the indices and its game draws one at a time, which is the correct picture on both sides.
+static GAME_BATCHING_POSSIBLE: AtomicBool = AtomicBool::new(false);
+
+/// Records whether this device may batch the game's own draws. See [`GAME_BATCHING_POSSIBLE`].
+pub fn set_game_batching_possible(possible: bool) {
+    GAME_BATCHING_POSSIBLE.store(possible, Ordering::Relaxed);
+}
+
+/// Whether the game's own draws may batch on this device. See [`GAME_BATCHING_POSSIBLE`].
+pub fn game_batching_possible() -> bool {
+    GAME_BATCHING_POSSIBLE.load(Ordering::Relaxed)
+}
+
 /// Whether this device and this backend may batch draws with `multi_draw_indexed_indirect` at all:
 /// **the device answer without the setting**.
 ///
@@ -747,7 +780,7 @@ pub fn terrain_batches_draws() -> bool {
 /// same call. A device whose multi-draw is emulated, or whose backend's is broken, gets one draw at a
 /// time there too - so the two readers cannot disagree about what the hardware can do.
 pub fn terrain_batching_possible() -> bool {
-    TERRAIN_BATCHING_POSSIBLE.load(Ordering::Relaxed)
+    game_batching_possible()
 }
 
 /// Whether the game's block atlas is sampled from its base mip level only.
@@ -789,42 +822,11 @@ pub fn set_pipeline_diagnostics(no_cull: bool, greater_depth: bool) -> bool {
     no_cull_changed || depth_changed
 }
 
-/// Draws a terrain pass had to leave out because its buffers had no room for a record of them,
-/// cumulatively, and the last second one was reported in.
-///
-/// See [`report_truncated_draws`] for why the line is not behind the diagnostics switch.
-static TERRAIN_TRUNCATED: AtomicU64 = AtomicU64::new(0);
-static TERRAIN_TRUNCATED_REPORTED: AtomicU64 = AtomicU64::new(0);
-
-/// Says so, once a second, when a pass had more draws than it has room to describe.
-///
-/// **Not gated on the diagnostics switch**, unlike every other line the terrain pass writes. The ones
-/// that are gated are counters - how much was drawn, how much was culled - and this is geometry that
-/// was *not* drawn. It cannot happen at the sizes here, and if it ever does the picture is missing
-/// sections with nothing else anywhere to say why, which is the one failure this renderer keeps
-/// choosing to make loud.
-fn report_truncated_draws(truncated: u64) {
-    if truncated == 0 {
-        return;
-    }
-
-    let total = TERRAIN_TRUNCATED.fetch_add(truncated, Ordering::Relaxed) + truncated;
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_secs())
-        .unwrap_or(0);
-
-    if TERRAIN_TRUNCATED_REPORTED.swap(now, Ordering::Relaxed) == now {
-        return;
-    }
-
-    log::error!(
-        "wgpu-mc: a terrain pass had more draws than the {} its buffers hold and left the rest out; \
-         {total} draw(s) dropped so far this session. Raise `SECTION_DRAW_CAPACITY`",
-        crate::mc::SECTION_DRAW_CAPACITY
-    );
-}
+// (The truncation machinery that used to sit here is gone with the per-frame record buffer it
+// guarded: a draw's description is its own indices now, so the fallback path has no capacity to
+// exceed at all, and the batched path's indirect-argument cap is `report_the_indirect_cap`'s to
+// report. Nothing can be truncated any more, which is the shape of failure this renderer liked least
+// and now cannot have.)
 
 /// Whether a pass with this many draw calls can still be recorded as one `multi_draw` argument list.
 ///
@@ -839,7 +841,7 @@ fn the_indirect_path_holds(calls: usize) -> bool {
 
 /// Says so, once a second, when a terrain pass had more draws than the indirect path can batch.
 ///
-/// **Not gated on the diagnostics switch**, for the reason [`report_truncated_draws`] is not: this is a step
+/// **Not gated on the diagnostics switch**, for the reason the old truncation report was not: this is a step
 /// change in what the frame costs - the pass stops writing one argument list and starts submitting one draw
 /// per section, on the render thread, for the rest of the frame - and it arrives with no other symptom. A run
 /// that hits it looks like "the frame time jumped when I turned toward the open" and nothing else, which is
@@ -1462,10 +1464,9 @@ impl RenderGraph {
                     BindGroupDef::Resource(resource) => {
                         match (&resource[..], &custom_bind_groups) {
                             ("@bg_ssbo_chunks", _) => wm.bind_group_layouts.get("ssbo").unwrap(),
-                            // (`@bg_section_draws` was here: the draw records were a storage binding at
-                            // group 2, and they are a vertex buffer now - see `Scene::section_draws`
-                            // and the note in `terrain.wgsl`. A shader that names it again fails to
-                            // build here, which is the shape of a mistake worth a failure.)
+                            ("@bg_section_draws", _) => {
+                                wm.bind_group_layouts.get("section_draws").unwrap()
+                            }
                             ("@bg_entity", _) => wm.bind_group_layouts.get("entity").unwrap(),
                             (_, Some(custom)) => {
                                 if let Some(entry) = custom.get(resource) {
@@ -1634,7 +1635,12 @@ impl RenderGraph {
 
             let vertex_buffer = match &pipeline_config.geometry[..] {
                 "@geo_terrain" | "@geo_terrain_translucent" => {
-                    vec![crate::mc::SectionDraw::vertex_layout()]
+                    // **No vertex buffers at all.** The vertex stage fetches everything it draws out
+                    // of storage bindings - the arena's vertices and the section's record - and the
+                    // draw's only inputs are its indices, which carry the record slot themselves. An
+                    // input-assembler attribute was the third of the three channels the per-draw data
+                    // tried, and the one this code leaves behind: see `SectionRecord` in `mc/mod.rs`.
+                    vec![]
                 }
                 "@geo_entities" => vec![EntityVertex::desc(), InstanceVertex::desc()],
                 "@geo_quad" => vec![QuadVertex::desc()],
@@ -2509,7 +2515,6 @@ impl RenderGraph {
                 let dz = rel_pos.z as f32;
 
                 frame.visible.push(VisibleSection {
-                    relative_position: rel_pos,
                     ranges,
                     distance_squared: dx * dx + dy * dy + dz * dz,
                 });
@@ -2613,12 +2618,9 @@ impl RenderGraph {
                 continue;
             }
 
-            draws.records.clear();
             draws.calls.clear();
             draws.spans.clear();
             draws.empty = [0u64; 3];
-
-            let mut truncated = 0u64;
 
             // **Which order this pass draws in**, which is the one thing about the lists that is per pass:
             // a pass that draws a blending layer needs far to near, and a pass that does not needs the
@@ -2638,7 +2640,7 @@ impl RenderGraph {
                 let start = draws.calls.len();
 
                 for section in sections {
-                    let Some((arena, index_range, vertex_range)) =
+                    let Some((arena, index_range, _vertex_range)) =
                         section.ranges[layer_index].clone()
                     else {
                         draws.empty[layer_index] += 1;
@@ -2658,28 +2660,7 @@ impl RenderGraph {
                         continue;
                     }
 
-                    // A draw past the end of the record buffer is a draw with nowhere to describe
-                    // itself, so it is left out and counted rather than wrapped or dropped in silence.
-                    // See `SECTION_DRAW_CAPACITY` and `report_truncated_draws`.
-                    if draws.records.len() >= crate::mc::SECTION_DRAW_CAPACITY {
-                        truncated += 1;
-                        continue;
-                    }
-
-                    let instance = draws.records.len() as u32;
-
-                    draws.records.push(SectionDraw {
-                        x: section.relative_position.x,
-                        y: section.relative_position.y,
-                        z: section.relative_position.z,
-                        word_base: vertex_range.start,
-                    });
-
-                    draws.calls.push(DrawCall {
-                        arena,
-                        index_range,
-                        instance,
-                    });
+                    draws.calls.push(DrawCall { arena, index_range });
                 }
 
                 draws.spans.push((layer_index, start, draws.calls.len()));
@@ -2699,25 +2680,11 @@ impl RenderGraph {
                 }
             }
 
-            // ---- the upload, once per pass and before its first draw ----
-            //
-            // `Queue::write_buffer` is applied at the next `submit`, ahead of everything recorded in that
-            // submission - so every write a frame makes lands before every draw in it, which is why each
-            // pass has a slot of its own. See `SECTION_DRAW_SLOTS`.
-            if !draws.records.is_empty() {
-                wm.gpu.queue.write_buffer(
-                    &scene.section_draws[slot],
-                    0,
-                    bytemuck::cast_slice(&draws.records),
-                );
-
-                TERRAIN_UPLOADS.fetch_add(1, Ordering::Relaxed);
-                TERRAIN_UPLOAD_BYTES.fetch_add(
-                    (draws.records.len() * std::mem::size_of::<SectionDraw>()) as u64,
-                    Ordering::Relaxed,
-                );
-            }
-
+            // **The only per-frame upload the terrain pass has left is the indirect arguments.** The
+            // records went back to a table written per bake (`Scene::section_records`), named by the
+            // slots the indices carry - see `SectionRecord` in `mc/mod.rs` - so a frame that draws ten
+            // thousand sections uploads ten thousand 16-byte arguments and nothing else, where the
+            // generations before it uploaded the same again in records.
             if draws.batched && !draws.calls.is_empty() {
                 let args = draws
                     .calls
@@ -2727,13 +2694,17 @@ impl RenderGraph {
                         instance_count: 1,
                         first_index: call.index_range.start,
                         // **Zero on both paths.** `base_vertex` is added to the *vertex* index, and the
-                        // index buffer holds the section's own indices - so the arena slot is in the
-                        // record instead. See `SectionDraw`.
+                        // index values already are the vertex ids the shader wants - the record slot in
+                        // their high bits, the local id below. See `SectionRecord`.
                         base_vertex: 0,
-                        // **Which record this draw fetches.** The input assembler indexes the record
-                        // buffer at this number, and for an indirect draw this is the only channel
-                        // there is for anything per draw.
-                        first_instance: call.instance,
+                        // **Zero, always, and that is the fix.** This field was the only per-draw channel
+                        // a batched call had, and the first two devices it shipped on refused to carry it
+                        // through - an Adreno 640 that does not fetch the record a non-zero
+                        // `firstInstance` names, and D3D12's `SV_InstanceID`, which ignores it by
+                        // definition. The record now travels in the indices instead, which every driver
+                        // between here and the fallback path already reads correctly. See
+                        // `SectionRecord` in `mc/mod.rs`.
+                        first_instance: 0,
                     })
                     .collect::<Vec<_>>();
 
@@ -2750,8 +2721,6 @@ impl RenderGraph {
                     Ordering::Relaxed,
                 );
             }
-
-            report_truncated_draws(truncated);
         }
 
         TERRAIN_RECORDS_NANOS.fetch_add(
@@ -2964,14 +2933,24 @@ impl RenderGraph {
                     // Everything the pipeline binds that is *not* the arena: the matrices, the two
                     // atlases and their samplers, the lightmap, the fog block. The arena's own group is
                     // left out here and bound per section, because which arena a draw reads is a property
-                    // of the section rather than of the pass. (`@bg_section_draws` used to be in this
-                    // loop too, and it is gone with the storage binding it named - the records are a
-                    // vertex buffer now, bound below.)
+                    // of the section rather than of the pass. The record table is in this loop, bound
+                    // once for the pass - see the arm below.
                     for (index, bind_group) in bound_pipeline.bind_groups.iter() {
                         match bind_group {
                             WmBindGroup::Resource(name) => match &name[..] {
                                 // Bound per draw - see `bound_arena`.
                                 "@bg_ssbo_chunks" => {}
+                                // **The record table, bound once for the pass.** Every draw reads its
+                                // section's entry through the slot its own indices carry, so the binding
+                                // has nothing per draw about it - one group, one set, for the whole pass.
+                                // See `SectionRecord` in `mc/mod.rs`.
+                                "@bg_section_draws" => {
+                                    render_pass.set_bind_group(
+                                        *index,
+                                        &scene.section_records.bind_group,
+                                        &[],
+                                    );
+                                }
                                 _ => unimplemented!(),
                             },
                             WmBindGroup::Custom(bind_group) => {
@@ -2979,15 +2958,6 @@ impl RenderGraph {
                             }
                         }
                     }
-
-                    // **The draw records are a vertex buffer, and this is the one bind for the pass.**
-                    // One instance-step attribute fetches the section's position and its arena slot off
-                    // the very allocation the frame build uploaded the records to, and the fetch is
-                    // per draw because each record's `first_instance` offsets it - the same channel
-                    // the batching always had, consumed by the input assembler now instead of by the
-                    // shader's `instance_index` builtin. Every draw of this pass reads this one buffer,
-                    // so it binds once here and never again.
-                    render_pass.set_vertex_buffer(0, scene.section_draws[draw_slot].slice(..));
 
                     // Arena 0 is bound before the first draw and rebound whenever a section names a
                     // different one: a bind group and an index buffer are per arena, and both have to
@@ -3202,6 +3172,13 @@ impl RenderGraph {
                             crate::render::atlas::texture_filtering()
                                 == crate::render::atlas::TEXTURE_FILTERING_RGSS,
                         ),
+                        _alignment: 0,
+                        camera_section: {
+                            let camera = *scene.camera_section_pos.read();
+
+                            [camera.x, camera.y, camera.z]
+                        },
+                        _padding: 0,
                     };
 
                     // **Whether this pass batches its draws, and the uploads, are with the build.** Both
@@ -3300,13 +3277,10 @@ impl RenderGraph {
                                     bound_arena = Some(call.arena);
                                 }
 
-                                // One instance, and its number is which record the input assembler is
-                                // to fetch - the number the batched path writes into `first_instance`.
-                                render_pass.draw_indexed(
-                                    call.index_range.clone(),
-                                    0,
-                                    call.instance..call.instance + 1,
-                                );
+                                // One instance. There is no per-draw record to fetch any more - the
+                                // indices name it - so the instance range is the trivial one, and the
+                                // batched path writes the same zero into its records.
+                                render_pass.draw_indexed(call.index_range.clone(), 0, 0..1);
 
                                 drawn += 1;
                                 drawn_total += 1;
@@ -3547,12 +3521,13 @@ pub fn set_push_constants(
 fn immediate_size_of(name: &str) -> u32 {
     match name {
         "@pc_mat4_model" => 64,
-        // **Seven four-byte members, and the three that are missing are the point.** `SectionPosition`
-        // is the layer's alpha cutoff, the atlas level-of-detail bias, the two half-texel shifts, one
-        // texel of each atlas, and whether the game's RGSS filtering is on. The section's x, y and z
-        // were the first three members and are in `SectionDraw` now, because a `multi_draw` is one call
-        // and an immediate holds what the whole of it shares. See the struct in `terrain.wgsl`.
-        "@pc_section_position" => 28,
+        // **The layer's alpha cutoff, the atlas level-of-detail bias, the two half-texel shifts, one
+        // texel of each atlas, whether the game's RGSS filtering is on, and the camera's section** -
+        // the last of which is what every draw's absolute record is made camera-relative against. A
+        // `multi_draw` is one call, so an immediate holds what the whole of it shares; the section's
+        // own position is per draw, and it lives in the record table. See the struct in
+        // `terrain.wgsl`.
+        "@pc_section_position" => 48,
         "@pc_total_sections" => 4,
         "@pc_parts_per_entity" => 4,
         "@pc_electrum_color" => 16,
@@ -3810,7 +3785,6 @@ mod terrain_layer_tests {
 
     fn at(distance_squared: f32) -> VisibleSection {
         VisibleSection {
-            relative_position: glam::IVec3::ZERO,
             ranges: [None, None, None],
             distance_squared,
         }
@@ -4352,9 +4326,11 @@ mod binding_visibility_tests {
                 })
                 .unwrap_or_else(|| panic!("{name}.wgsl declares no `SectionPosition` struct"));
 
-            // The same seven names in the same order, taken from the other side. `offset_of!` rather
+            // The same names in the same order, taken from the other side. `offset_of!` rather
             // than a written-down number: a literal here would be a second hand-written table, which is
-            // the thing this replaced.
+            // the thing this replaced. `camera_section` is a `vec3<i32>` on the shader side - twelve
+            // bytes, and WGSL gives that an alignment of sixteen, which is why the Rust struct names a
+            // four-byte `_alignment` between `use_rgss` and it: the hole the shader rounds over too.
             let written = [
                 (
                     "alpha_cutout",
@@ -4384,6 +4360,10 @@ mod binding_visibility_tests {
                     "use_rgss",
                     std::mem::offset_of!(SectionPositionImmediate, use_rgss),
                 ),
+                (
+                    "camera_section",
+                    std::mem::offset_of!(SectionPositionImmediate, camera_section),
+                ),
             ];
 
             assert_eq!(
@@ -4408,11 +4388,16 @@ mod binding_visibility_tests {
                     "{name}.wgsl puts `{field}` at byte {} and this side writes it at byte {offset}",
                     member.offset
                 );
+                // `camera_section` is the one member that is not a scalar: a `vec3<i32>` in WGSL, and
+                // three `i32` in a Rust array. Everything else is four bytes, and a scalar that grew
+                // is a stride the shader and the writer disagree about.
+                let expected_size = if field == "camera_section" { 12 } else { 4 };
+
                 assert_eq!(
                     module.types[member.ty].inner.size(module.to_ctx()),
-                    4,
-                    "{name}.wgsl's `{field}` is not four bytes, so the Rust struct's stride and this \
-                     one's have parted"
+                    expected_size,
+                    "{name}.wgsl's `{field}` is not {expected_size} bytes, so the Rust struct's \
+                     stride and this one's have parted"
                 );
             }
 
@@ -4426,20 +4411,20 @@ mod binding_visibility_tests {
         }
     }
 
-    /// **The size and the shape of one draw's record, on both sides of it.**
+    /// **The size and the shape of one draw's record, and the index channel that names it.**
     ///
-    /// The pass writes `SectionDraw` as a flat array of `#[repr(C)]` structs and the input assembler
-    /// fetches the same bytes through `SectionDraw::vertex_layout`, so the layout's stride is the
-    /// struct's size, the step is the instance one, and the one attribute is a four-`i32` vector at
-    /// location 0 - because that is exactly the input the terrain shaders' `vert` declares. A
-    /// disagreement in any of those is sections drawn at other sections' positions and vertices read
-    /// from other sections' slots, and none of it is an error anywhere: the buffer is a run of bytes
-    /// to the GPU, and only this contract keeps the fetch pointed at the right words.
+    /// The record is a `#[repr(C)]` `SectionRecord` in the table the drain uploads, and the shader
+    /// reaches it through the **index's own high bits**: a baked index is
+    /// `(record_slot << RECORD_ID_SHIFT) | local_vertex`, and `vi >> RECORD_ID_SHIFT` is what the
+    /// vertex stage reads the record at. The halves of that packing are a contract in three parts: the
+    /// Rust side packs it (`index_with_record`), the shader decodes it (`vi >> 17` and `vi & 0x1ffff`),
+    /// and a disagreement in either is sections drawn at other sections' positions - which is a picture,
+    /// not an error, and therefore exactly the shape of mistake a test has to hold.
     ///
-    /// The two shaders are read out of the Neolectrum checkout; without a checkout the check is skipped
+    /// The shaders are read out of the Neolectrum checkout; without a checkout the check is skipped
     /// rather than failed.
     #[test]
-    fn a_draw_record_is_the_size_the_shader_fetches() {
+    fn a_draw_record_is_the_size_the_shader_reads_from_the_table() {
         let Some(terrain) = modtree::shader("terrain") else {
             modtree::skip("the draw-record checks");
             return;
@@ -4450,25 +4435,34 @@ mod binding_visibility_tests {
             return;
         };
 
-        let layout = crate::mc::SectionDraw::vertex_layout();
+        // The record the drain writes, and the size every shader fetch walks past: four words, no
+        // padding, which is what `array<SectionRecord>` in the shader assumes a stride of.
+        assert_eq!(
+            std::mem::size_of::<crate::mc::SectionRecord>(),
+            16,
+            "the record the drain writes is sixteen bytes, and the shader's `array<SectionRecord>` \
+             strides exactly that"
+        );
 
-        assert_eq!(
-            layout.array_stride as usize,
-            std::mem::size_of::<crate::mc::SectionDraw>(),
-            "the record buffer's stride is the record's size, and the record the pass writes is {} \
-             bytes",
-            std::mem::size_of::<crate::mc::SectionDraw>()
-        );
-        assert_eq!(
-            layout.step_mode,
-            wgpu::VertexStepMode::Instance,
-            "the record is fetched per draw, which is what the instance step is for - a vertex step \
-             would fetch one record per vertex and every corner of every quad would read the same one"
-        );
-        assert_eq!(layout.attributes.len(), 1);
-        assert_eq!(layout.attributes[0].format, wgpu::VertexFormat::Sint32x4);
-        assert_eq!(layout.attributes[0].offset, 0);
-        assert_eq!(layout.attributes[0].shader_location, 0);
+        // The packing, round-tripped: a slot in the high bits, a local vertex id in the low ones, and
+        // neither spilling into the other.
+        for slot in [0u32, 1, 1234, crate::mc::SECTION_DRAW_CAPACITY as u32 - 1] {
+            for local in [0u32, 1, 3, 12345, crate::mc::LOCAL_VERTEX_MASK] {
+                let index = crate::mc::index_with_record(slot, local);
+
+                assert_eq!(
+                    index >> crate::mc::RECORD_ID_SHIFT,
+                    slot,
+                    "the slot the shader decodes out of the index's high bits is not the slot packed in"
+                );
+                assert_eq!(
+                    index & crate::mc::LOCAL_VERTEX_MASK,
+                    local,
+                    "the local vertex id the shader decodes out of the index's low bits is not the one \
+                     packed in"
+                );
+            }
+        }
 
         for (name, source) in [
             ("terrain", terrain.as_str()),
@@ -4476,65 +4470,101 @@ mod binding_visibility_tests {
         ] {
             let module = naga::front::wgsl::parse_str(source).expect("the terrain shader parses");
 
-            // The record arrives as the `vert` entry point's `@location(0)` argument - the WGSL front
-            // end keeps an input where it was declared, and this fork's naga carries locations on
-            // entry-point arguments only.
+            // **The vertex stage takes no attribute at all.** The record came through a `@location(0)`
+            // argument in the two generations before this one, and a leftover input is a pipeline that
+            // fetches instance-step data the pass no longer binds - which is a validation error at the
+            // build or a zero-filled record at the draw, depending on which half drifted.
             let entry = module
                 .entry_points
                 .iter()
                 .find(|entry| entry.stage == naga::ShaderStage::Vertex && entry.name == "vert")
                 .expect("the terrain shader has a `vert` entry point");
 
-            let argument_ty = entry
-                .function
-                .arguments
+            assert!(
+                entry.function.arguments.iter().all(|argument| !matches!(
+                    argument.binding,
+                    Some(naga::Binding::Location { .. })
+                )),
+                "{name}.wgsl's vertex stage declares a `@location` input, and the terrain pipelines \
+                 bind no vertex buffers any more - the record's slot travels in the indices"
+            );
+
+            // **The table the stage reads, and the record inside it.** `section_records` is a storage
+            // array at group 2, of a struct that must be the four words the Rust side writes in
+            // declaration order.
+            let table = module
+                .global_variables
                 .iter()
-                .find(|argument| {
-                    matches!(
-                        argument.binding,
-                        Some(naga::Binding::Location { location: 0, .. })
-                    )
+                .find(|(_, variable)| {
+                    variable.name.as_deref() == Some("section_records")
                 })
-                .map(|argument| argument.ty)
+                .map(|(_, variable)| variable)
                 .unwrap_or_else(|| {
                     panic!(
-                        "{name}.wgsl's vertex stage declares no `@location(0)` input, and that is \
-                         where the draw record is fetched from"
+                        "{name}.wgsl declares no `section_records`, and that is where a draw's record \
+                         is read from"
                     )
                 });
 
+            let Some(binding) = table.binding else {
+                panic!("{name}.wgsl's `section_records` carries no @group/@binding")
+            };
+
+            assert_eq!(
+                binding.group, 2,
+                "{name}.wgsl reads the record table at group 2"
+            );
+            assert_eq!(binding.binding, 0);
             assert!(
-                matches!(
-                    module.types[argument_ty].inner,
-                    naga::TypeInner::Vector {
-                        size: naga::VectorSize::Quad,
-                        scalar: naga::Scalar {
-                            kind: naga::ScalarKind::Sint,
-                            width: 4
-                        },
-                    }
-                ),
-                "{name}.wgsl's `@location(0)` input is not a `vec4<i32>`, and the attribute the \
-                 layout fetches is one - the four words of `SectionDraw` in declaration order"
+                matches!(table.space, naga::AddressSpace::Storage { .. }),
+                "{name}.wgsl's `section_records` is not storage"
+            );
+
+            let naga::TypeInner::Array {
+                base: record_ty,
+                stride: record_stride,
+                ..
+            } = module.types[table.ty].inner
+            else {
+                panic!("{name}.wgsl's `section_records` is not an array")
+            };
+
+            assert_eq!(
+                record_stride, 16,
+                "{name}.wgsl's record array strides {record_stride} bytes, and the Rust record is \
+                 sixteen"
+            );
+
+            let naga::TypeInner::Struct { members, .. } = &module.types[record_ty].inner else {
+                panic!("{name}.wgsl's record array does not hold a struct")
+            };
+
+            assert_eq!(
+                members.len(),
+                4,
+                "{name}.wgsl's `SectionRecord` has {} members, and the Rust one has four",
+                members.len()
+            );
+            assert_eq!(
+                module.types[record_ty].inner.size(module.to_ctx()),
+                16,
+                "{name}.wgsl's `SectionRecord` is not sixteen bytes"
             );
         }
     }
 
-    /// **The draw records bind no group any more, and this is the half of that a layout cannot check
-    /// for itself.**
+    /// **The draw records are a storage binding at group 2, read by the vertex stage alone.**
     ///
-    /// They were a storage binding at group 2, visible to the vertex stage alone, and both halves of
-    /// that sentence had a test: the visibility one - a fragment read of a vertex-only binding is a
-    /// pipeline wgpu refuses to build, and a refusal on this path ends the process - and the fetch is
-    /// an attribute now, which leaves the stronger half: **no stage of either terrain shader may name
-    /// group 2 at all.** The graph's layout resolver has no answer for a group it does not know, and a
-    /// binding that reached the layout without a `BindGroupDef` behind it would be a missing bind
-    /// group at the draw rather than an error at the build. Both shaders, because one is a copy of the
-    /// other and a change made to one of them is exactly the shape this is here to catch. They are
-    /// read out of the Neolectrum checkout, so a clone of this repository without the mod skips the
-    /// check rather than failing it.
+    /// Both halves of that sentence are the contract. The visibility half is the one a wgpu refusal
+    /// enforces at pipeline build - a fragment read of a vertex-only binding is a pipeline the device
+    /// will not create, and a refusal on this path ends the process - and the group half is the one
+    /// the layout resolver cannot check: the graph answers a group-2 binding with the
+    /// `section_draws` layout, and a shader that read its records anywhere else would bind nothing
+    /// there and read zeros. Both shaders, because one is a copy of the other and a change made to
+    /// one of them is exactly the shape this is here to catch. They are read out of the Neolectrum
+    /// checkout, so a clone of this repository without the mod skips the check rather than failing it.
     #[test]
-    fn the_draw_records_bind_no_group_any_more() {
+    fn the_draw_records_are_read_by_the_vertex_stage_alone() {
         let Some(terrain) = modtree::shader("terrain") else {
             modtree::skip("the draw-record visibility checks");
             return;
@@ -4551,12 +4581,32 @@ mod binding_visibility_tests {
         ] {
             let used = sampled(source);
 
-            assert!(
-                !used.iter().any(|(_, _, group, _)| *group == 2),
-                "{name}.wgsl names group 2, and the draw records are a vertex buffer now - there is \
-                 no group behind them to bind, so a shader that reaches for one again is a missing \
-                 bind group at the draw rather than a working one: {used:?}"
+            let records = used
+                .iter()
+                .filter(|(_, _, group, _)| *group == 2)
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                records.len(),
+                1,
+                "{name}.wgsl reaches group 2 {} time(s); the record table is one binding",
+                records.len()
             );
+
+            let (stage, kind, _, binding) = records[0];
+
+            assert_eq!(
+                *stage,
+                naga::ShaderStage::Vertex,
+                "{name}.wgsl reads the record table from the fragment stage, and a vertex-only \
+                 binding read there is a pipeline wgpu refuses to build"
+            );
+            assert_eq!(
+                *kind,
+                ResourceKind::Storage,
+                "{name}.wgsl's group 2 binding is {kind:?}, and the record table is storage"
+            );
+            assert_eq!(*binding, 0);
         }
     }
 

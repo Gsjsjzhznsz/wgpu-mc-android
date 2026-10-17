@@ -515,7 +515,7 @@ impl WmRenderer {
         };
         let growth_margin = mc::chunk::largest_section_slots().saturating_mul(GROWTH_MARGIN);
 
-        updates.for_each(|(pos, layers)| {
+        updates.for_each(|(pos, mut layers)| {
             moved += 1;
 
             let mut storage = scene.section_storage.write();
@@ -556,7 +556,7 @@ impl WmRenderer {
                     .pending_arena_growth
                     .store(1, std::sync::atomic::Ordering::Relaxed);
             }
-            let Some((section, freed)) = storage.allocate(pos, &layers) else {
+            let Some((section, freed)) = storage.allocate(pos, &mut layers) else {
                 // Ask for another arena rather than only counting the refusal. A fixed ceiling sized
                 // from a guess about what a section costs is one a real world outgrows, and the failure
                 // mode of that is the worst one this path has: a section that is never replaced keeps
@@ -652,6 +652,68 @@ impl WmRenderer {
         // The last run, which nothing follows to flush it.
         if let Some(run) = pending.take() {
             runs.push(run);
+        }
+
+        // **The record table's writes, after the arena's runs.** The entries are keyed by slot and
+        // iterated ascending, so the runs fall out of a linear walk: adjacent slots are one write,
+        // scattered ones are their own. This is the same batching the arena's uploads got, applied to
+        // a table that a loading burst can fill by thousands of slots - one `write_buffer` per entry
+        // there would be one staging buffer per sixteen bytes, which is the shape of allocation churn
+        // the arena's runs exist to prevent.
+        let record_writes = {
+            let mut storage = scene.section_storage.write();
+
+            storage.drain_record_writes()
+        };
+
+        let mut record_runs: Vec<(u64, usize, usize)> = Vec::new();
+        let mut record_bytes: Vec<u8> = Vec::new();
+
+        {
+            let entry_size = std::mem::size_of::<crate::mc::SectionRecord>() as u64;
+
+            for (slot, record) in &record_writes {
+                let bytes = bytemuck::bytes_of(record);
+                let offset = *slot as u64 * entry_size;
+                let joins = record_runs
+                    .last()
+                    .is_some_and(|(run_offset, run_len, _)| run_offset + *run_len as u64 == offset);
+
+                if !joins {
+                    record_runs.push((offset, 0, 0));
+                }
+
+                let run = record_runs.last_mut().expect("just pushed");
+                run.1 += bytes.len();
+                record_bytes.extend_from_slice(bytes);
+            }
+        }
+
+        let mut record_written = 0usize;
+
+        for (offset, len, at) in &record_runs {
+            if *len == 0 {
+                continue;
+            }
+
+            self.gpu.queue.write_buffer(
+                &scene.section_records.buffer,
+                *offset,
+                &record_bytes[*at..*at + *len],
+            );
+
+            record_written += 1;
+        }
+
+        // A drain that wrote no records says nothing; one that did names how many writes the batching
+        // turned the entries into, which is the number to compare against the entry count when this
+        // path is next suspected of churning.
+        if !record_writes.is_empty() {
+            log::debug!(
+                "wgpu-mc: the section-record table took {} entrie(s) in {} write(s)",
+                record_writes.len(),
+                record_written,
+            );
         }
 
         // **The writes, after the gathering**, so that the bytes being written are the scratch buffer's

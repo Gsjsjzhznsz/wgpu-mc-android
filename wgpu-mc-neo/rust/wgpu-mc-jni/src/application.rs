@@ -327,12 +327,17 @@ mod tests {
         );
 
         for (name, pipeline) in terrain {
+            // **Group 2 is the record table's, and the draw binds it by name.** The graph answers
+            // `@bg_section_draws` with the `section_draws` layout and the terrain pass binds
+            // `Scene::section_records`' group there - a shader that read its records anywhere else
+            // would bind nothing and read zeros, which is a world at nobody's position.
             assert!(
-                pipeline.bind_groups.get(&2).is_none(),
-                "the '{name}' pipeline binds a group 2, and the terrain pipelines have nothing to \
-                 bind there: the draw records are a vertex buffer now (`SectionDraw::vertex_layout` \
-                 in `mc/mod.rs`), and a group in the layout without a bind behind it is a missing \
-                 bind group at the draw"
+                matches!(
+                    pipeline.bind_groups.get(&2),
+                    Some(BindGroupDef::Resource(resource)) if resource == "@bg_section_draws"
+                ),
+                "the '{name}' pipeline has to bind the section-record table at group 2, which is \
+                 where the vertex stage reads a draw's `SectionRecord` from"
             );
             assert!(
                 matches!(

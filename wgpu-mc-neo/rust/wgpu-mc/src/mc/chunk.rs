@@ -244,6 +244,19 @@ pub type DrawnLayer = (u32, Range<u32>, Range<u32>);
 pub struct SectionRanges {
     pub vertex_range: Range<u32>,
     pub index_range: Range<u32>,
+    /// **Which slot of the section-record table this layer's draw reads.**
+    ///
+    /// The record is the section's world position and the arena slot its vertices start at, written
+    /// once at bake into `Scene::section_records`; a draw finds it because its own indices carry this
+    /// slot in the bits above the local vertex id - see [`crate::mc::RECORD_ID_SHIFT`]. One slot per
+    /// *layer* rather than per section, because the record names the vertex range and each layer has
+    /// its own; the three layers of one section agree on the position by being written from the same
+    /// bake.
+    ///
+    /// It is freed with the ranges, through the same deferral: a record slot returned while a frame
+    /// still draws the indices that name it is a slot whose next bake overwrites an entry a draw is
+    /// about to read.
+    pub record_slot: u32,
     /// **Which arena buffer these ranges are offsets into.**
     ///
     /// The arena was one buffer until it turned out that one is not enough: `arena_cap_slots` is the
@@ -302,6 +315,12 @@ pub struct SectionStorage {
     /// given back to the wrong pool is a range that pool will hand out while the buffer that holds it
     /// still does. See [`SectionRanges::buffer`].
     deferred: Vec<Vec<ReleasedRange>>,
+    /// Record slots waiting to be given back, one bucket per frame that may still be in flight.
+    ///
+    /// The same deferral the arena ranges go through, and for the same reason: a slot returned while a
+    /// frame still draws the indices that name it is a slot whose next bake overwrites an entry that
+    /// draw is about to read. See [`SectionRanges::record_slot`].
+    deferred_records: Vec<Vec<u32>>,
     /// The bucket this frame's ranges are parked in.
     deferred_head: usize,
     /// How many buckets there are. See [`SectionStorage::set_deferred_depth`].
@@ -351,6 +370,21 @@ pub struct SectionStorage {
     /// mean opposite things to the JVM: a refused section is one it has to mesh itself, and a parked
     /// one is one this side is still going to draw.
     parked: HashMap<IVec3, ParkedSection>,
+    /// The free list of the section-record table: every slot not currently named by a live layer's
+    /// indices.
+    ///
+    /// A `Vec` used as a LIFO stack, which is what makes a bake that lands right after the one it
+    /// replaced reuse the same slot - and therefore overwrite the same table entry, which is one GPU
+    /// write in the same place rather than a table that drifts across all of its entries. Allocated in
+    /// [`Self::allocate_ranges`], freed through [`Self::defer_free_records`] like the ranges beside
+    /// which it travels.
+    record_free: Vec<u32>,
+    /// Record entries the drain has not uploaded yet, by slot.
+    ///
+    /// A `BTreeMap` rather than a `Vec` of pairs because the drain uploads **runs of adjacent slots**
+    /// in one `write_buffer` - the same shape the arena's own uploads were batched into - and ascending
+    /// slot order is what makes the runs fall out of a linear walk. See `submit_chunk_updates`.
+    record_writes: std::collections::BTreeMap<u32, crate::mc::SectionRecord>,
     /// The next [`ParkedSection::seq`]. A counter rather than a clock: the queue is only ever
     /// compared with itself, and a clock would make the order depend on how long a frame took.
     parked_seq: u64,
@@ -399,6 +433,7 @@ impl SectionStorage {
             arenas: slots_per_arena.into_iter().map(SectionArena::new).collect(),
             current_arena: 0,
             deferred: vec![Vec::new()],
+            deferred_records: vec![Vec::new()],
             deferred_head: 0,
             deferred_depth: 1,
             refused: false,
@@ -406,6 +441,8 @@ impl SectionStorage {
             refused_pending: std::collections::HashSet::new(),
             parked: HashMap::new(),
             parked_seq: 0,
+            record_free: (0..crate::mc::SECTION_DRAW_CAPACITY as u32).rev().collect(),
+            record_writes: std::collections::BTreeMap::new(),
         }
     }
     /// Narrows or widens the pool to a render distance, which is only possible while it is empty.
@@ -434,7 +471,12 @@ impl SectionStorage {
         self.refused = false;
         self.at_capacity = false;
         self.deferred.clear();
+        self.deferred_records.clear();
         self.deferred_head = 0;
+        // The pool is empty by the check above, so no live indices name a slot: every slot of the
+        // table is free, whatever the old pool had handed out.
+        self.record_free = (0..crate::mc::SECTION_DRAW_CAPACITY as u32).rev().collect();
+        self.record_writes.clear();
 
         true
     }
@@ -589,17 +631,24 @@ impl SectionStorage {
         // ranges carry `(buffer, range)` together, which is the whole reason a range can be given back
         // to the right arena after the section that named it is gone.
         let mut freed = Vec::new();
+        let mut record_slots = Vec::new();
 
         for section in self.storage.values() {
             for ranges in section.layers.iter().flatten() {
                 freed.push((ranges.buffer, ranges.vertex_range.clone()));
                 freed.push((ranges.buffer, ranges.index_range.clone()));
+                record_slots.push(ranges.record_slot);
             }
         }
 
         for (buffer, range) in freed {
             self.free_in(buffer, range);
         }
+
+        // Straight back, like the ranges: the world these slots described is gone, and the frame that
+        // drew it has been submitted. See the note above.
+        self.record_free.extend(record_slots);
+        self.record_writes.clear();
 
         self.storage.clear();
 
@@ -646,6 +695,7 @@ impl SectionStorage {
     pub fn trim(&mut self, pos: IVec2) -> Vec<IVec3> {
         let mut to_remove = vec![];
         let mut deferred = Vec::new();
+        let mut deferred_records = Vec::new();
         for (k, section) in &self.storage {
             let dist = (k.xz() - pos).abs();
             let radius = self.width + 2; //temp fix until proper sync
@@ -658,6 +708,7 @@ impl SectionStorage {
                         // ranges. See `allocate`.
                         deferred.push((l.buffer, l.vertex_range.clone()));
                         deferred.push((l.buffer, l.index_range.clone()));
+                        deferred_records.push(l.record_slot);
                     }
                 }
             }
@@ -697,6 +748,7 @@ impl SectionStorage {
             self.storage.remove(pos);
         });
         self.defer_free(deferred);
+        self.defer_free_records(deferred_records);
 
         to_remove
     }
@@ -718,9 +770,10 @@ impl SectionStorage {
     pub fn allocate(
         &mut self,
         pos: IVec3,
-        baked_layers: &[BakedLayer],
+        baked_layers: &mut [BakedLayer],
     ) -> Option<(Section, Vec<ReleasedRange>)> {
         let mut freed = Vec::new();
+        let mut replaced_records = Vec::new();
 
         if let Some(previous_section) = self.storage.get(&pos) {
             for layer in &previous_section.layers {
@@ -729,9 +782,16 @@ impl SectionStorage {
                     // that pool hands out while the buffer holding it still does.
                     freed.push((l.buffer, l.vertex_range.clone()));
                     freed.push((l.buffer, l.index_range.clone()));
+                    // Deferred after the loop rather than in it, because the deferral borrows `self`
+                    // mutably and this loop borrows the storage immutably. The slots die with the same
+                    // frame boundary the ranges do - the caller defers those on its side of the GPU
+                    // write - and a batch of one is the shape a per-layer free arrives in anyway.
+                    replaced_records.push(l.record_slot);
                 }
             }
         }
+
+        self.defer_free_records(replaced_records);
 
         let section = self.allocate_ranges(baked_layers);
 
@@ -746,6 +806,38 @@ impl SectionStorage {
             self.refused_pending.insert(pos);
 
             return None;
+        }
+
+        // **The indices name their record slot, and the record is written here, once.** The bake
+        // wrote local vertex ids; the slot in the bits above them is what turns the same bytes into
+        // a draw this renderer can find its section through - and it has to happen before the drain
+        // uploads the bytes, which is why the layers come in mutable. The record itself is absolute
+        // coordinates plus the vertex range's start, neither of which moves while the section lives:
+        // written here, uploaded by the drain, never touched again.
+        for (layer, ranges) in baked_layers.iter_mut().zip(section.layers.iter()) {
+            let Some(ranges) = ranges else {
+                continue;
+            };
+
+            for word in bytemuck::cast_slice_mut::<u8, u32>(&mut layer.indices) {
+                debug_assert!(
+                    *word <= crate::mc::LOCAL_VERTEX_MASK,
+                    "a bake wrote a local vertex id past the {} bits the index format holds",
+                    crate::mc::RECORD_ID_SHIFT,
+                );
+
+                *word |= ranges.record_slot << crate::mc::RECORD_ID_SHIFT;
+            }
+
+            self.record_writes.insert(
+                ranges.record_slot,
+                crate::mc::SectionRecord {
+                    x: pos.x,
+                    y: pos.y,
+                    z: pos.z,
+                    word_base: ranges.vertex_range.start,
+                },
+            );
         }
 
         // Published, so it is no longer waiting for one. `insert` clears the flag as well - this is
@@ -915,6 +1007,35 @@ impl SectionStorage {
         self.deferred[head].extend(ranges);
     }
 
+    /// Queues record slots to be freed on the same schedule as the ranges beside them.
+    ///
+    /// A record slot's entry is read by the *indices*, so the slot dies when the index range dies -
+    /// which is the same frame boundary the ranges wait out. See [`Self::defer_free`].
+    pub fn defer_free_records(&mut self, slots: Vec<u32>) {
+        if slots.is_empty() {
+            return;
+        }
+
+        if self.deferred_records.is_empty() {
+            self.deferred_records.push(Vec::new());
+        }
+
+        let head = self.deferred_head.min(self.deferred_records.len() - 1);
+
+        self.deferred_records[head].extend(slots);
+    }
+
+    /// Takes the record entries waiting to be uploaded, in ascending slot order.
+    ///
+    /// Called once per drain, after the arena's own runs: ascending slots are what lets the upload
+    /// merge adjacent entries into runs, and taking the map whole is what leaves the next drain
+    /// nothing stale to re-write. See `submit_chunk_updates`.
+    pub fn drain_record_writes(
+        &mut self,
+    ) -> std::collections::BTreeMap<u32, crate::mc::SectionRecord> {
+        std::mem::take(&mut self.record_writes)
+    }
+
     /// Sets how many frames of submissions the renderer may have in flight, which is how long a range
     /// waits before it can be handed out again.
     ///
@@ -935,7 +1056,12 @@ impl SectionStorage {
             }
         }
 
+        for bucket in std::mem::take(&mut self.deferred_records) {
+            self.record_free.extend(bucket);
+        }
+
         self.deferred = (0..depth).map(|_| Vec::new()).collect();
+        self.deferred_records = (0..depth).map(|_| Vec::new()).collect();
         self.deferred_head = 0;
         self.deferred_depth = depth;
     }
@@ -954,6 +1080,10 @@ impl SectionStorage {
         for (buffer, range) in bucket {
             self.free_in(buffer, range);
         }
+
+        let records = std::mem::take(&mut self.deferred_records[self.deferred_head]);
+
+        self.record_free.extend(records);
     }
 
     /// Publishes an allocated section, which is what makes the next frame draw it.
@@ -1028,6 +1158,17 @@ impl SectionStorage {
                 return Section { layers };
             };
 
+            // **One record slot per placed layer.** A table exhausted is an arena refusal by another
+            // name: a draw with indices but no record to name would read whoever held the slot before,
+            // which is a section drawn out of somebody else's geometry - the one outcome this path is
+            // never allowed. Three thousand sections at three layers is nine thousand slots against a
+            // table of thirty-two thousand, so the exhaustion is a pathological world rather than a
+            // full one, and refusing it is cheaper than drawing it wrong.
+            let Some(record_slot) = self.record_free.pop() else {
+                self.refuse(&mut layers);
+                return Section { layers };
+            };
+
             // Sticky for the rest of this section, and a hint for the next one.
             chosen = Some(buffer);
             self.current_arena = buffer as usize;
@@ -1035,6 +1176,7 @@ impl SectionStorage {
             layers.push(Some(SectionRanges {
                 vertex_range: vertices,
                 index_range: indices,
+                record_slot,
                 buffer,
             }));
         }
@@ -1078,6 +1220,9 @@ impl SectionStorage {
             if let Some(ranges) = layer.take() {
                 freed.push((ranges.buffer, ranges.vertex_range));
                 freed.push((ranges.buffer, ranges.index_range));
+                // Straight back rather than deferred: a refused section's bytes were never uploaded,
+                // so no frame has drawn the indices that would have named this slot.
+                self.record_free.push(ranges.record_slot);
             }
         }
 
@@ -6215,9 +6360,9 @@ mod arena_tests {
     /// Puts one section into the arena the way the feed does - allocate, then publish - and answers
     /// whether the pool had room for it.
     fn put(storage: &mut SectionStorage, pos: IVec3, quads: usize) -> bool {
-        let layers = [layer(quads)];
+        let mut layers = [layer(quads)];
 
-        match storage.allocate(pos, &layers) {
+        match storage.allocate(pos, &mut layers) {
             Some((section, freed)) => {
                 storage.insert(pos, section);
                 storage.defer_free(freed);
@@ -6352,14 +6497,14 @@ mod arena_tests {
 
         let second = IVec3::new(1, 0, 0);
         let third = IVec3::new(2, 0, 0);
-        let layers = vec![layer(1), layer(2)];
+        let mut layers = vec![layer(1), layer(2)];
         let bytes: usize = layers
             .iter()
             .map(|held| held.vertices.len() + held.indices.len())
             .sum();
 
         assert!(
-            storage.allocate(second, &layers).is_none(),
+            storage.allocate(second, &mut layers).is_none(),
             "the pool is full"
         );
         assert!(storage.park(second, layers));
@@ -6399,7 +6544,7 @@ mod arena_tests {
 
         let refused = IVec3::new(1, 0, 0);
 
-        assert!(storage.allocate(refused, &[layer(1)]).is_none());
+        assert!(storage.allocate(refused, &mut [layer(1)]).is_none());
         assert_eq!(
             storage.refusals_waiting(),
             1,
@@ -6615,7 +6760,7 @@ mod arena_tests {
     #[test]
     fn the_trim_reports_every_section_it_drops() {
         let mut storage = SectionStorage::new(pool_for(64));
-        let layers = [layer(1)];
+        let mut layers = [layer(1)];
 
         // One section at the origin and one far away, with a width that puts the second outside it.
         let near = IVec3::new(0, 0, 0);
@@ -6625,7 +6770,7 @@ mod arena_tests {
 
         for pos in [near, far] {
             let (section, _) = storage
-                .allocate(pos, &layers)
+                .allocate(pos, &mut layers)
                 .unwrap_or_else(|| panic!("{pos:?} should fit"));
 
             storage.insert(pos, section);
@@ -6671,10 +6816,10 @@ mod arena_tests {
 
         let free_before = storage.free_slots();
 
-        let layers = [layer(1), layer(1)];
+        let mut layers = [layer(1), layer(1)];
 
         assert!(
-            storage.allocate(IVec3::new(0, 0, 0), &layers).is_none(),
+            storage.allocate(IVec3::new(0, 0, 0), &mut layers).is_none(),
             "the cutout layer has nowhere to go"
         );
 
@@ -6700,7 +6845,7 @@ mod arena_tests {
     fn every_refused_section_is_reported_however_many_there_are() {
         // Enough pool for exactly one quad, so everything that needs a second is refused.
         let mut storage = SectionStorage::new(pool_for(1));
-        let layers = [layer(1)];
+        let mut layers = [layer(1)];
 
         // Well past the old cap of 4096.
         let attempts = 6000;
@@ -6709,7 +6854,7 @@ mod arena_tests {
         for index in 0..attempts {
             let pos = IVec3::new(index % 100, 0, index / 100);
 
-            if storage.allocate(pos, &layers).is_none() {
+            if storage.allocate(pos, &mut layers).is_none() {
                 refused_here.push(pos);
             }
         }
@@ -6759,12 +6904,12 @@ mod arena_tests {
     #[test]
     fn a_section_that_fits_on_a_later_frame_stops_being_refused() {
         let mut storage = SectionStorage::new(pool_for(1));
-        let layers = [layer(1)];
+        let mut layers = [layer(1)];
 
         // The one quad of pool, taken by a section that keeps it.
         let occupier = IVec3::new(0, 0, 0);
         let (occupier_section, _) = storage
-            .allocate(occupier, &layers)
+            .allocate(occupier, &mut layers)
             .expect("the pool starts empty, so the first section fits");
 
         let held = occupier_section.layers[0]
@@ -6776,7 +6921,7 @@ mod arena_tests {
         let pos = IVec3::new(3, 0, 7);
 
         assert!(
-            storage.allocate(pos, &layers).is_none(),
+            storage.allocate(pos, &mut layers).is_none(),
             "and the next one has nowhere to go"
         );
         assert_eq!(storage.refused(), vec![pos], "so it is reported");
@@ -6787,7 +6932,7 @@ mod arena_tests {
         storage.storage.remove(&occupier);
 
         assert!(
-            storage.allocate(pos, &layers).is_some(),
+            storage.allocate(pos, &mut layers).is_some(),
             "the same section, with room this time"
         );
 
@@ -6803,16 +6948,16 @@ mod arena_tests {
     #[test]
     fn publishing_a_section_clears_its_refusal_mark() {
         let mut storage = SectionStorage::new(pool_for(1));
-        let layers = [layer(1)];
+        let mut layers = [layer(1)];
 
         let occupier = IVec3::new(0, 0, 0);
         let (occupier_section, _) = storage
-            .allocate(occupier, &layers)
+            .allocate(occupier, &mut layers)
             .expect("the pool starts empty");
         storage.insert(occupier, occupier_section);
 
         let pos = IVec3::new(1, 0, 0);
-        assert!(storage.allocate(pos, &layers).is_none());
+        assert!(storage.allocate(pos, &mut layers).is_none());
         assert_eq!(storage.refused(), vec![pos]);
 
         // Now it is refused and reported, and the section is published directly - which is what

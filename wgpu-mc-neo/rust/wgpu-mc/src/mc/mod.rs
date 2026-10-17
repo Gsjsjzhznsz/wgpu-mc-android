@@ -464,76 +464,87 @@ pub const SECTION_DRAW_SLOTS: usize = 3;
 /// megabyte per slot.
 pub const INDIRECT_DRAW_CAPACITY: usize = 24_000;
 
-/// How many draws one pass may make at all, indirect or not, which is the capacity of every slot's
-/// [`SectionDraw`] buffer.
+/// How many slots the section-record table holds: one [`SectionRecord`] per **(section, layer)**
+/// whose geometry is in the arena.
 ///
-/// **It is larger than [`INDIRECT_DRAW_CAPACITY`] because the fallback needs it to be.** A pass that
-/// exceeds the indirect capacity still draws every section - one call at a time - and each of those
-/// calls still reads its own `SectionDraw` out of this buffer, because the shader reads the section's
-/// position there in both paths. A common capacity would make the fallback impossible and turn the
-/// batched path's limit into a hole in the world.
-///
-/// Past *this* count the extra draws are dropped and said so in the log, once a second. The ceiling is
-/// twice what a 16-chunk view has measured per pass, so the failure is a line in a log rather than a
-/// read past the end of a buffer.
+/// A record slot is what a section's indices name, so this is the number of (section, layer) pairs
+/// that may hold geometry at once. It kept its name - `SECTION_DRAW_CAPACITY` - from the two
+/// generations when it capped a per-frame draw list instead, and the number survived the change of
+/// meaning because it was sized generously enough to be the same bound in practice: a 16-chunk view
+/// holds about six thousand sections, three layers each is under half of this table, and the old
+/// per-frame ceiling this number used to be was sized off the same view. A world that exhausts it is
+/// refused like an arena-full, which is a log line rather than a hole. See [`SectionRecord`].
 pub const SECTION_DRAW_CAPACITY: usize = 1 << 15;
 
-/// One terrain draw's arguments, as the input assembler fetches them for the vertex stage: one
-/// instance-step `Sint32x4` at location 0, sixteen bytes.
+/// One terrain draw's arguments, read by the vertex stage out of a storage table the section's
+/// record slot names: sixteen bytes, written once at bake and never again.
 ///
-/// Four `u32`s, and the layout is the fetch's - [`vertex_layout`][Self::vertex_layout] declares it,
-/// and the terrain shaders read it as `@location(0) draw_record: vec4<i32>`. A struct with a `vec3`
-/// in it was the other shape this could have had and it is the one to avoid: `vec3<i32>` is sixteen
-/// bytes of storage for twelve bytes of data, and three scalars say what the four offsets are without
-/// anyone having to know the alignment rule.
+/// Four `u32`s. A struct with a `vec3` in it was the other shape this could have had and it is the
+/// one to avoid: `vec3<i32>` is sixteen bytes of storage for twelve bytes of data, and three scalars
+/// say what the four offsets are without anyone having to know the alignment rule.
 ///
-/// **The record used to be a storage binding the shader indexed by `@builtin(instance_index)`.**
-/// Every section's draw used to pass its arena slot as the instance number, which is exactly what
-/// `first_instance` is for in an indirect record - except that `instance_index` then had a job of its
-/// own: it was the index of the record being drawn, because a multi-draw cannot be told anything per
-/// draw any other way. The first device the batched path turned on on accepted the feature and then
-/// did not propagate the number into the builtin, and the world drew hollow - so the record moved
-/// from a binding the shader indexed to a buffer the input assembler fetches, which offsets
-/// instance-step reads by `firstInstance` at the fixed-function level. See the note above
-/// `VertexResult` in `terrain.wgsl` for the whole of it.
+/// **How a draw finds its record, and why it is not `first_instance`.** The record used to travel
+/// three ways, one per generation of this path: a storage binding indexed by
+/// `@builtin(instance_index)` (the first device the batching turned on on accepted the feature and
+/// then did not propagate the number into the builtin, and the world drew hollow), then an
+/// instance-step vertex attribute offset by the record's `first_instance` - and the same Adreno 640
+/// driver does not carry `firstInstance` into the fixed-function fetch either, which the
+/// four-record probe proved at device creation and the terrain pass fell back to one draw per
+/// section for the whole of android.26-28. The channel that survives on every driver is the one the
+/// per-section fallback always used: **the index buffer itself**. Each section's indices are baked
+/// with its record slot in the bits above the local vertex id - see [`RECORD_ID_SHIFT`] - so the
+/// shader reads `section_records[vi >> RECORD_ID_SHIFT]` and the indirect record needs no per-draw
+/// channel at all: `first_instance` and `base_vertex` are zero in every record, on every path.
+///
+/// **The position is absolute now, and the camera subtraction is the shader's.** A record written
+/// once at bake cannot carry the camera-relative offset the per-frame record carried, so `x`, `y`
+/// and `z` are the section's own coordinates and the shader subtracts the camera's section, which
+/// travels in the pass' immediate. Three integer subtractions per vertex buy a record upload that
+/// happens per bake instead of per frame.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct SectionDraw {
-    /// The section's position relative to the camera's section, in sections - the number the immediate
-    /// used to carry for one draw at a time. See [`Scene::camera_section_pos`].
+pub struct SectionRecord {
+    /// The section's position **in the world, in sections** - what the bake was asked for, and what
+    /// the shader subtracts the camera's section from. See [`Scene::camera_section_pos`].
     pub x: i32,
     pub y: i32,
     pub z: i32,
-    /// The u32 slot in the arena the section's vertices start at: the old `instance_index`, and what
-    /// `chunk_data` is indexed by in the shader.
+    /// The u32 slot in the arena the section's vertices start at, which is what `chunk_data` is
+    /// indexed by in the shader: the vertex the index names is at `word_base + local_vertex * 4`.
     pub word_base: u32,
 }
 
-impl SectionDraw {
-    /// The one attribute the record is fetched through, and the only place its shape is written:
-    /// `Sint32x4` at location 0, offset zero - the four members in declaration order, no padding. The
-    /// tests in `graph.rs` hold the shaders to the same shape.
-    pub const DRAW_RECORD_ATTRIBUTES: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Sint32x4,
-        offset: 0,
-        shader_location: 0,
-    }];
+/// The bits of an index value above the local vertex id, which carry the section's record slot.
+///
+/// A baked index is `(record_slot << RECORD_ID_SHIFT) | local_vertex`, and the two halves divide a
+/// `u32` as `15 + 17`. **The local half is sized by the geometry, not by taste**: a 16x16x16 section
+/// has 4 096 blocks and a face per block per direction at the worst, which is 24 576 quads and
+/// 98 304 vertices - under the 131 072 (`1 << 17`) the local half holds, with the worst section the
+/// mesher can possibly produce still a third under the cliff. The slot half is sized by
+/// [`SECTION_DRAW_CAPACITY`], which is `1 << 15` - the two halves sum to exactly one `u32`, and a
+/// capacity that grew past that would need this shift to move with it.
+pub const RECORD_ID_SHIFT: u32 = 17;
 
-    /// The vertex layout every terrain pipeline fetches its draw records through: sixteen bytes per
-    /// record, `wgpu::VertexStepMode::Instance`, one attribute. The pass binds the very buffer the
-    /// records were uploaded to as this layout's vertex buffer, so a record is never copied to be
-    /// fetched.
-    ///
-    /// **Instance-stepped, and that is the whole mechanism.** The input assembler indexes this buffer
-    /// at `firstInstance + i` for the `i`th draw of a call - the same number the shader builtin would
-    /// have received, consumed one unit earlier, where every backend honours it.
-    pub fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
-        wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<SectionDraw>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &Self::DRAW_RECORD_ATTRIBUTES,
-        }
-    }
+/// The mask of the local vertex id inside a baked index: the bits below [`RECORD_ID_SHIFT`].
+pub const LOCAL_VERTEX_MASK: u32 = (1 << RECORD_ID_SHIFT) - 1;
+
+/// Puts a record slot into an index value whose low bits are the local vertex id.
+#[inline]
+pub fn index_with_record(slot: u32, local_vertex: u32) -> u32 {
+    debug_assert!(
+        local_vertex <= LOCAL_VERTEX_MASK,
+        "a 16x16x16 section cannot bake {} vertices - the index format holds {}",
+        local_vertex,
+        LOCAL_VERTEX_MASK + 1
+    );
+    debug_assert!(
+        slot < SECTION_DRAW_CAPACITY as u32,
+        "record slot {} past the table's {} slots",
+        slot,
+        SECTION_DRAW_CAPACITY
+    );
+
+    (slot << RECORD_ID_SHIFT) | local_vertex
 }
 
 pub struct Scene {
@@ -604,18 +615,25 @@ pub struct Scene {
     /// it is `WmRenderer::grow_arena_if_asked`.
     pub arena_memory_budget: u64,
 
-    /// **The draw arguments, one pair of buffers per terrain pass.** See [`SECTION_DRAW_SLOTS`] for why
-    /// there is a pair per pass rather than one for the frame, and [`SectionDraw`] for what is in them.
+    /// **The terrain indirect arguments, one buffer per terrain pass.** See [`SECTION_DRAW_SLOTS`]
+    /// for why there is one per pass rather than one for the frame.
     ///
-    /// `section_draws[i]` is the **vertex buffer** the input assembler fetches a draw's section position
-    /// and arena slot from - one instance-step attribute over the whole allocation, which is why this
-    /// is a plain buffer now and not the `BindableBuffer` it used to be: that type exists to bind a
-    /// buffer into a group, and the records bind into no group any more. `indirect_buffers[i]` is the
-    /// `DrawIndexedIndirectArgs` array the batched path draws from. Index `i` is a *slot*, not a
-    /// pipeline: `BoundPipeline::draw_slot` says which pass owns which, and two passes may not share
-    /// one - which is the whole of what the slot assignment has to get right.
-    pub section_draws: Vec<Arc<wgpu::Buffer>>,
+    /// `indirect_buffers[i]` is the `DrawIndexedIndirectArgs` array the batched path draws from.
+    /// Index `i` is a *slot*, not a pipeline: `BoundPipeline::draw_slot` says which pass owns which,
+    /// and two passes may not share one - which is the whole of what the slot assignment has to get
+    /// right. The draw *records* are not here: they live in [`Scene::section_records`], one table
+    /// every pass reads through the indices' record slots.
     pub indirect_buffers: Vec<Arc<wgpu::Buffer>>,
+
+    /// **The table the terrain shaders read a section's record out of**, one [`SectionRecord`] per
+    /// record slot, written per bake and never per frame.
+    ///
+    /// It is bound at group 2 of the terrain pipelines (`@bg_section_draws`, the name it has carried
+    /// through two generations of this path), and the record a draw reads is named by the slot the
+    /// draw's own indices carry in their high bits - see [`RECORD_ID_SHIFT`]. One table rather than
+    /// one per pass, because a record describes a section rather than a draw: three passes read the
+    /// same entry, and a per-pass copy would be three writes per bake agreeing to stay equal.
+    pub section_records: BindableBuffer,
 
     pub entity_instances: Mutex<HashMap<String, BundledEntityInstances>>,
     pub sky_state: ArcSwap<SkyState>,
@@ -751,29 +769,13 @@ impl Scene {
         // happens when a world is joined, before anything has been baked. A buffer that is too large
         // is video memory; one that is too small is sections that cannot be baked.
         //
-        // The two buffers a terrain pass draws out of, allocated for every slot up front: a slot is
-        // claimed when the graph builds its pipelines and a buffer created then would have to be
-        // created on a rebuild, which is a resource the frame in flight may still be reading. See
+        // The indirect arguments, one buffer per terrain pass, allocated for every slot up front: a
+        // slot is claimed when the graph builds its pipelines and a buffer created then would have to
+        // be created on a rebuild, which is a resource the frame in flight may still be reading. See
         // `SECTION_DRAW_SLOTS`.
         //
         // `min_binding_size` is left open in the layout, so the whole of each is bound; the arena's
-        // storage buffer is declared the same way. The records are fetched as a **vertex buffer** now -
-        // one instance-step attribute over this same allocation - and a plain buffer is what that
-        // needs: `BindableBuffer` exists to bind a buffer into a group, and the records bind into no
-        // group any more. See the note at the `@bg_section_draws` removal in `graph.rs`.
-        let section_draws = (0..SECTION_DRAW_SLOTS)
-            .map(|_| {
-                let size = (SECTION_DRAW_CAPACITY * std::mem::size_of::<SectionDraw>()) as u64;
-
-                Arc::new(wm.gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("section_draws"),
-                    size,
-                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::VERTEX,
-                    mapped_at_creation: false,
-                }))
-            })
-            .collect::<Vec<_>>();
-
+        // storage buffer is declared the same way.
         let indirect_buffers = (0..SECTION_DRAW_SLOTS)
             .map(|_| {
                 Arc::new(wm.gpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -828,7 +830,15 @@ impl Scene {
             ),
             arena_memory_budget: arena_memory_budget(wm.gpu.device.limits().max_buffer_size),
             indirect_buffers,
-            section_draws,
+            // One table for every pass and every arena; a slot's entry is written when the bake that
+            // claimed the slot is uploaded, and never touched again until the slot is reused. See the
+            // field's note.
+            section_records: BindableBuffer::new_deferred(
+                wm,
+                (SECTION_DRAW_CAPACITY * std::mem::size_of::<SectionRecord>()) as u64,
+                wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+                "section_draws",
+            ),
 
             entity_instances: Default::default(),
             sky_state: Default::default(),

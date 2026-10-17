@@ -182,12 +182,25 @@ struct FogEnvironment {
 
 @group(1) @binding(0) var<storage> chunk_data: array<u32>;
 
-// **What one draw of this pass is: a vertex attribute, fetched instance-stepped.** The same four words
-// and the same reasoning as `terrain.wgsl`, which is where the full note is: the record travels through
-// one `Sint32x4` at location 0, sixteen bytes, instance-stepped, and the record number reaches the
-// fetch through the record's `first_instance` - the fixed-function instance indexing, not the shader's
-// `instance_index` builtin, which is the path a driver failed to propagate on the first device the
-// batched draw turned on on.
+// **The section-record table**, the same binding `terrain.wgsl` declares and the full note beside it:
+// one `SectionRecord` per record slot, written once per bake, found through the slot the draw's own
+// indices carry in their high bits. This shader has no `discard` and no test in it - the solid layer's
+// whole reason to exist - and it reads the same records through the same group because the two shaders
+// draw one world.
+struct SectionRecord {
+    x: i32,
+    y: i32,
+    z: i32,
+    word_base: u32,
+}
+
+@group(2) @binding(0) var<storage> section_records: array<SectionRecord>;
+
+// **What one draw of this pass reads, and where from: the indices, not the input assembler.** The
+// same story as `terrain.wgsl`, which is where the full note is - the record travelled as an
+// instance-step attribute fetched at the record's `first_instance`, and the Adreno 640 that broke the
+// builtin broke the fetch too, so the record's slot now rides in the indices and this stage reads
+// `section_records[vi >> 17]`. See `SectionRecord` in `mc/mod.rs`.
 
 struct VertexResult {
     @builtin(position) pos: vec4<f32>,
@@ -280,6 +293,10 @@ struct SectionPosition {
     // draw one world, and an immediate of a different size would be a validation error rather than a bug in
     // either of them.
     use_rgss: u32,
+    // The same alignment hole and the same camera section as `terrain.wgsl`'s copy of this struct:
+    // two shaders read one immediate, and an immediate of a different size would be a validation error
+    // rather than a bug in either of them. See the note there.
+    camera_section: vec3<i32>,
 };
 
 var<immediate> section_pos: SectionPosition;
@@ -287,18 +304,19 @@ var<immediate> section_pos: SectionPosition;
 @vertex
 fn vert(
     @builtin(vertex_index) vi: u32,
-    // **This draw's record, fetched by the input assembler.** See the note above `VertexResult` and
-    // the one in `terrain.wgsl` for why the record is an attribute rather than a binding the stage
-    // indexes by `instance_index`.
-    @location(0) draw_record: vec4<i32>
 ) -> VertexResult {
 //    var vert1_i = (vi >> 2) << 4;
 //    var vert1_i = (vi << 2) & 0xfffffffc;
 //    var vert1_i = ((vi >> 2u) << 2u)+base_vertex;
 
-    let base_vertex = u32(draw_record.w);
-    var offset = vi & 3;
-    var vert1_i = vi & ~3u;
+    // The record slot out of the index's high bits, the local vertex id out of the rest - the decode
+    // `terrain.wgsl`'s vertex stage carries the full note for.
+    let record = section_records[vi >> 17u];
+    let local_vertex = vi & 0x1ffffu;
+
+    let base_vertex = record.word_base;
+    var offset = local_vertex & 3u;
+    var vert1_i = local_vertex & ~3u;
 
     var id = ((vert1_i + offset) << 2u) + base_vertex;
 
@@ -398,8 +416,13 @@ fn vert(
     // No flag test and no `16.0` here any more: see the decode above for where those three bits went.
     var pos = vec3<f32>(x, y, z);
 
-    var section_origin =
-        vec3<f32>(f32(draw_record.x), f32(draw_record.y), f32(draw_record.z)) * 16.0;
+    // The record's absolute position, made camera-relative here - see the note in `terrain.wgsl`'s
+    // vertex stage, which is where the reasoning lives and this is the same three subtractions.
+    var section_origin = vec3<f32>(
+        f32(record.x - section_pos.camera_section.x),
+        f32(record.y - section_pos.camera_section.y),
+        f32(record.z - section_pos.camera_section.z),
+    ) * 16.0;
     var world_pos = pos + section_origin;
 
     vr.pos = mat4_persp * mat4_view * mat4_model * vec4(world_pos, 1.0);

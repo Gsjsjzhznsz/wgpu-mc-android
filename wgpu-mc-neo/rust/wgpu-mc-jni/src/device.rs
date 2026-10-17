@@ -729,12 +729,18 @@ static MULTI_DRAW: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::ne
 /// slower than the loop it would replace, because each of those draws still reads its record out of
 /// `section_draws`.
 ///
-/// **The answer is about the device and not about the backend**, which is why the one caller in
-/// `try_create_renderer` combines it with a backend exclusion of its own: DX12 reports all three bits and
-/// its `multi_draw_indexed_indirect` is nonetheless broken. A function named "can" that answered no there
-/// would be lying about what the adapter said.
-pub fn can_batch_terrain_draws() -> bool {
-    MULTI_DRAW.load(std::sync::atomic::Ordering::Relaxed) & (1 | 2 | 8) == (1 | 2 | 8)
+/// Whether this device can record a `multi_draw_indexed_indirect` that is **one call**: indirect
+/// execution, and the count feature that stops wgpu expanding the batch into a loop.
+///
+/// **The first-instance bit is deliberately not asked for any more.** It used to be, because the
+/// terrain pass carried its per-draw record through `first_instance` - and the first device that ran
+/// the batched path, an Adreno 640, reported the bit and then did not fetch the record it named,
+/// which is why the probe below exists. The terrain pass has stopped using that channel entirely (the
+/// record's slot now rides in the indices - see `SectionRecord` in `wgpu-mc`), so the bit is no
+/// longer part of *this* answer; it is part of the **game** path's answer, which the probe resolves
+/// separately in `try_create_renderer`.
+pub fn can_multi_draw_indirect() -> bool {
+    MULTI_DRAW.load(std::sync::atomic::Ordering::Relaxed) & (1 | 2) == (1 | 2)
 }
 
 /// What the first-instance probe concluded: 0 not run, 1 passed, 2 failed.
@@ -840,7 +846,21 @@ pub fn probe_first_instance_fetch(device: &wgpu::Device, queue: &wgpu::Queue) ->
             module: &module,
             entry_point: Some("vert"),
             compilation_options: Default::default(),
-            buffers: &[Some(wgpu_mc::mc::SectionDraw::vertex_layout())],
+            // **The instance-step record fetch, declared here rather than borrowed.** The terrain
+            // pipelines stopped declaring any vertex buffer - their records live in a table the
+            // indices name - but the probe is asking a question that still has a reader: the game's
+            // batched draws, whose per-draw channel is exactly this fetch. The layout is the shape the
+            // game path's records arrive in, spelled locally so the probe depends on nothing it is
+            // not testing: one `Sint32x4` at location 0, sixteen bytes, instance-stepped.
+            buffers: &[Some(wgpu::VertexBufferLayout {
+                array_stride: 16,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &[wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Sint32x4,
+                    offset: 0,
+                    shader_location: 0,
+                }],
+            })],
         },
         fragment: Some(wgpu::FragmentState {
             module: &module,
@@ -859,19 +879,14 @@ pub fn probe_first_instance_fetch(device: &wgpu::Device, queue: &wgpu::Queue) ->
         cache: None,
     });
 
-    // The records: one sentinel each, in the very struct the pass uploads.
+    // The records: one sentinel each, in the shape the game path's per-draw ring uses.
     let instances = (0..RECORDS)
-        .map(|r| wgpu_mc::mc::SectionDraw {
-            x: PROBE_SENTINELS[r as usize] as i32,
-            y: 0,
-            z: 0,
-            word_base: 0,
-        })
+        .map(|r| [PROBE_SENTINELS[r as usize] as i32, 0, 0, 0i32])
         .collect::<Vec<_>>();
 
     let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("wgpu-mc: the first-instance probe records"),
-        size: RECORDS * std::mem::size_of::<wgpu_mc::mc::SectionDraw>() as u64,
+        size: RECORDS * 16,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::VERTEX,
         mapped_at_creation: false,
     });
@@ -1054,59 +1069,53 @@ fn report_device_capabilities() {
     );
 
     // What the terrain pass does with the answer above, which is the number a run is actually read for:
-    // `terrain_indirect` is a switch, and this is the setting *and* the hardware *and* the backend
+    // `terrain_indirect` is a switch, and this is the setting *and* the hardware *and the backend*
     // resolved into the one flag the draw path reads. See `debug::apply`.
     //
     // **The ways it can be off are named separately**, because they call for different things: a
-    // switch that is off is a setting, a device that cannot is hardware, DirectX 12 is a defect in
-    // the backend's multi-draw indirect (see `try_create_renderer`), and a failed probe is a driver
-    // that reported a feature and then did not carry it through (see `probe_first_instance_fetch`).
-    // A single "the switch is off, or it is DX12" was the first version of this line and it is the
-    // reason the wiring bug it hid took a run to find.
+    // switch that is off is a setting, a device that cannot is hardware, and DirectX 12 stays
+    // excluded until a machine of that backend has been measured (see `try_create_renderer`). The
+    // probe is **not** one of the terrain's reasons any more: its record channel is the indices,
+    // which no probe can take away - the probe's answer is the game path's batching, reported below
+    // and read by nothing that draws terrain.
     info!(
         "wgpu-mc: the terrain pass is drawing {}",
         if wgpu_mc::render::graph::terrain_batches_draws() {
-            "in batches - one multi_draw_indexed_indirect per run of sections that share an arena"
+            "in batches - one multi_draw_indexed_indirect per run of sections that share an arena, \
+             each record named by the slots its own indices carry"
         } else if multi_draw & 1 == 0 {
             "one section at a time, because this device has no indirect execution at all"
-        } else if multi_draw & 8 == 0 {
-            "one section at a time, because this device cannot put a non-zero `first_instance` in an \
-             indirect draw, so a batched call could not say which record each draw is"
         } else if multi_draw & 2 == 0 {
             "one section at a time, because this device has no real multi-draw: wgpu-hal expands \
              multi_draw_* into one indirect draw per record here, which is the fallback loop with a \
              buffer read per draw on top"
         } else if !wgpu_mc::render::graph::terrain_indirect_requested() {
             "one section at a time: the `terrain_indirect` switch is off, and this device could batch"
-        } else if FIRST_INSTANCE_PROBE.load(Ordering::Relaxed) == 2 {
-            "one section at a time, because the first-instance probe failed: this driver accepts a \
-             non-zero `first_instance` in an indirect record and does not fetch the matching record \
-             with it, so every section would be drawn out of somebody else's geometry - the defect \
-             the probe exists to catch. See `probe_first_instance_fetch`"
         } else {
-            "one section at a time: this is the DirectX 12 backend, where wgpu's implementation of \
-             multi-draw indirect is broken, so the terrain pass is not allowed to use it - every \
-             capability above says yes and this is a defect, not a missing feature. See \
-             `try_create_renderer`"
+            "one section at a time: this is the DirectX 12 backend, which stays excluded until a \
+             machine of that backend has measured the batched path"
         }
     );
 
-    // What the probe itself said, which is a sentence about honesty rather than about capability: a
-    // driver can report every bit above and still not fetch what a batched draw asks it to. The
-    // three answers are named, because "not run" is itself information - it means the batching was
+    // What the probe itself said, which is now a sentence about the **game path's** channel: the
+    // game's batched draws carry their per-draw data through a record's `first_instance`, and the
+    // probe is the driver demonstrating the fetch. The terrain needs no such proof - it stopped using
+    // the channel - so a failed probe costs the game path's batching and nothing else. The three
+    // answers are named, because "not run" is itself information - it means the batching was
     // never going to happen anyway.
     match FIRST_INSTANCE_PROBE.load(Ordering::Relaxed) {
         1 => info!(
             "wgpu-mc: the first-instance probe drew four records and read its four sentinels back in \
-             order: the batched path's per-draw channel works on this driver"
+             order: the game path's batched draws work on this driver"
         ),
         2 => info!(
-            "wgpu-mc: the first-instance probe did not read its sentinels back in order, and the \
-             terrain pass will not batch on this driver"
+            "wgpu-mc: the first-instance probe did not read its sentinels back in order, so the \
+             game's own draws will not batch on this driver - the terrain pass is unaffected, its \
+             records travel in the indices"
         ),
         _ => info!(
-            "wgpu-mc: the first-instance probe did not run, because the batching was already ruled \
-             out by the adapter or the backend"
+            "wgpu-mc: the first-instance probe did not run, because the game path's batching was \
+             already ruled out by the adapter or the backend"
         ),
     }
 
@@ -1273,11 +1282,12 @@ fn try_create_renderer(
         required_features |= wgpu::Features::IMMEDIATES;
     }
 
-    // **A non-zero `first_instance` in an indirect draw**, which is how a terrain pass tells the vertex
-    // stage *which record* a draw is: without it every record would have to read record zero, and the
-    // batching would draw one section's position for all of them. wgpu validates that field against
-    // this feature - "Has to be 0, unless `Features::INDIRECT_FIRST_INSTANCE` is enabled" - so asking
-    // for it is what makes the batched path available at all.
+    // **A non-zero `first_instance` in an indirect draw**, which is how the *game's* batched draws
+    // (`draw_call_batch` on the JNI side) tell a shader which record of the submission's per-draw ring
+    // it reads. The terrain pass used to need this too and has stopped: its records live in a table
+    // the indices name, so its batching needs nothing per draw at all. The feature is still asked for
+    // whenever the adapter has it, because the game path's channel is exactly this, and wgpu validates
+    // a non-zero `first_instance` against the feature being on.
     //
     // Asked for whenever the adapter has it, like the three above: requesting a feature changes nothing
     // about how anything renders. The switch that decides whether the batched path *is* used is read
@@ -1329,32 +1339,28 @@ fn try_create_renderer(
         std::sync::atomic::Ordering::Relaxed,
     );
 
-    // **DirectX 12 gets no batching, and the reason is not multi-draw: it is the per-draw channel.**
+    // **DirectX 12 gets no batching, and the reason has narrowed but the exclusion has not.**
     //
-    // MDI itself works there, and the first version of this comment was wrong about that: `wgpu-hal`'s
-    // DX12 backend hands `draw_count` straight to `ExecuteIndirect` with `MaxCommandCount`
-    // (`dx12/command.rs`, `unsafe fn draw_indexed_indirect`), over a command signature whose `ByteStride`
-    // is `size_of::<wgpu::DrawIndexedIndirectArgs>()` - twenty bytes, field for field what `indirect.rs`
-    // writes. A run with the exclusion removed batched 257,880 of 262,863 draws a second with no error.
+    // The first version of this exclusion was about the per-draw channel: MDI itself works there
+    // (`wgpu-hal`'s DX12 backend hands `draw_count` straight to `ExecuteIndirect`, and a run with the
+    // exclusion removed batched 257,880 of 262,863 draws a second with no error), but a batched run
+    // had exactly one channel for per-draw data - a record's `first_instance` - and the terrain shader
+    // read the section's block at `instance_index`, which on D3D12 is `SV_InstanceID` and ignores
+    // `StartInstanceLocation` by definition. Every record carries one instance, so the shader saw 0
+    // for all of them: every section drawn with the first record's `ChunkPosition`, a screen full of
+    // the world piled into one section.
     //
-    // What does not work is what the batching *carries*. A batched run has exactly one channel for
-    // per-draw data - a record's `first_instance` - and the terrain shader reads the section's block at
-    // `instance_index`. On Vulkan that is `InstanceIndex`, which is `firstInstance + instance`; **on
-    // DX12 naga emits `SV_InstanceID` for it** (`naga-30.0.1/src/back/hlsl/conv.rs`), and D3D12's
-    // `SV_InstanceID` does **not** include `StartInstanceLocation`. Every record carries one instance,
-    // so the shader sees 0 for all of them: every section is drawn with the first record's
-    // `ChunkPosition`, which is a screen full of every block in the world piled into one section. That
-    // is the picture a DX12 run showed, and it is why this exclusion is back.
+    // The terrain pass has since stopped using that channel at all - its record rides in the indices
+    // (see `SectionRecord` in `wgpu-mc`) - so **the reason the terrain is excluded here is now only
+    // that a DX12 machine has not been measured since**. The exclusion stays until one is: the
+    // backend is not what any of this port's phones run, a fallback that draws correctly is what the
+    // exclusion costs, and a defect found by shipping is more expensive than a feature not yet taken.
     //
-    // A DX12 batching path needs a per-draw channel D3D12 actually honours - `first_instance` *does*
-    // offset instance-step vertex buffer reads there, so an instance-step attribute carrying the record
-    // number is the shape that would work - and that is a change to the vertex layout and the shader,
-    // not a line here.
-    //
-    // The terrain is drawn either way, one `draw_indexed` per section - the same records, the same
-    // order, the same shader, and the uniform block this side has always bound per draw.
+    // The game path keeps its own reason, unchanged: its per-draw channel is `first_instance`, which
+    // D3D12 honours for instance-step fetches - but that answer is the probe's to give, below, and
+    // the backend exclusion here is the conservative one for both readers.
     wgpu_mc::render::graph::set_terrain_batching_possible(
-        backend != GraphicsBackend::DirectX12 && can_batch_terrain_draws(),
+        backend != GraphicsBackend::DirectX12 && can_multi_draw_indirect(),
     );
 
     let (device, queue) = match block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -1505,18 +1511,20 @@ fn try_create_renderer(
         }
     });
 
-    // **The probe that asks whether the batched path's one per-draw channel actually works here.**
-    // Everything above is what the adapter claims; this is the device doing the thing. A `false`
-    // takes the batching away for the life of the device - the same answer the DX12 exclusion gives,
-    // and the same fallback: one draw per section, correct and slow. Runs before any pipeline of the
-    // game is compiled, so a driver that chokes on the probe does not get to choke on anything else
-    // first. See `probe_first_instance_fetch`.
-    if backend != GraphicsBackend::DirectX12
-        && can_batch_terrain_draws()
-        && !probe_first_instance_fetch(&device, &queue)
-    {
-        wgpu_mc::render::graph::set_terrain_batching_possible(false);
-    }
+    // **The probe that asks whether the batched path's one per-draw channel actually works here** -
+    // and the only reader of its answer is now the *game's* batched draws, not the terrain's. The
+    // terrain pass stopped using the channel (its records live in a table the indices name), so a
+    // driver that fails the probe keeps its batched terrain and loses only the game path's batching -
+    // one draw at a time there, correct and slow, exactly what the Adreno 640 this port targets has
+    // been doing since the probe went in. Everything above is what the adapter claims; this is the
+    // device doing the thing. Runs before any pipeline of the game is compiled, so a driver that
+    // chokes on the probe does not get to choke on anything else first. See
+    // `probe_first_instance_fetch`.
+    let game_batching = backend != GraphicsBackend::DirectX12
+        && can_multi_draw_indirect()
+        && probe_first_instance_fetch(&device, &queue);
+
+    wgpu_mc::render::graph::set_game_batching_possible(game_batching);
 
     // **The limits the device answered with, once per launch.** Alignment is the one limit a port
     // has to reason about on the JVM side - the per-draw ring's stride comes from

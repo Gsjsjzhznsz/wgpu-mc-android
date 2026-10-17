@@ -62,6 +62,10 @@ pipelines:
         16: "@texture_mc_block_atlas"
         17: "@texture_mc_block_atlas"
       1: "@bg_ssbo_chunks"
+      # **The section-record table**: one `SectionRecord` per record slot, written per bake. The record
+      # a draw reads is named by the slot its own indices carry in their high bits - see `SectionRecord`
+      # in `mc/mod.rs`.
+      2: "@bg_section_draws"
     immediates:
       0: "@pc_section_position"
 
@@ -102,6 +106,10 @@ pipelines:
         16: "@texture_mc_block_atlas"
         17: "@texture_mc_block_atlas"
       1: "@bg_ssbo_chunks"
+      # **The section-record table**: one `SectionRecord` per record slot, written per bake. The record
+      # a draw reads is named by the slot its own indices carry in their high bits - see `SectionRecord`
+      # in `mc/mod.rs`, and `RECORD_ID_SHIFT` for the packing.
+      2: "@bg_section_draws"
     immediates:
       0: "@pc_section_position"
 
@@ -155,6 +163,10 @@ pipelines:
         16: "@texture_mc_block_atlas"
         17: "@texture_mc_block_atlas"
       1: "@bg_ssbo_chunks"
+      # **The section-record table**: one `SectionRecord` per record slot, written per bake. The record
+      # a draw reads is named by the slot its own indices carry in their high bits - see `SectionRecord`
+      # in `mc/mod.rs`, and `RECORD_ID_SHIFT` for the packing.
+      2: "@bg_section_draws"
     immediates:
       0: "@pc_section_position"
 
