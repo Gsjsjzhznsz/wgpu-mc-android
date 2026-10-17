@@ -750,7 +750,41 @@ pub struct Scene {
     /// is crossed, so the windows this opens are short - and a frame drawn from the frustum is
     /// over-drawn by exactly the culling's savings, not a hole in it.
     pub visible_sections_camera: RwLock<IVec3>,
+
+    /// **The sections whose publish the JVM has not been told of yet**, as positions, drained by
+    /// `WgpuNative#publishedSections` once a client tick.
+    ///
+    /// This is the other half of the same fact [`Scene::sections_since_the_list`] carries, told to the
+    /// other renderer: the gather needs to know a section is drawable *this frame*, and the JVM needs to
+    /// know a section's bake has *landed* so it can retire Minecraft's own mesh for it. Both read the
+    /// same publish - [`Scene::note_section_taken`] - and neither can read the other's copy: the JVM's
+    /// is a drain (a section is announced once), this one is a snapshot reset by the next list.
+    ///
+    /// **Why the JVM has to be told at all.** The mesh suppression is gated on the publish now, not on
+    /// the offer: a section whose bake is still in the queue keeps Minecraft's mesh, which is what
+    /// draws it while it waits. The day the bake lands, the game's mesh has to go - or the section is
+    /// drawn twice, at the cost of both renderers and with the two meshes disagreeing about shading in
+    /// the meantime. The drain is the announcement; the JVM answers it with one redirty rebuild that
+    /// compiles the section with the geometry skipped, because the publish now says it is Rust's.
+    ///
+    /// A `Vec` behind a `Mutex`, and capped: the drain runs once a tick and a frame's publishes are a
+    /// burst the queue drains in one go, so the steady state is an empty vector - the cap exists so a
+    /// JVM that stops ticking (a paused world) cannot collect a session of publishes. Past the cap a
+    /// publish is counted and dropped, and the failure mode is the old one - the game's mesh stays for
+    /// that section, which is a picture drawn twice rather than a picture missing.
+    pub published_pending: std::sync::Mutex<Vec<IVec3>>,
 }
+
+/// The most publishes [`Scene::published_pending`] will hold between drains.
+///
+/// A frame's publishes are one burst and a tick drains it, so this is sized an order past the
+/// largest burst a session is known to have produced: the 32-chunk session that named the hole this
+/// channel closes published at about thirty sections a second, and a tick is a fiftieth of that - the
+/// cap is a pause-proof bound, not a working-set size.
+pub const PUBLISHED_PENDING_CAP: usize = 8192;
+
+/// How many publishes the cap above has dropped, since the last drain. For the report only.
+pub static PUBLISHED_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl Scene {
     /// Replaces the list of sections the game's own occlusion graph says are visible.
@@ -813,6 +847,37 @@ impl Scene {
     /// this side's while the game's list may not have heard of it yet.
     pub fn note_section_taken(&self, pos: IVec3) {
         self.sections_since_the_list.write().insert(pos);
+
+        // **And the JVM's half of the same fact.** A publish the queue has no room for is dropped
+        // rather than blocking the drain it is called from: the drain is the render path, and a
+        // contended mutex or a growing allocation there is a frame paid for one announcement. The
+        // JVM still converges - the section's next rebuild asks the same question the drain would
+        // have answered, and the game's mesh it kept is replaced then. See
+        // [`Scene::published_pending`] for the cap's shape.
+        let mut pending = self
+            .published_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if pending.len() < PUBLISHED_PENDING_CAP {
+            pending.push(pos);
+        } else {
+            PUBLISHED_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Hands over the sections whose publish the JVM has not been told of, and forgets them.
+    ///
+    /// The mirror of [`crate::mc::chunk::SectionStorage::refused`] on the happy side of the same
+    /// fact: a refusal says "this renderer will not draw it", and this says "this renderer now
+    /// does". Drained, once per client tick - see [`Scene::published_pending`].
+    pub fn published_sections(&self) -> Vec<IVec3> {
+        let mut pending = self
+            .published_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        std::mem::take(&mut *pending)
     }
 
     /// The revision [`Scene::set_visible_sections`] last left behind.
@@ -922,6 +987,7 @@ impl Scene {
             visible_sections_revision: AtomicU64::new(0),
             sections_since_the_list: RwLock::new(HashSet::new()),
             visible_sections_camera: RwLock::new(IVec3::ZERO),
+            published_pending: std::sync::Mutex::new(Vec::new()),
         }
     }
 

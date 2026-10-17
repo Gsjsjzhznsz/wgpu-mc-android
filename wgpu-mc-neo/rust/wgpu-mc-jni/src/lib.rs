@@ -2241,6 +2241,40 @@ pub fn refusedSections(env: JNIEnv, _class: JClass) -> jlongArray {
     array.into_raw()
 }
 
+/// The sections whose bake has **landed in the arena** since the last call, as the keys the JVM
+/// knows them by.
+///
+/// The happy-side mirror of [`refusedSections`]: that one says "this renderer will not draw it",
+/// this one says "this renderer now does". The JVM's mesh suppression is gated on the publish - a
+/// section whose bake is still queued keeps Minecraft's own mesh, which is what draws it while it
+/// waits - so the publish is the moment the game's mesh has to be retired, and this drain is the
+/// announcement. What the JVM does with a key is one redirty rebuild: the rebuild's bake answers
+/// against a section that is published, so the compile skips the geometry and the game's mesh is
+/// replaced by the empty one while the arena takes the drawing over.
+///
+/// Drains, one call per client tick, the same protocol [`refusedSections`] runs on the refusal
+/// side. The queue is capped on the publishing side (see `PUBLISHED_PENDING_CAP`), so a publish
+/// that did not fit is not in here - the JVM's next rebuild of that section re-derives the same
+/// answer from the arena, and the cost of that is one mesh drawn twice a while longer.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn publishedSections(env: JNIEnv, _class: JClass) -> jlongArray {
+    let published = RENDERER
+        .get()
+        .and_then(|wm| wm.scene())
+        .map(|scene| scene.published_sections())
+        .unwrap_or_default();
+
+    let keys: Vec<jlong> = published.iter().map(|pos| section_key(*pos)).collect();
+
+    let array = env.new_long_array(keys.len() as i32).unwrap();
+
+    if !keys.is_empty() {
+        env.set_long_array_region(&array, 0, &keys).unwrap();
+    }
+
+    array.into_raw()
+}
+
 /// How many bakes are queued or running right now, against [`MAX_QUEUED_BAKES`].
 ///
 /// The JVM's refusal drain reads this to decide whether to ask for a rebuild at all: a refused section

@@ -325,6 +325,11 @@ object RustChunkBake {
                         // And a refused section is one Rust is not drawing, so Minecraft's mesh goes back to being
                         // the fallback for it. The rebuild `redirtyDue` asks for is what puts it back.
                         rustHas.remove(key)
+                        // The same for the published set: a refusal (or a trim, which shares this channel) is
+                        // "this renderer is not drawing it any more", and the gate that drops Minecraft's mesh
+                        // reads the publish. Leaving the key here would keep the mesh suppressed for a section
+                        // nothing draws - the hole this channel exists to close, one rename later.
+                        published.remove(key)
 
                         if (pendingRedirty.size < PENDING_REDIRTY_LIMIT) {
                                 pendingRedirty.put(key, System.nanoTime())
@@ -449,8 +454,10 @@ object RustChunkBake {
 
                 WgpuMcMod.LOGGER.info(
                         "wgpu: this side claims Rust has {} section(s); the arena is drawing {}, with {} awaiting a " +
-                                "rebuild and {} bake(s) queued. Rebuilds: {} meshed by Rust's answer, {} refused by it, " +
-                                "{} left to Minecraft because the arena is full, {} left to it because Rust was never told",
+                                "rebuild and {} bake(s) queued, {} of the claims published (the arena draws them; the " +
+                                "rest are offered and waiting for their bake). Rebuilds: {} meshed by Rust's answer, " +
+                                "{} refused by it, {} left to Minecraft because the arena is full, {} left to it " +
+                                "because Rust was never told",
                         rustHas.size,
                         arena,
                         pendingRedirty.size,
@@ -459,6 +466,7 @@ object RustChunkBake {
                         } catch (error: Throwable) {
                                 -1
                         },
+                        published.size,
                         suppressed,
                         refusedByRust,
                         refusedAtCapacity,
@@ -827,6 +835,10 @@ object RustChunkBake {
                 // either - and Minecraft meshes sections again until Rust has been told about them. See
                 // [rustHas].
                 rustHas.clear()
+                // And nothing the arena was drawing survives it either: the publishes are the gate that
+                // retires Minecraft's mesh, and a stale one would suppress the mesh of a section the new
+                // world's arena has never heard of. See [published].
+                published.clear()
                 this.generation = generation
 
                 WgpuMcMod.LOGGER.info(
@@ -863,8 +875,11 @@ object RustChunkBake {
                 // setting that decides how a face is baked - so the arena is holding geometry of the last bake
                 // and Minecraft's own mesh is the only correct thing to draw until the re-offers land. So this
                 // forgets that Rust is drawing them too, and the re-mesh the caller asks for is one Minecraft
-                // takes part in. See [rustHas].
+                // takes part in. See [rustHas] and [published] - the publish is cleared with the claim,
+                // because the arena's geometry is now the *stale* one and the gate would otherwise suppress
+                // exactly the mesh that is correct.
                 rustHas.clear()
+                published.clear()
 
                 WgpuMcMod.LOGGER.info(
                         "wgpu: {} section(s) will be offered to the Rust baker with their blocks again",
@@ -924,7 +939,8 @@ object RustChunkBake {
 
         /**
          * Whether the rebuild being run on this thread has been **taken** by Rust, so Minecraft's own mesh
-         * for the same section is geometry nothing will ever read. See [rustHas] for what "taken" means.
+         * for the same section is geometry nothing will ever read. See [published] for what "taken" means
+         * now.
          *
          * **Per thread, and that is the whole reason it is not a field beside the others.** Section rebuilds
          * run on a pool of chunk-build workers, the bake is called at the head of the task and this is read a
@@ -977,23 +993,110 @@ object RustChunkBake {
          * The sections Rust has been handed at least once - which is what "Rust has this section" means
          * here, and the only claim this side is entitled to make.
          *
-         * **A payload leaving is not the same as a mesh existing**, and the difference is a hole in the
-         * world. Rust bakes on its own thread off a queue: `bakeSections` returns as soon as the payload is
-         * copied, and what comes out the other end lands in the arena some frames later, if it lands at all
-         * - the arena refuses sections it has no room for. So a section offered for the first time is a
-         * section Rust may not be drawing yet, and Minecraft's mesh is dropped for such a section is a
-         * section **nothing** draws until something dirties it again, which for a section that is not
-         * changing is never.
-         *
-         * Being handed once closes that: the payload has landed by the next rebuild of the same section by
-         * definition - a rebuild of it is what carries it. So the first rebuild of a section lets Minecraft
-         * mesh it as it always did while Rust catches up, and every rebuild after that drops the mesh.
+         * **This is the offer bookkeeping, not the mesh gate.** It decides [firstLook] - whether a rebuild
+         * is the first thing ever said about a section, which changes what the answer means - and it feeds
+         * the claim line in [reportClaimAgainstArena]. It does **not** decide whether Minecraft's mesh is
+         * dropped: that used to read this set, on the argument that "the payload has landed by the next
+         * rebuild of the same section by definition" - an argument that holds for the world a section at a
+         * time and collapses at view distance, where every section's mesh is dropped while its bake is
+         * still minutes out in the queue. See [published] for the gate that replaced it, and the user's own
+         * 32-chunk log for the bar it drew across the ocean.
          *
          * The keys are `SectionPos.asLong`, the same key [sent] uses, and the two are cleared together
          * everywhere: a section this side has forgotten is one Rust may have refused, so it is one
          * Minecraft's mesh goes back to being the fallback for.
          */
         private val rustHas: MutableSet<Long> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+        /**
+         * The sections whose bake has **landed in the arena** - the ones Rust is actually drawing.
+         *
+         * This is the set the mesh suppression is gated on, and the difference between it and [rustHas] is
+         * the black bar: `rustHas` is filed the moment a payload is *queued*, and a queue at thirty bakes a
+         * second feeding a 32-chunk world that needs tens of thousands of them is minutes of latency - so a
+         * section gated on the claim had its Minecraft mesh dropped and nothing drawn in its place for as
+         * long as the queue stayed backed up. Against an ocean that is a flat void-coloured band where the
+         * sea should be, which is what the user reported and three rounds of "the publish is quick enough"
+         * missed.
+         *
+         * So the gate moved to the fact: a section keeps Minecraft's mesh until its bake has landed, and the
+         * landed-ness arrives here through [drainPublished]. The cost is a section drawn by the game for the
+         * queue's latency, and the game's mesh is a picture - which is the whole trade. See
+         * [WgpuNative.publishedSections] for the channel and `Scene::published_pending` on the native side
+         * for the queue it drains.
+         *
+         * The keys are `SectionPos.asLong`, the same key [sent] uses, and they are cleared wherever [rustHas]
+         * is: a section this side has forgotten is one Rust may have refused or trimmed, so it is one
+         * Minecraft's mesh goes back to being the fallback for.
+         */
+        private val published: MutableSet<Long> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+        /** Whether Rust is drawing the section [key] names, which is what the mesh suppression gates on. */
+        @JvmStatic
+        fun isPublished(key: Long): Boolean = published.contains(key)
+
+        /** How many publishes this side has drained. For the report. */
+        private var publishedDrained = 0L
+
+        /**
+         * Takes the publishes the native side has been holding, and retires the game meshes they name.
+         *
+         * A publish says "the bake landed; the arena draws this section now" - and a section the arena draws
+         * is one Minecraft's own mesh must stop being drawn, or the section is rendered twice, at the cost
+         * of both renderers and with the two meshes' shading disagreeing in the meantime. The retirement is
+         * the same move a refusal's recovery uses, run in the opposite direction: one entry in
+         * [pendingRedirty], which asks the game for a rebuild whose bake answers against a section that is
+         * published, whose compile therefore skips the geometry, and whose empty mesh replaces the game's.
+         *
+         * Only the **first** publish of a section queues anything. A re-publish - a re-bake of a section
+         * whose mesh is already retired, for new blocks or new light - carries geometry the arena takes over
+         * directly, and there is no game mesh left to remove; queueing a rebuild for it would be a rebuild
+         * that does nothing, once per block edit.
+         *
+         * Called once a client tick, beside [forgetRefused] - the drain is one native call that returns an
+         * empty array in the steady state, and the cap on the native queue's side (a world left running
+         * while the client is paused) bounds what one call can bring back.
+         */
+        @JvmStatic
+        fun drainPublished() {
+                val landed = try {
+                        WgpuNative.publishedSections()
+                } catch (error: Throwable) {
+                        // No renderer yet, so nothing has been baked and nothing can have been published.
+                        return
+                }
+
+                if (landed.isEmpty()) {
+                        return
+                }
+
+                var queued = 0
+
+                for (key in landed) {
+                        if (!published.add(key)) {
+                                continue
+                        }
+
+                        // A key the set has not seen is a section the game may still be drawing - every
+                        // section's mesh is kept until its publish now - so this is the one rebuild that
+                        // retires it. The bound is [PENDING_REDIRTY_LIMIT], the same one the refusals
+                        // run under.
+                        if (pendingRedirty.size < PENDING_REDIRTY_LIMIT) {
+                                pendingRedirty.put(key, System.nanoTime())
+                                queued++
+                        }
+                }
+
+                publishedDrained += landed.size
+
+                WgpuMcMod.LOGGER.info(
+                        "wgpu: {} section bake(s) landed in the arena ({} rebuild(s) queued to retire the " +
+                                "game's meshes, {} drained so far)",
+                        landed.size,
+                        queued,
+                        publishedDrained,
+                )
+        }
 
         /**
          * The block states of one of the 27 sections, from the rebuild's own snapshot.
@@ -1093,9 +1196,17 @@ object RustChunkBake {
                 // The arena is a live thing: sections are trimmed as the view list changes, so the same section can
                 // be at capacity on one read and have room on the next. Reading it twice made the decision and the
                 // report disagree about which answer a rebuild got, and both of them pay for it below.
+                //
+                // **What the answer is now: the publish, not the attempt.** All three inputs above say whether
+                // the *offer* went well - and the offer is a queue, not a picture. Gating the mesh on it is how
+                // the black bar was built: at thirty bakes a second, every section's mesh was dropped while its
+                // bake was still minutes out. The gate reads the arena's own fact instead - the bake has landed
+                // and the arena is drawing it - and the attempt's answer stays in the counters below, where it
+                // belongs. See [published].
                 val atCapacity = atCapacity()
+                val centreKey = SectionPos.asLong(targetX, targetY, targetZ)
 
-                noteTookSection(!firstLook[0] && !atCapacity && accepted)
+                noteTookSection(isPublished(centreKey))
 
                 // **Which of the answers this rebuild got, counted.** The decision has four inputs now and when a
                 // hole survives a fix the question is which one is still wrong; `suppressed` is the only one that
@@ -1107,7 +1218,7 @@ object RustChunkBake {
                         // A section that was waiting for arena room and has now been taken. The set is what makes this
                         // a count of *recoveries* rather than of retries: a section that had to be re-offered twice is
                         // one recovery, and one that never had room is none.
-                        if (awaitingCapacity.remove(SectionPos.asLong(targetX, targetY, targetZ))) {
+                        if (awaitingCapacity.remove(centreKey)) {
                                 capacityRecovered++
                         }
                 } else if (!accepted) {
@@ -1145,8 +1256,15 @@ object RustChunkBake {
                 // anyway (the payload this one carried is what tells Rust about it), and queuing it would rebuild
                 // the whole world twice on purpose. `!accepted` is already here because it has no such second
                 // chance.
-                if ((!accepted || atCapacity) && pendingRedirty.size < PENDING_REDIRTY_LIMIT) {
-                        val key = SectionPos.asLong(targetX, targetY, targetZ)
+                //
+                // **And a section the arena already draws is never queued for capacity.** The `atCapacity` arm
+                // exists for a section whose bake was refused for want of room - one that is not being drawn.
+                // A *published* section offered again (a redirty rebuild from the publish drain, most often) is
+                // already in the arena: queueing it here would be a rebuild per publish forever, the loop the
+                // skip in `send` closes on the other side. `!accepted` keeps its queue entry in both cases: a
+                // refused update of a published section is stale geometry in the arena, and the retry is wanted.
+                if ((!accepted || (atCapacity && !isPublished(centreKey))) && pendingRedirty.size < PENDING_REDIRTY_LIMIT) {
+                        val key = centreKey
 
                         if (atCapacity) {
                                 capacityReoffers++
@@ -1268,6 +1386,14 @@ object RustChunkBake {
                 val payload = Payload.ofThread()
                 payload.begin()
 
+                // **Whether this payload carries anything at all.** Every write below sets it; the skip at
+                // the end of the loop reads it. A rebuild whose 27 sections all compare equal to what was
+                // sent last time - the common case for a rebuild asked for by a publish's redirty, whose
+                // whole job is to retire a game mesh and change no blocks - has nothing to say, and the
+                // call it would make re-queues a bake of a section the arena already draws, which is how
+                // the publish drain would turn into a rebuild-and-rebake loop. See the skip below.
+                var wrote = false
+
                 // One read for the whole payload: every record in it describes the same world. A level change
                 // while it is being written is exactly what the stamp is for - the records that were already
                 // written for the old world are refused by the other side rather than applied.
@@ -1313,8 +1439,10 @@ object RustChunkBake {
                         // rebuild would compare against it and find nothing to say.
                         if (blocks == null) {
                                 payload.writeAbsentBlock(index, stamp)
+                                wrote = true
                         } else if (blocksChanged) {
                                 payload.writeBlock(index, blocks, stamp)
+                                wrote = true
                         } else {
                                 // Rust has this section and this call does not carry it.
                                 knownBlocks = knownBlocks or (1 shl index)
@@ -1335,15 +1463,20 @@ object RustChunkBake {
                         // weights, the list, the seed arithmetic - corrects itself on the next rebuild rather than
                         // needing the blocks to change as well.
                         if (index == CENTER) {
-                                states?.let { variants(it, x, y, z) }?.let { payload.writeVariants(it) }
+                                states?.let { variants(it, x, y, z) }?.let {
+                                        payload.writeVariants(it)
+                                        wrote = true
+                                }
                         }
 
                         if (timing) blockNanos += System.nanoTime() - blocksStarted
 
                         if (light == null) {
                                 payload.writeAbsentLight(index, stamp)
+                                wrote = true
                         } else if (lightChanged) {
                                 payload.writeLight(index, light, stamp)
+                                wrote = true
                         } else {
                                 knownLight = knownLight or (1 shl index)
                         }
@@ -1359,6 +1492,23 @@ object RustChunkBake {
 
                 payload.writeVisibility(visibilities, stamp)
                 payload.finish(knownBlocks, knownLight)
+
+                // **Nothing to say, and the arena already draws it: no call.** This is the guard that keeps
+                // the publish drain from being a loop. A section whose bake has landed gets one redirty
+                // rebuild from [drainPublished] to retire Minecraft's mesh; that rebuild arrives here,
+                // finds every section unchanged, and without this skip would hand the empty payload to
+                // `bakeSections` - which queues a re-bake of a section the arena already holds, whose
+                // publish is announced, whose redirty rebuild arrives here again. One rebuild per section
+                // per publish, forever. With the skip, the rebuild compiles against [isPublished] and the
+                // chain stops: the mesh is retired, nothing is queued, nothing is re-baked.
+                //
+                // The visibility trailer above is safe to lose on this path: it is derived from the blocks,
+                // and blocks that did not change did not change their visibility. Anything that *did* write
+                // - a block, a light, a variant, an absence - takes the call, and the centre is re-baked as
+                // it always was.
+                if (!wrote && isPublished(SectionPos.asLong(targetX, targetY, targetZ))) {
+                        return Answer(false, true)
+                }
 
                 lastPayloadBytes = payload.length
 

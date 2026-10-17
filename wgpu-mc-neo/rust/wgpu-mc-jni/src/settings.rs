@@ -2219,15 +2219,38 @@ mod tests {
              returned normally"
         );
 
-        // **And the decision has to include what Rust accepted.** `send` can come back having taken
-        // nothing - the bake queue was full and the task was dropped, or the records were refused - and
-        // it was already reporting that while the decision ignored it. A section Rust refused then had
-        // Minecraft's mesh dropped too, and nothing asks for it back: only an *arena* refusal reaches
-        // the re-offer drain, not a dropped task.
+        // **And the decision has to be the arena's own fact, not the offer's.** The offer is a queue: a
+        // payload accepted is a bake *queued*, and a queue at thirty bakes a second feeding a 32-chunk
+        // world is minutes of latency - so a decision keyed on the attempt dropped Minecraft's mesh for
+        // a section nothing drew for that whole window, which is the flat black band over the ocean the
+        // 32-chunk session reported. The gate reads the publish - the bake landed, the arena draws it -
+        // and the attempt's answer stays in the counters, where it belongs.
         assert!(
-            source.contains("noteTookSection(!firstLook[0] && !atCapacity && accepted)"),
-            "the decision to drop Minecraft's mesh must require that Rust accepted the payload; \
-             otherwise a refused section is drawn by neither renderer"
+            source.contains("noteTookSection(isPublished(centreKey))"),
+            "the decision to drop Minecraft's mesh must be gated on the publish (the bake landed in the \
+             arena), not on the offer being accepted - an accepted payload is a queued bake, and a \
+             section drawn by neither renderer while its bake waits is the black bar"
+        );
+
+        // **The channel the publish arrives through, and what it does.** The drain retires the game's
+        // mesh with one redirty rebuild - the same shape the refusal recovery uses, run in reverse - and
+        // only for the first publish of a section.
+        assert!(
+            source.contains("WgpuNative.publishedSections()")
+                && source.contains("fun drainPublished()"),
+            "the publish has to reach this side, and the drain has to exist to retire the game meshes \
+             it announces - without it a published section is drawn twice, and the two meshes disagree \
+             about shading"
+        );
+
+        // **And a refused or trimmed section leaves the published set.** The refusal (and the trim, which
+        // shares the channel) is "this renderer is not drawing it any more"; a key left in the set would
+        // keep the mesh suppressed for a section the arena has let go of - the same hole by one more
+        // route.
+        assert!(
+            source.contains("published.remove(key)"),
+            "the refusal drain must clear the publish alongside the claim: both mean the arena is not \
+             drawing the section, and the gate reads the publish"
         );
 
         // **And the arena's refusals have to be asked for again, which is the one refusal that is not
@@ -2242,10 +2265,12 @@ mod tests {
         // session, drawn by Minecraft at full cost beside terrain Rust was drawing.
         assert!(
             source.contains(
-                "if ((!accepted || atCapacity) && pendingRedirty.size < PENDING_REDIRTY_LIMIT)"
+                "if ((!accepted || (atCapacity && !isPublished(centreKey))) && pendingRedirty.size < PENDING_REDIRTY_LIMIT)"
             ),
             "an at-capacity refusal has to reach the re-offer drain as well as a dropped payload: the arena \
-             frees room as the view moves, and nothing else marks a section stale"
+             frees room as the view moves, and nothing else marks a section stale - but a *published* \
+             section is already being drawn, and queueing it for capacity would be a rebuild per publish \
+             forever"
         );
 
         assert!(
@@ -2261,11 +2286,12 @@ mod tests {
              neighbour's refusal only costs the next payload"
         );
 
-        // And the capacity check itself, which is the part only the native side can answer.
+        // And the capacity check itself, which the native side answers; the decision reads it once, into
+        // `atCapacity`, and the queueing below consults the sample rather than asking again.
         assert!(
-            source.contains("!atCapacity && accepted"),
-            "the decision to drop Minecraft's mesh has to account for an arena that cannot grow: at the \
-             device's buffer limit a refusal is permanent, so the game keeps its mesh for those sections"
+            source.contains("val atCapacity = atCapacity()"),
+            "the decision has to account for an arena that cannot grow: at the device's buffer limit a \
+             refusal is permanent, so the game keeps its mesh for those sections"
         );
 
         assert!(

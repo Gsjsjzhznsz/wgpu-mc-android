@@ -753,6 +753,22 @@ object WgpuNative {
         @JvmStatic
         external fun refusedSections(): LongArray
 
+        /**
+         * The sections whose bake has **landed in the arena** since the last call, as `SectionPos.asLong`
+         * keys.
+         *
+         * The happy-side mirror of [refusedSections]: that one says "this renderer will not draw it",
+         * this one says "this renderer now does". The mesh suppression is gated on this answer now - a
+         * section whose bake is still queued keeps Minecraft's own mesh, which is what draws it while it
+         * waits - so the publish is the moment the game's mesh has to be retired, and this drain is the
+         * announcement. See `RustChunkBake.drainPublished`.
+         *
+         * Drains: what one call does not take is handed over by the next. Called once a client tick, and
+         * an empty array in the normal case.
+         */
+        @JvmStatic
+        external fun publishedSections(): LongArray
+
         @JvmStatic
         external fun setMatrix(type: Int, mat: FloatArray)
 

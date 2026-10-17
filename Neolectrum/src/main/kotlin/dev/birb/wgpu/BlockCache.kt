@@ -682,5 +682,10 @@ object BlockCache {
 		// every launch: a section it had no room for is a hole this side would otherwise go on
 		// believing was filled. See `RustChunkBake.forgetRefused`.
 		RustChunkBake.forgetRefused()
+
+		// The arena's publishes, drained beside the refusals and for the same reason: a section
+		// whose bake has landed is one Minecraft's own mesh has to be retired for, and a mesh
+		// that stays is a section drawn twice. See `RustChunkBake.drainPublished`.
+		RustChunkBake.drainPublished()
 	}
 }
