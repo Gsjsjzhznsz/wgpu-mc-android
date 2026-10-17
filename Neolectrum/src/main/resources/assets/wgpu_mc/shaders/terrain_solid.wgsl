@@ -45,6 +45,15 @@ struct ChunkOffset {
 @group(0) @binding(12) var t_game_sampler_animated: sampler;
 @group(0) @binding(13) var t_sampler_animated: sampler;
 
+// **The same two atlases again, one copy per sampler.** One texture global per sampler, the same view
+// bound to each - Vulkan takes one image under several samplers, but naga's GLSL writer refuses exactly
+// that for GLES's combined `sampler2D` model (`A image was used with multiple samplers`), and that refusal
+// was the GLES world's black screen. See the full note beside the same bindings in `terrain.wgsl`.
+@group(0) @binding(14) var t_texture_magnify: texture_2d<f32>;
+@group(0) @binding(15) var t_texture_animated: texture_2d<f32>;
+@group(0) @binding(16) var t_game_atlas_magnify: texture_2d<f32>;
+@group(0) @binding(17) var t_game_atlas_animated: texture_2d<f32>;
+
 /// Whether a fragment's coordinates are being **stretched** rather than squeezed. The two derivatives are
 /// compared separately rather than through `fwidth`, which is their sum and would move the switch to half a
 /// texel; see `terrain.wgsl` for the whole of why that matters.
@@ -583,17 +592,17 @@ fn frag(
 
     if in.game_atlas == 1u {
         if fg.magnified {
-            texel = sample_at_level(t_game_atlas, t_game_sampler_magnify, fg.geometry, section_pos.use_rgss);
+            texel = sample_at_level(t_game_atlas_magnify, t_game_sampler_magnify, fg.geometry, section_pos.use_rgss);
         } else if in.animated == 1u {
-            texel = sample_at_level(t_game_atlas, t_game_sampler_animated, fg.geometry, section_pos.use_rgss);
+            texel = sample_at_level(t_game_atlas_animated, t_game_sampler_animated, fg.geometry, section_pos.use_rgss);
         } else {
             texel = sample_at_level(t_game_atlas, t_game_sampler, fg.geometry, section_pos.use_rgss);
         }
     } else {
         if fg.magnified {
-            texel = sample_at_level(t_texture, t_sampler_magnify, fg.geometry, section_pos.use_rgss);
+            texel = sample_at_level(t_texture_magnify, t_sampler_magnify, fg.geometry, section_pos.use_rgss);
         } else if in.animated == 1u {
-            texel = sample_at_level(t_texture, t_sampler_animated, fg.geometry, section_pos.use_rgss);
+            texel = sample_at_level(t_texture_animated, t_sampler_animated, fg.geometry, section_pos.use_rgss);
         } else {
             texel = sample_at_level(t_texture, t_sampler, fg.geometry, section_pos.use_rgss);
         }
@@ -614,9 +623,9 @@ fn frag_game_atlas(
     var texel: vec4<f32>;
 
     if fg.magnified {
-        texel = sample_at_level(t_game_atlas, t_game_sampler_magnify, fg.geometry, section_pos.use_rgss);
+        texel = sample_at_level(t_game_atlas_magnify, t_game_sampler_magnify, fg.geometry, section_pos.use_rgss);
     } else if in.animated == 1u {
-        texel = sample_at_level(t_game_atlas, t_game_sampler_animated, fg.geometry, section_pos.use_rgss);
+        texel = sample_at_level(t_game_atlas_animated, t_game_sampler_animated, fg.geometry, section_pos.use_rgss);
     } else {
         texel = sample_at_level(t_game_atlas, t_game_sampler, fg.geometry, section_pos.use_rgss);
     }

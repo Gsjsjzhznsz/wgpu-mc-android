@@ -257,10 +257,19 @@ mod tests {
                 "@sampler_mc_block_atlas_magnify",
                 "@sampler_block_atlas_magnify",
                 // And the third pair: a minified *animated* face, which wants neither of the others - see
-                // `atlas_animated_minified_sampler`. The list is exact and in order because the keys are the
-                // shader's own binding slots, so a new sampler has to be added here deliberately.
+                // `atlas_animated_minified_sampler`.
                 "@sampler_mc_block_atlas_animated",
-                "@sampler_block_atlas_animated"
+                "@sampler_block_atlas_animated",
+                // **The two atlases again, one copy per sampler.** naga's GLSL writer - the GLES path -
+                // refuses a module where one image is reached by several samplers (`A image was used with
+                // multiple samplers`), which is what blacked the world out on the GLES backend: all three
+                // terrain pipelines died in translation and the graph skipped their draws. The magnify and
+                // animated samplers therefore read the same view through their own texture bindings; the
+                // shader note beside bindings 14-17 in `terrain.wgsl` carries the whole story.
+                "@texture_block_atlas",
+                "@texture_block_atlas",
+                "@texture_mc_block_atlas",
+                "@texture_mc_block_atlas"
             ],
             "the shader's own binding numbers are the keys of this map: the two atlases with their \
              samplers, the same two with the magnifying samplers, the same two again with the sampler a \

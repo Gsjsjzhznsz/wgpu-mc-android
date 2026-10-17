@@ -5517,14 +5517,18 @@ mod atlas_entry_point_tests {
     /// checkout that is not there skips the check rather than failing it; see `wgpu_mc_modtree`.
     #[test]
     fn the_single_atlas_entry_point_samples_one_atlas() {
-        const THE_GAMES: [&str; 4] = [
+        const THE_GAMES: [&str; 6] = [
             "t_game_atlas",
+            "t_game_atlas_magnify",
+            "t_game_atlas_animated",
             "t_game_sampler",
             "t_game_sampler_magnify",
             "t_game_sampler_animated",
         ];
-        const OURS: [&str; 4] = [
+        const OURS: [&str; 6] = [
             "t_texture",
+            "t_texture_magnify",
+            "t_texture_animated",
             "t_sampler",
             "t_sampler_magnify",
             "t_sampler_animated",

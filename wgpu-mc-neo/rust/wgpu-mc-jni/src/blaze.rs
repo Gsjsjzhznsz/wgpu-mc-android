@@ -364,6 +364,22 @@ pub struct BlazeRenderPass {
     /// draw instead. Kept as the place that state belongs when it is needed.
     #[allow(dead_code)]
     emitted: u32,
+    /// What the raw pass is actually holding right now: the groups Arc, the offsets it was bound
+    /// with, and the index buffer and format. `set_bind_group` and `set_index_buffer` are skipped
+    /// when a draw would bind exactly this - wgpu keeps pass state across draws (a pipeline change
+    /// does not reset it), and the runs of draws the JVM sends usually agree about their bindings,
+    /// so every redundant rebind is driver work for no picture. The groups Arc makes identity a
+    /// pointer compare, and its cache key folds the plan's salt (see `bind_groups_for_call`), so
+    /// the same Arc under another pipeline still means the same slots.
+    bound: Option<BoundPassState>,
+}
+
+/// The pass state a skip decision is made against. See [BlazeRenderPass::bound].
+struct BoundPassState {
+    groups: Arc<CachedBindGroups>,
+    offsets: [[wgpu::DynamicOffset; MAX_DRAW_BINDINGS]; MAX_DRAW_SETS],
+    offsets_len: [usize; MAX_DRAW_SETS],
+    index: Option<(*const wgpu::Buffer, IndexFormat)>,
 }
 
 impl BlazeRenderPass {
@@ -376,6 +392,7 @@ impl BlazeRenderPass {
             offsets_len: [0; MAX_DRAW_SETS],
             pipeline: std::ptr::null(),
             emitted: 0,
+            bound: None,
         }
     }
 
@@ -1761,10 +1778,40 @@ fn bind_for_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) -
     }
 
     if let Some(bound) = groups.as_ref() {
-        for (index, group) in bound.groups.iter().enumerate() {
-            let count = offsets_len[index].min(MAX_DRAW_BINDINGS);
+        // **Binding what the pass already holds is driver work for no picture.** wgpu keeps bind
+        // groups and dynamic offsets across draws within a pass - a pipeline change does not reset
+        // them - and the runs of draws the JVM sends usually agree about their bindings. The
+        // snapshot is compared whole: the same Arc with a different dynamic offset is a different
+        // binding, and so is a different Arc under the same plan. Anything that differs re-binds
+        // every set and refreshes the snapshot; a draw that refused earlier left the snapshot as
+        // it was, which is what the pass still holds, so the next good draw agrees with it again.
+        let same = pass.bound.as_ref().is_some_and(|state| {
+            Arc::ptr_eq(&state.groups, bound)
+                && state.offsets == *offsets
+                && state.offsets_len == *offsets_len
+        });
 
-            raw_pass.set_bind_group(index as u32, group, &offsets[index][..count]);
+        if !same {
+            for (index, group) in bound.groups.iter().enumerate() {
+                let count = offsets_len[index].min(MAX_DRAW_BINDINGS);
+
+                raw_pass.set_bind_group(index as u32, group, &offsets[index][..count]);
+            }
+
+            if let Some(state) = pass.bound.as_mut() {
+                state.groups = bound.clone();
+                state.offsets = *offsets;
+                state.offsets_len = *offsets_len;
+                // The index buffer is its own piece of pass state and outlives a bind-group
+                // change - only the skip below retires it.
+            } else {
+                pass.bound = Some(BoundPassState {
+                    groups: bound.clone(),
+                    offsets: *offsets,
+                    offsets_len: *offsets_len,
+                    index: None,
+                });
+            }
         }
     }
 
@@ -1782,15 +1829,31 @@ fn bind_for_call(wm: &WmRenderer, pass: &mut BlazeRenderPass, call: &DrawCall) -
 
         // Safety: a live buffer box, as above, null-checked just now.
         let buffer = unsafe { &*(call.index_buffer as *const wgpu::Buffer) };
+        let format = if call.index_format == 2 {
+            IndexFormat::Uint32
+        } else {
+            IndexFormat::Uint16
+        };
 
-        raw_pass.set_index_buffer(
-            buffer.slice(..),
-            if call.index_format == 2 {
-                IndexFormat::Uint32
-            } else {
-                IndexFormat::Uint16
-            },
-        );
+        // The same skip, against the snapshot's index half - invalidated above whenever the bind
+        // groups moved, because a draw that changes its bindings may change buffers with them, and
+        // a cheap pointer-and-format compare is all this needs to be exact either way.
+        let same_index = pass
+            .bound
+            .as_ref()
+            .and_then(|state| state.index)
+            .is_some_and(|(bound_buffer, bound_format)| {
+                std::ptr::eq(bound_buffer, call.index_buffer as *const wgpu::Buffer)
+                    && bound_format == format
+            });
+
+        if !same_index {
+            raw_pass.set_index_buffer(buffer.slice(..), format);
+
+            if let Some(state) = pass.bound.as_mut() {
+                state.index = Some((call.index_buffer as *const wgpu::Buffer, format));
+            }
+        }
     }
 
     true

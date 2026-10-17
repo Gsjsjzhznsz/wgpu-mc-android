@@ -57,6 +57,23 @@ struct ChunkOffset {
 @group(0) @binding(12) var t_game_sampler_animated: sampler;
 @group(0) @binding(13) var t_sampler_animated: sampler;
 
+// **The same two atlases again, one copy per sampler.**
+//
+// Vulkan accepts a shader that samples one texture through several samplers - the descriptor set binds
+// the image once per sampler, and every backend we ship there is fine with it. GLES is not: its samplers
+// are combined `sampler2D` types, one texture unit each, and naga's GLSL writer refuses a module where a
+// single image is reached by more than one of them (`A image was used with multiple samplers`). That
+// refusal is what blacked the world out on the GLES path: all three terrain pipelines died at
+// translation, the graph skipped their draws, and the screen kept everything but the world. The way out
+// changes nothing about what is sampled: one texture global per sampler, and the same view bound to each.
+// On GLES that is the same texture on several units under different sampler objects, which GLSL ES has
+// always allowed; on Vulkan it is the same view in a few more descriptor slots. The fragment stage
+// switches between the three pairs as it did between the three samplers - plain, magnify, animated.
+@group(0) @binding(14) var t_texture_magnify: texture_2d<f32>;
+@group(0) @binding(15) var t_texture_animated: texture_2d<f32>;
+@group(0) @binding(16) var t_game_atlas_magnify: texture_2d<f32>;
+@group(0) @binding(17) var t_game_atlas_animated: texture_2d<f32>;
+
 // The game's **lightmap**, and the sampler the game samples it with (`Sampler2` for the terrain is
 // `getClampToEdge(LINEAR)`). This is the whole of the lighting: the game builds this 16x16 texture from
 // the light levels of the world, the gamma and brightness options, the time of day, night vision and
@@ -579,17 +596,17 @@ fn frag(
 
     if in.game_atlas == 1u {
         if fg.magnified {
-            texel = sample_at_level(t_game_atlas, t_game_sampler_magnify, fg.geometry, section_pos.use_rgss);
+            texel = sample_at_level(t_game_atlas_magnify, t_game_sampler_magnify, fg.geometry, section_pos.use_rgss);
         } else if in.animated == 1u {
-            texel = sample_at_level(t_game_atlas, t_game_sampler_animated, fg.geometry, section_pos.use_rgss);
+            texel = sample_at_level(t_game_atlas_animated, t_game_sampler_animated, fg.geometry, section_pos.use_rgss);
         } else {
             texel = sample_at_level(t_game_atlas, t_game_sampler, fg.geometry, section_pos.use_rgss);
         }
     } else {
         if fg.magnified {
-            texel = sample_at_level(t_texture, t_sampler_magnify, fg.geometry, section_pos.use_rgss);
+            texel = sample_at_level(t_texture_magnify, t_sampler_magnify, fg.geometry, section_pos.use_rgss);
         } else if in.animated == 1u {
-            texel = sample_at_level(t_texture, t_sampler_animated, fg.geometry, section_pos.use_rgss);
+            texel = sample_at_level(t_texture_animated, t_sampler_animated, fg.geometry, section_pos.use_rgss);
         } else {
             texel = sample_at_level(t_texture, t_sampler, fg.geometry, section_pos.use_rgss);
         }
@@ -602,7 +619,9 @@ fn frag(
 /// that can remove the branch rather than execute it.
 ///
 /// It samples the game's block atlas and nothing else, so `t_texture` and the three samplers that go with
-/// it are not referenced here at all - and this is what the graph builds the terrain pipelines from
+/// it are not referenced here at all (the game's atlas is reached through its three per-sampler copies,
+/// `t_game_atlas`/`t_game_atlas_magnify`/`t_game_atlas_animated`, which are one view bound three times) -
+/// and this is what the graph builds the terrain pipelines from
 /// whenever [`crate::mc::block::faces_are_all_the_games`] says the arena holds no face that fell back.
 /// The numbers, from a normal session: **204,878 faces baked against the game's atlas and 0 against this
 /// side's**, so the two-atlas shader is the exceptional one and this is the common one.
@@ -611,8 +630,9 @@ fn frag(
 /// contain both atlases and both sampler sets; naga substitutes the override and the *backend compiler*
 /// would then fold the branch away - reliably, but somewhere this repository cannot check. A second entry
 /// point is smaller in the source itself, which is checkable: a test reads both shaders with naga and
-/// asserts that this entry point reaches exactly one texture and its three samplers, and that `frag`
-/// reaches both. See `the_single_atlas_entry_point_samples_one_atlas` in `graph.rs`.
+/// asserts that this entry point reaches exactly one atlas (through its per-sampler copies) and its
+/// three samplers, and that `frag` reaches both atlases. See
+/// `the_single_atlas_entry_point_samples_one_atlas` in `graph.rs`.
 ///
 /// The atlas is not the *sampler*, so the three-way choice between magnify, animated and plain is still
 /// here - those are properties of the fragment, not of the build.
@@ -627,9 +647,9 @@ fn frag_game_atlas(
     var texel: vec4<f32>;
 
     if fg.magnified {
-        texel = sample_at_level(t_game_atlas, t_game_sampler_magnify, fg.geometry, section_pos.use_rgss);
+        texel = sample_at_level(t_game_atlas_magnify, t_game_sampler_magnify, fg.geometry, section_pos.use_rgss);
     } else if in.animated == 1u {
-        texel = sample_at_level(t_game_atlas, t_game_sampler_animated, fg.geometry, section_pos.use_rgss);
+        texel = sample_at_level(t_game_atlas_animated, t_game_sampler_animated, fg.geometry, section_pos.use_rgss);
     } else {
         texel = sample_at_level(t_game_atlas, t_game_sampler, fg.geometry, section_pos.use_rgss);
     }

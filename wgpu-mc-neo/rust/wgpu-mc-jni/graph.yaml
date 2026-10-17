@@ -53,6 +53,14 @@ pipelines:
         11: "@sampler_block_atlas_magnify"
         12: "@sampler_mc_block_atlas_animated"
         13: "@sampler_block_atlas_animated"
+        # 14-17 are the two atlases again, one copy per sampler: naga's GLSL writer (the GLES path)
+        # refuses a shader where one image is reached by several samplers, so the magnify and animated
+        # samplers get their own texture bindings - same view, same resource, three slots. See the note
+        # beside bindings 14-17 in `terrain.wgsl`.
+        14: "@texture_block_atlas"
+        15: "@texture_block_atlas"
+        16: "@texture_mc_block_atlas"
+        17: "@texture_mc_block_atlas"
       1: "@bg_ssbo_chunks"
       2: "@bg_section_draws"
     immediates:
@@ -86,6 +94,14 @@ pipelines:
         11: "@sampler_block_atlas_magnify"
         12: "@sampler_mc_block_atlas_animated"
         13: "@sampler_block_atlas_animated"
+        # 14-17 are the two atlases again, one copy per sampler: naga's GLSL writer (the GLES path)
+        # refuses a shader where one image is reached by several samplers, so the magnify and animated
+        # samplers get their own texture bindings - same view, same resource, three slots. See the note
+        # beside bindings 14-17 in `terrain.wgsl`.
+        14: "@texture_block_atlas"
+        15: "@texture_block_atlas"
+        16: "@texture_mc_block_atlas"
+        17: "@texture_mc_block_atlas"
       1: "@bg_ssbo_chunks"
       2: "@bg_section_draws"
     immediates:
@@ -132,6 +148,14 @@ pipelines:
         11: "@sampler_block_atlas_magnify"
         12: "@sampler_mc_block_atlas_animated"
         13: "@sampler_block_atlas_animated"
+        # 14-17 are the two atlases again, one copy per sampler: naga's GLSL writer (the GLES path)
+        # refuses a shader where one image is reached by several samplers, so the magnify and animated
+        # samplers get their own texture bindings - same view, same resource, three slots. See the note
+        # beside bindings 14-17 in `terrain.wgsl`.
+        14: "@texture_block_atlas"
+        15: "@texture_block_atlas"
+        16: "@texture_mc_block_atlas"
+        17: "@texture_mc_block_atlas"
       1: "@bg_ssbo_chunks"
       2: "@bg_section_draws"
     immediates:

@@ -1076,18 +1076,39 @@ fn try_create_renderer(
         // loss would be. `LAST_PIPELINE_COMPILING` is taken here, so one dump per
         // refusal; the next compilation sets it again.
         let text = error.to_string();
-        if text.contains("create_render_pipeline")
+        let is_pipeline = text.contains("create_render_pipeline");
+        if is_pipeline
             || text.contains("create_shader_module")
             || text.contains("create_compute_pipeline")
         {
+            // **The label inside the error is the pipeline the refused call was for**, and for a
+            // render pipeline it wins over the compilation that was last started: the render graph
+            // builds its terrain pipelines without touching `LAST_PIPELINE_COMPILING`, so on GLES -
+            // where every terrain pipeline dies in naga's GLSL writer - its refusals were reported
+            // under whichever Java pipeline had been compiled last (`entity_smooth_cutout_cull`,
+            // `blur/5`), two pipelines away from the shader that was actually refused.
+            let label = if is_pipeline {
+                text.split("label = '")
+                    .nth(1)
+                    .and_then(|rest| rest.split('\'').next())
+                    .map(str::to_owned)
+            } else {
+                None
+            };
+
             let compiling = LAST_PIPELINE_COMPILING.lock().take();
-            if let Some(compilation) = &compiling {
+            let mismatched = match (&compiling, &label) {
+                (Some(compilation), Some(label)) => compilation.name != *label,
+                _ => false,
+            };
+
+            if let Some(compilation) = compiling.filter(|_| !mismatched) {
                 error!(
                     "wgpu-mc: the driver refused {} - writing its shaders out now",
                     compilation.name
                 );
                 dump_pipeline_refused_or_lost(
-                    compilation,
+                    &compilation,
                     format!(
                         "the driver refused it while {} of this pipeline was being compiled - \
                          the device was not lost",
@@ -1098,6 +1119,12 @@ fn try_create_renderer(
                     // refusal dump names the adapter through the game log's own
                     // `Vulkan adapter is` line instead.
                     "",
+                );
+            } else if let Some(label) = label {
+                error!(
+                    "wgpu-mc: the driver refused {label} - the error names this pipeline itself, \
+                     so no dump is kept: this refusal did not pass through the pipeline registry \
+                     (the render graph compiled it, and its source is the mod's own shaders)"
                 );
             }
         }
@@ -2264,6 +2291,17 @@ fn new_stage(device: &wgpu::Device) -> Stage {
 fn stage_copy(wm: &WmRenderer, buffer: &wgpu::Buffer, start: u64, bytes: &[u8]) -> bool {
     if bytes.is_empty() {
         return true;
+    }
+
+    // A copy is a command, and a command cannot be recorded while a render pass is borrowing the
+    // shared encoder - and with the encoder reached through its raw pointer (see
+    // `with_shared_encoder`), recording one mid-pass is an aliasing violation before it is a
+    // validation error. Minecraft reaches this from inside a pass now and then (a `mapBuffer`
+    // close during one), so this is the queue-write path's turn and the caller falls back below;
+    // `flush_shared_encoder` already refuses a submit under the same condition.
+    if LIVE_PASS_COUNT.load(Ordering::Relaxed) != 0 {
+        STAGING_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        return false;
     }
 
     // A destination without `COPY_DST` cannot be the target of a copy, and asking wgpu anyway would
