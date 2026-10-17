@@ -44,6 +44,7 @@ glsl = { git = "https://github.com/wgpu-mc/glsl.git" }
 # `cargo update` belongs in the tree, not in a pinned revision.
 cyntax = { path = "../cyntax" }
 
+
 [dev-dependencies]
 # The tests read the mod's Kotlin, its language files and its metadata out of the Neolectrum
 # checkout; this is the crate that finds it, and it says what it does when it is not there.
@@ -72,6 +73,7 @@ winapi = { version = "0.3.9", features = [
 # against `libandroid.so` in `device.rs` - the `ndk` crate's `nativewindow` bindings would link
 # `libnativewindow.so`, whose NDK stub only exists for API 34+, and the binary would then refuse
 # to load on every Android between 7.0 and 13 for a library it needs nothing else from.
+libc = "0.2"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

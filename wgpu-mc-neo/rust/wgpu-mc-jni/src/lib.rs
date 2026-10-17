@@ -44,6 +44,7 @@ use crate::section::{
 };
 use crate::settings::Settings;
 
+mod affinity;
 mod alloc;
 mod application;
 pub mod blaze;
@@ -1770,11 +1771,48 @@ fn forget_one(pos: IVec3) {
 /// held while palettes were turned into vertices. Rayon's own default sizing is used (one thread per
 /// core): these tasks are independent, they take only read locks, and the results funnel back
 /// through the chunk update queue that was already the hand-off to the render thread.
+///
+/// **Except on a phone, where the sizing and the placement are this module's to decide.** A phone
+/// splits its cores into clusters, and the default "one thread per core" puts bake threads on the
+/// efficiency cluster, where the same work costs two or three times the clock - and lets the
+/// scheduler bounce them around it while the world is loading. `affinity` names the performance
+/// cluster; the pool then runs one thread per performance core, each pinned there, and the
+/// efficiency cluster is left to the JVM's own background threads. A device whose clusters cannot
+/// be read gets the default, unchanged.
 static THREAD_POOL: Lazy<ThreadPool> = Lazy::new(|| {
-    ThreadPoolBuilder::new()
-        .thread_name(|index| format!("wgpu-mc bake {index}"))
-        .build()
-        .expect("wgpu-mc: could not start the section bake pool")
+    // Two independent answers from the same probe: how many threads (the performance cluster's
+    // size, rather than every core), and where they run (pinned there, at thread start). Either
+    // answer being `None` leaves that half of the builder exactly as rayon would have built it.
+    let threads = crate::affinity::bake_pool_threads();
+    let handler = crate::affinity::bake_pool_spawn_handler();
+
+    // **Built in four shapes, because the builder's type is not one type.** Handing a builder a
+    // custom spawn changes its type (`DefaultSpawn` into `CustomSpawn`), so a builder mutated in
+    // place across an `if let` is a type error, and the honest shape is the four combinations of
+    // the two answers, each built from its own base. The name closure repeats with them, because
+    // naming it once in a helper would name a type this crate does not otherwise need.
+    match (threads, handler) {
+        (Some(threads), Some(handler)) => ThreadPoolBuilder::new()
+            .thread_name(|index| format!("wgpu-mc bake {index}"))
+            .num_threads(threads)
+            .spawn_handler(handler)
+            .build()
+            .expect("wgpu-mc: could not start the section bake pool"),
+        (Some(threads), None) => ThreadPoolBuilder::new()
+            .thread_name(|index| format!("wgpu-mc bake {index}"))
+            .num_threads(threads)
+            .build()
+            .expect("wgpu-mc: could not start the section bake pool"),
+        (None, Some(handler)) => ThreadPoolBuilder::new()
+            .thread_name(|index| format!("wgpu-mc bake {index}"))
+            .spawn_handler(handler)
+            .build()
+            .expect("wgpu-mc: could not start the section bake pool"),
+        (None, None) => ThreadPoolBuilder::new()
+            .thread_name(|index| format!("wgpu-mc bake {index}"))
+            .build()
+            .expect("wgpu-mc: could not start the section bake pool"),
+    }
 });
 
 /// How many bakes may be waiting before further sections are dropped on the floor.

@@ -5171,6 +5171,7 @@ dependencies = [
  "jni",
  "jni_fn",
  "lazy_static",
+ "libc",
  "log",
  "mc-varint",
  "once_cell",

@@ -490,6 +490,31 @@ impl WmRenderer {
         // The run being gathered, or `None` when the next range starts a new one.
         let mut pending: Option<PendingUpload> = None;
 
+        // Room for the largest section this side has ever baked, twice over - the one being
+        // allocated now and the one after it. Both triggers below ask with this margin.
+        const GROWTH_MARGIN: u32 = 2;
+
+        // **The usable room, not the free room - read once per drain.** The trigger inside the loop
+        // asks twice: whether the pool is running out in total, and whether it is running out *in
+        // runs* - because a pool of contiguous ranges that has churned holds its free slots as holes
+        // between held sections, and a section the size of any real section then fits none of them
+        // while the total looks comfortable. That is not a hypothetical shape: the run the user's own
+        // log described held its pool at 39% and refused 909 sections, because the twenty million
+        // free slots were scattered as holes no section could sit in. `largest_free_run` is the one
+        // walk that tells the two apart, and it is linear in the arena's ranges - so it is read here,
+        // once, and not per section.
+        //
+        // A value read before the loop is a frame old by the loop's end, and the loop's own
+        // allocations shrink the real runs behind it. That is the trade, deliberately: the read is
+        // the *early* ask, and a section the stale value still let through is covered by the
+        // allocate-refusal path below, which asks at the moment the room is actually gone. Growth
+        // coalesces both asks into one marker.
+        let largest_run = {
+            let storage = scene.section_storage.read();
+            storage.largest_free_run()
+        };
+        let growth_margin = mc::chunk::largest_section_slots().saturating_mul(GROWTH_MARGIN);
+
         updates.for_each(|(pos, layers)| {
             moved += 1;
 
@@ -514,11 +539,8 @@ impl WmRenderer {
             // what the view wants (see `grow_arena_if_asked`), and repeated asks coalesce into one marker,
             // but how many sections a frame's burst holds is not something this side knows - a margin that
             // claimed to cover it would be a guess dressed as a constant.
-            const GROWTH_MARGIN: u32 = 2;
-
             if !storage.at_capacity()
-                && storage.free_slots()
-                    < mc::chunk::largest_section_slots().saturating_mul(GROWTH_MARGIN)
+                && (storage.free_slots() < growth_margin || largest_run < growth_margin)
             {
                 let asking_at_a_refusal = storage.refusals_waiting() > 0
                     || scene

@@ -6851,6 +6851,14 @@ pub extern "C" fn render_terrain_pass(
     depth: &wgpu::TextureView,
     translucent: bool,
 ) -> bool {
+    // The one thread this renderer cannot afford to find on a slow core is the one this call runs
+    // on: every frame it is the thread that records the terrain, and a phone's scheduler parks it
+    // on the efficiency cluster whenever the bake pool looks busier. `affinity::pin_render_thread`
+    // answers "the performance cluster, once for this thread's life" - and on a device whose
+    // clusters cannot be read, or a build for a machine that has none, it is a call that does
+    // nothing. The common cost is one atomic load and a thread-id compare.
+    crate::affinity::pin_render_thread();
+
     // The graph opens a pass of its own, and wgpu allows one at a time: recording it inside one of
     // Minecraft's would leave the frame's recording in a state neither side can describe.
     let open = LIVE_PASS_COUNT.load(Ordering::Relaxed);
@@ -7312,12 +7320,26 @@ pub fn setRenderDistance(_env: JNIEnv, _class: JClass, chunks: jint) {
 
     let chunks = chunks.max(0);
     let previous = scene.section_storage.read().width();
-    // Capped by the device, not by a constant of this renderer's: `arena_slots` asks for 1.9 GB at 64
-    // chunks, which is a request for a buffer that may be larger than the device is willing to make -
-    // and a buffer that cannot be created is a validation error on the first write, which ends the
-    // process. `arena_cap_slots` is this device's own `max_buffer_size` in slots, read when the scene
-    // was made; past it the arena stops growing as well (see `WmRenderer::grow_arena`).
-    let wanted = wgpu_mc::mc::chunk::arena_slots(chunks as u32).min(scene.arena_cap_slots);
+
+    // **The pool's ceiling, not one buffer's.** This clamp used to be `scene.arena_cap_slots`, which
+    // is the ceiling on a *single* arena buffer - the smaller of `max_buffer_size` and the storage
+    // binding limit, in slots. The pool is up to `ARENA_BUFFERS` of those, so capping what the view
+    // asks for at one buffer's size is a clamp that bites exactly where buffers per-buffer caps
+    // always bite: on a device whose binding limit is small enough that one buffer is not a view.
+    // The user's own run was that device and that run - `arena_slots(12)` asks for 50,460,000 slots,
+    // `arena_cap_slots` on Adreno 640 is 33,554,432 (a 128 MiB binding over four bytes), and the
+    // clamp turned the report for 12 chunks into 33,554,432 - which is also what the pool already
+    // held. The late-report branch below then found `target > pool` false, asked for nothing, and
+    // the arena kept refusing sections at 39% held for the life of the world, each refusal sending
+    // one to Minecraft's own mesh and to the re-bake that offers it again.
+    //
+    // The ceiling the request is held under is the pool's: `ARENA_BUFFERS` buffers, or the memory
+    // budget, whichever is smaller. `set_arena_slots` splits the request into per-buffer pieces
+    // itself (see `split_arena_slots`), so a pool past one buffer's size is its ordinary job.
+    let pool_cap_slots = ((scene.arena_cap_slots as u64 * wgpu_mc::mc::ARENA_BUFFERS as u64)
+        .min(scene.arena_memory_budget / 4))
+    .min(u32::MAX as u64) as u32;
+    let wanted = wgpu_mc::mc::chunk::arena_slots(chunks as u32).min(pool_cap_slots);
 
     // The pool *and* the buffer it lives in, in one call, and only while the arena is empty - see
     // `Scene::set_arena_slots`. The report arrives when a world is joined, which is the moment the
@@ -7392,9 +7414,7 @@ pub fn setRenderDistance(_env: JNIEnv, _class: JClass, chunks: jint) {
         // a time. Only upwards: a report that asks for less than the pool already has is not a reason to
         // move it.
         let pool = scene.section_storage.read().pool_slots();
-        let target = wanted
-            .max(pool.saturating_mul(2))
-            .min(scene.arena_cap_slots);
+        let target = wanted.max(pool.saturating_mul(2)).min(pool_cap_slots);
 
         if target > pool {
             scene
@@ -7403,12 +7423,19 @@ pub fn setRenderDistance(_env: JNIEnv, _class: JClass, chunks: jint) {
         }
 
         if previous != chunks {
-            warn!(
-                "wgpu-mc: the render distance is now {chunks} chunk(s), which the arena cannot be \
-                 re-created for while it holds sections; it holds {} slot(s) and will grow to {target} \
-                 on the next frame",
-                pool
-            );
+            if target > pool {
+                warn!(
+                    "wgpu-mc: the render distance is now {chunks} chunk(s), which the arena cannot be \
+                     re-created for while it holds sections; it holds {pool} slot(s) and will grow to \
+                     {target} on the next frame"
+                );
+            } else {
+                warn!(
+                    "wgpu-mc: the render distance is now {chunks} chunk(s), which the arena cannot be \
+                     re-created for while it holds sections; it holds {pool} slot(s), which already \
+                     covers the {wanted} the view asks for"
+                );
+            }
         }
     }
 }

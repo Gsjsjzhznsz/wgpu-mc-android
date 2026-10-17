@@ -475,6 +475,46 @@ impl SectionStorage {
             .sum()
     }
 
+    /// **The longest run of free slots any single arena can hand out in one piece.**
+    ///
+    /// The number the growth trigger has to read, and the reason it exists is the run the user's own
+    /// log described: an arena at 39% of its pool, refusing sections. A pool is a set of contiguous
+    /// ranges per buffer, so "how much is free" and "what fits" are different questions - free slots
+    /// scattered as holes between held sections answer the first with twenty million and the second
+    /// with zero. [`Self::free_slots`] says what is free; this says what is *usable*, and the
+    /// difference between the two is fragmentation.
+    ///
+    /// The free runs are the gaps between the allocator's allocated ones, which `range_alloc` hands
+    /// over sorted by position - so the complement is walked rather than stored, and no allocator
+    /// state of our own can drift from its. Head and tail are gaps like any other: the arena starts
+    /// empty at slot zero, and the region above the highest held range is as allocatable as the one
+    /// below the lowest.
+    ///
+    /// Cost is one walk of the allocated ranges per arena - a few thousand entries against the
+    /// sections a settled world holds - which is why the caller runs this once per drain and not once
+    /// per section.
+    pub fn largest_free_run(&self) -> u32 {
+        self.arenas
+            .iter()
+            .map(|arena| {
+                let mut largest = 0u32;
+                let mut expected = 0u32;
+
+                for allocated in arena.allocator.allocated_ranges() {
+                    // Sorted, non-empty and non-overlapping, so the gap arithmetic cannot go
+                    // backwards; `max` keeps the invariant if a range ever did.
+                    largest = largest.max(allocated.start.saturating_sub(expected));
+                    expected = expected.max(allocated.end);
+                }
+
+                // The run above the last held range, which the loop above never sees: on a freshly
+                // bumped arena this is the whole pool, and it is the run every allocation lands in.
+                largest.max(arena.pool.saturating_sub(expected))
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Adds one more arena buffer of this many slots, and answers whether that was allowed.
     ///
     /// **This replaced growing a single buffer in place, and it is the better trade twice over.** The
@@ -6185,6 +6225,50 @@ mod arena_tests {
             }
             None => false,
         }
+    }
+
+    /// **The longest run is the usable space, and the total is not.**
+    ///
+    /// This is the shape the user's own run described: an arena 39% held, refusing sections. Eight
+    /// sections fill one arena end to end; every other one is freed; the total free is half the pool
+    /// and no run anywhere is longer than one section. A growth trigger that read the total would
+    /// never ask for room this arena does not have - which is why the trigger reads this.
+    #[test]
+    fn the_longest_free_run_is_the_usable_space_not_the_total() {
+        let mut storage = SectionStorage::with_arenas(vec![pool_for(8)]);
+
+        // Fresh, the run is the whole pool: every allocation lands in it.
+        assert_eq!(storage.largest_free_run(), pool_for(8));
+
+        for x in 0..8 {
+            assert!(put(&mut storage, IVec3::new(x, 0, 0), 1), "it fits");
+        }
+
+        assert_eq!(storage.largest_free_run(), 0, "full means no run at all");
+
+        // Every other section goes back - which is what the arena's trim and the refuse-and-resend
+        // churn do to a settled world, one section at a time, nowhere adjacent. The ranges go
+        // straight back to the allocator (the test has no frames in flight to wait out).
+        for x in [1, 3, 5, 7] {
+            let pos = IVec3::new(x, 0, 0);
+            let section = storage.storage.remove(&pos).expect("it was put");
+
+            for layer in section.layers.iter().flatten() {
+                storage.free_in(layer.buffer, layer.vertex_range.clone());
+                storage.free_in(layer.buffer, layer.index_range.clone());
+            }
+        }
+
+        assert_eq!(
+            storage.free_slots(),
+            pool_for(4),
+            "the total free is half the pool"
+        );
+        assert_eq!(
+            storage.largest_free_run(),
+            QUAD_SLOTS,
+            "and the longest run is one section - nothing larger fits"
+        );
     }
 
     /// The arena is sized once, while it is empty - which is what makes a render distance report
