@@ -164,7 +164,22 @@ object WgpuNative {
         @JvmStatic
         @Throws(IOException::class)
         fun load(name: String, forceOverwrite: Boolean) {
-                System.load(resolveNativeLibrary(name, forceOverwrite))
+                val path = resolveNativeLibrary(name, forceOverwrite)
+                try {
+                        System.load(path)
+                } catch (first: UnsatisfiedLinkError) {
+                        // A file that exists but refuses to load is not the library this jar carries:
+                        // a truncated copy from a run that was killed mid-extraction (the extraction
+                        // directory is a launcher cache that outlives the process), or debris from an
+                        // older build. Re-extract it from the jar once and load again; a second
+                        // failure is an honest answer about the jar itself and propagates.
+                        dev.birb.wgpu.WgpuMcMod.LOGGER.warn(
+                                "wgpu: the native at {} did not load ({}); re-extracting it from the mod jar and trying once more",
+                                path,
+                                first.message,
+                        )
+                        System.load(resolveNativeLibrary(name, true))
+                }
         }
 
         /**
@@ -188,7 +203,7 @@ object WgpuNative {
                 if (!libraryFile.exists() || forceOverwrite) {
                         libraryFile.parentFile?.mkdirs()
                         val roots = nativeResourceRoots()
-                        val resourceName = roots
+                        val located = roots
                                 .firstOrNull { WgpuNative::class.java.classLoader.getResource(it + mappedName) != null }
                                 // Belt and braces for a classloader that hides mod-jar resources from
                                 // `getResource` - NeoForge's union filesystem is the usual path and
@@ -203,27 +218,57 @@ object WgpuNative {
                                                 "native library for this device)"
                                 )
 
+                        // The roots answer with a directory prefix that needs the file name appended;
+                        // `scanJarEntries` answers with the whole entry name, already ending in it.
+                        // Appending onto *that* asked the classloader for
+                        // `...libwgpu_mc_jni.solibwgpu_mc_jni.so` and made the fallback a latent
+                        // NullPointerException - the union filesystem always answers for the roots,
+                        // so the broken arm had never actually been walked.
+                        val resourceName = if (located.endsWith(mappedName)) located else located + mappedName
+
                         dev.birb.wgpu.WgpuMcMod.LOGGER.info(
                                 "wgpu: extracting the native library from {} in the mod jar to {}",
                                 resourceName,
                                 libraryFile,
                         )
 
-                        WgpuNative::class.java.classLoader.getResourceAsStream(resourceName + mappedName).use { input ->
-                                try {
-                                        Files.copy(input!!, libraryFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
-                                } catch (denied: AccessDeniedException) {
-                                        // Windows keeps a loaded DLL locked until the process that mapped it exits,
-                                        // and two clients sharing a run directory is what that looks like: the copy
-                                        // cannot replace the file the other instance is running. The file that is
-                                        // there is the same library this build produced, so use it rather than
-                                        // refusing to start - the alternative is a crash on launch.
-                                        if (!libraryFile.exists()) throw denied
-                                        dev.birb.wgpu.WgpuMcMod.LOGGER.warn(
-                                                "wgpu: {} is locked by another process; using the copy already on disk",
-                                                libraryFile,
+                        try {
+                                val fromLoader = WgpuNative::class.java.classLoader.getResourceAsStream(resourceName)
+                                if (fromLoader != null) {
+                                        fromLoader.use { input ->
+                                                Files.copy(input, libraryFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
+                                        }
+                                } else if (!extractFromModJar(resourceName, libraryFile)) {
+                                        // `scanJarEntries` found the entry by reading the jar file itself,
+                                        // so neither source producing a stream means the jar changed
+                                        // underneath this call.
+                                        throw FileNotFoundException(
+                                                "the mod jar answered for $located but would not produce a stream for $resourceName"
                                         )
                                 }
+                        } catch (denied: AccessDeniedException) {
+                                // Windows keeps a loaded DLL locked until the process that mapped it exits,
+                                // and two clients sharing a run directory is what that looks like: the copy
+                                // cannot replace the file the other instance is running. The file that is
+                                // there is the same library this build produced, so use it rather than
+                                // refusing to start - the alternative is a crash on launch.
+                                if (!libraryFile.isFile || libraryFile.length() == 0L) throw denied
+                                dev.birb.wgpu.WgpuMcMod.LOGGER.warn(
+                                        "wgpu: {} is locked by another process; using the copy already on disk",
+                                        libraryFile,
+                                )
+                        } catch (failed: IOException) {
+                                // The extraction directory can refuse the write outright - a full data
+                                // partition, a remounted volume, a launcher cache wiped underneath a
+                                // concurrent run. A usable copy already on disk beats not starting;
+                                // `load` re-extracts and reports honestly when the JVM refuses the file.
+                                if (!libraryFile.isFile || libraryFile.length() == 0L) throw failed
+                                dev.birb.wgpu.WgpuMcMod.LOGGER.warn(
+                                        "wgpu: extracting to {} failed ({}); starting with the copy already on disk ({} bytes)",
+                                        libraryFile,
+                                        failed.message,
+                                        libraryFile.length(),
+                                )
                         }
 
                         // The symbols for that same build, next to the library - which is where a debugger looks
@@ -233,8 +278,45 @@ object WgpuNative {
                         // the same time as the library and for the same reason: the two are one build, and a
                         // PDB from the previous one no longer matches.
                         copySymbolsBeside(mappedName)
+                } else {
+                        dev.birb.wgpu.WgpuMcMod.LOGGER.info(
+                                "wgpu: reusing the native already on disk at {} ({} bytes)",
+                                libraryFile,
+                                libraryFile.length(),
+                        )
                 }
                 return libraryFile.absolutePath
+        }
+
+        /**
+         * Copies the jar entry [entryName] out of the mod jar file itself onto [target], answering
+         * whether it happened.
+         *
+         * This is the extraction arm for a classloader that would not hand the entry over as a
+         * resource stream - `scanJarEntries` found the name by reading this same file, so the entry
+         * is there to be read directly even when the loader refuses to serve it. A stream a
+         * `ZipFile` hands out dies with the file, so the copy happens inside the `use` block and
+         * the answer comes back as a Boolean rather than a stream.
+         */
+        private fun extractFromModJar(entryName: String, target: File): Boolean {
+                val jarFile = runCatching {
+                        val location = WgpuNative::class.java.protectionDomain.codeSource.location
+                        File(location.toURI()).takeIf { it.isFile }
+                }.getOrNull() ?: return false
+
+                return runCatching {
+                        java.util.zip.ZipFile(jarFile).use { zip ->
+                                val entry = zip.getEntry(entryName)
+                                if (entry == null) {
+                                        false
+                                } else {
+                                        zip.getInputStream(entry).use { input ->
+                                                Files.copy(input, target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+                                        }
+                                        true
+                                }
+                        }
+                }.getOrDefault(false)
         }
 
         /**
