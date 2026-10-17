@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use treeculler::{AABB, BVol, Frustum, Vec3};
-use wgpu::util::DeviceExt;
 
 use wgpu::{
     Color, IndexFormat, LoadOp, Operations, RenderPassColorAttachment,
@@ -86,10 +85,11 @@ struct VisibleSection {
 /// [`SectionDraw`] describes it.
 ///
 /// The gather produces *sections* and a draw needs *draws* - a section with two layers is two of them,
-/// and the record a draw reads is per draw rather than per section - so the pass builds this list once
+/// and the record a draw fetches is per draw rather than per section - so the pass builds this list once
 /// and both draw paths below walk it. `instance` is the index of the matching record, which is what the
-/// vertex stage receives as `instance_index`: through `first_instance` of an indirect record on the
-/// batched path, and through the instance range of a plain `draw_indexed` on the other.
+/// input assembler indexes the record buffer at: through `first_instance` of an indirect record on the
+/// batched path, and through the instance range of a plain `draw_indexed` on the other. The fetched
+/// attribute is the record; the shader never sees the number itself.
 ///
 /// Which layer a draw belongs to is not here: the list is built layer by layer and the pass keeps the
 /// span of each layer's run instead, so a layer's draws are a contiguous slice and the layer is already
@@ -120,7 +120,7 @@ const INDIRECT_RECORD_SIZE: u64 = std::mem::size_of::<wgpu::util::DrawIndexedInd
 ///
 /// See the shader's `SectionPosition` for what each one means and `SectionDraw` for the three that are
 /// *not* here - the section's position, which a `multi_draw` cannot be told per draw and which travels
-/// in the storage buffer instead.
+/// in the instance-step vertex buffer instead.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 struct SectionPositionImmediate {
@@ -1462,12 +1462,10 @@ impl RenderGraph {
                     BindGroupDef::Resource(resource) => {
                         match (&resource[..], &custom_bind_groups) {
                             ("@bg_ssbo_chunks", _) => wm.bind_group_layouts.get("ssbo").unwrap(),
-                            // The draw arguments a terrain pass writes and reads back. A layout of its
-                            // own rather than `ssbo`, because it is visible to the vertex stage alone -
-                            // see the entry in `create_bind_group_layouts`.
-                            ("@bg_section_draws", _) => {
-                                wm.bind_group_layouts.get("section_draws").unwrap()
-                            }
+                            // (`@bg_section_draws` was here: the draw records were a storage binding at
+                            // group 2, and they are a vertex buffer now - see `Scene::section_draws`
+                            // and the note in `terrain.wgsl`. A shader that names it again fails to
+                            // build here, which is the shape of a mistake worth a failure.)
                             ("@bg_entity", _) => wm.bind_group_layouts.get("entity").unwrap(),
                             (_, Some(custom)) => {
                                 if let Some(entry) = custom.get(resource) {
@@ -1635,7 +1633,9 @@ impl RenderGraph {
             };
 
             let vertex_buffer = match &pipeline_config.geometry[..] {
-                "@geo_terrain" | "@geo_terrain_translucent" => vec![],
+                "@geo_terrain" | "@geo_terrain_translucent" => {
+                    vec![crate::mc::SectionDraw::vertex_layout()]
+                }
                 "@geo_entities" => vec![EntityVertex::desc(), InstanceVertex::desc()],
                 "@geo_quad" => vec![QuadVertex::desc()],
                 "@geo_sun_moon" => vec![SunMoonVertex::desc()],
@@ -2706,7 +2706,7 @@ impl RenderGraph {
             // pass has a slot of its own. See `SECTION_DRAW_SLOTS`.
             if !draws.records.is_empty() {
                 wm.gpu.queue.write_buffer(
-                    &scene.section_draws[slot].buffer,
+                    &scene.section_draws[slot],
                     0,
                     bytemuck::cast_slice(&draws.records),
                 );
@@ -2730,9 +2730,9 @@ impl RenderGraph {
                         // index buffer holds the section's own indices - so the arena slot is in the
                         // record instead. See `SectionDraw`.
                         base_vertex: 0,
-                        // **Which record this draw is.** The vertex stage reads
-                        // `section_draws[instance_index]`, and for an indirect draw this is the only
-                        // channel there is for anything per draw.
+                        // **Which record this draw fetches.** The input assembler indexes the record
+                        // buffer at this number, and for an indirect draw this is the only channel
+                        // there is for anything per draw.
                         first_instance: call.instance,
                     })
                     .collect::<Vec<_>>();
@@ -2964,30 +2964,14 @@ impl RenderGraph {
                     // Everything the pipeline binds that is *not* the arena: the matrices, the two
                     // atlases and their samplers, the lightmap, the fog block. The arena's own group is
                     // left out here and bound per section, because which arena a draw reads is a property
-                    // of the section rather than of the pass.
+                    // of the section rather than of the pass. (`@bg_section_draws` used to be in this
+                    // loop too, and it is gone with the storage binding it named - the records are a
+                    // vertex buffer now, bound below.)
                     for (index, bind_group) in bound_pipeline.bind_groups.iter() {
                         match bind_group {
                             WmBindGroup::Resource(name) => match &name[..] {
                                 // Bound per draw - see `bound_arena`.
                                 "@bg_ssbo_chunks" => {}
-                                // Bound once for the whole pass, which is the point of the buffer: a
-                                // `multi_draw` cannot be told anything per draw, so the section's
-                                // position and its arena slot travel in this buffer and the vertex
-                                // stage reads them by `instance_index`. Written below, before the first
-                                // draw of this pass and after the gather that decides what goes in it.
-                                "@bg_section_draws" => {
-                                    let Some(slot) = bound_pipeline.draw_slot else {
-                                        // Unreachable: a pipeline draws terrain only if it claimed a
-                                        // slot, and one that could not is not in the graph at all.
-                                        continue;
-                                    };
-
-                                    render_pass.set_bind_group(
-                                        *index,
-                                        &scene.section_draws[slot].bind_group,
-                                        &[],
-                                    );
-                                }
                                 _ => unimplemented!(),
                             },
                             WmBindGroup::Custom(bind_group) => {
@@ -2995,6 +2979,15 @@ impl RenderGraph {
                             }
                         }
                     }
+
+                    // **The draw records are a vertex buffer, and this is the one bind for the pass.**
+                    // One instance-step attribute fetches the section's position and its arena slot off
+                    // the very allocation the frame build uploaded the records to, and the fetch is
+                    // per draw because each record's `first_instance` offsets it - the same channel
+                    // the batching always had, consumed by the input assembler now instead of by the
+                    // shader's `instance_index` builtin. Every draw of this pass reads this one buffer,
+                    // so it binds once here and never again.
+                    render_pass.set_vertex_buffer(0, scene.section_draws[draw_slot].slice(..));
 
                     // Arena 0 is bound before the first draw and rebound whenever a section names a
                     // different one: a bind group and an index buffer are per arena, and both have to
@@ -3288,7 +3281,8 @@ impl RenderGraph {
                             //
                             // The picture is the same either way, and by construction rather than by
                             // care: the same records in the same order, the same shader, and the same
-                            // `instance_index` - a record's own number - reaching it.
+                            // instance indexing - the record buffer addressed at the record's own
+                            // number - reaching the fetch.
                             for call in &draws.calls[*start..*end] {
                                 // **Rebind when the section lives in a different arena.** The bind group
                                 // is the storage buffer the vertex stage reads `chunk_data` out of and
@@ -3306,8 +3300,8 @@ impl RenderGraph {
                                     bound_arena = Some(call.arena);
                                 }
 
-                                // One instance, and its number is which record the vertex stage is to
-                                // read - the number the batched path writes into `first_instance`.
+                                // One instance, and its number is which record the input assembler is
+                                // to fetch - the number the batched path writes into `first_instance`.
                                 render_pass.draw_indexed(
                                     call.index_range.clone(),
                                     0,
@@ -4432,22 +4426,20 @@ mod binding_visibility_tests {
         }
     }
 
-    /// **The size of one draw's record, on both sides of it.**
+    /// **The size and the shape of one draw's record, on both sides of it.**
     ///
-    /// The pass writes `SectionDraw` as a flat array of `#[repr(C)]` structs and the vertex stage reads
-    /// `section_draws[instance_index]` out of the same bytes, so the two have to agree on the stride.
-    /// wgpu would not refuse a disagreement: the buffer is bound as an untyped run of bytes and only the
-    /// shader knows where a record starts, so a shader that read 32 bytes per record would take the
-    /// next draw's `x` as this one's `word_base` - and what that looks like is sections drawn at other
-    /// sections' positions and vertices read from other sections' slots, not an error anywhere.
-    ///
-    /// Every member of both is a four-byte scalar, so the struct's size is its stride; the assertion is
-    /// written against the size because that is the number naga will give.
+    /// The pass writes `SectionDraw` as a flat array of `#[repr(C)]` structs and the input assembler
+    /// fetches the same bytes through `SectionDraw::vertex_layout`, so the layout's stride is the
+    /// struct's size, the step is the instance one, and the one attribute is a four-`i32` vector at
+    /// location 0 - because that is exactly the input the terrain shaders' `vert` declares. A
+    /// disagreement in any of those is sections drawn at other sections' positions and vertices read
+    /// from other sections' slots, and none of it is an error anywhere: the buffer is a run of bytes
+    /// to the GPU, and only this contract keeps the fetch pointed at the right words.
     ///
     /// The two shaders are read out of the Neolectrum checkout; without a checkout the check is skipped
     /// rather than failed.
     #[test]
-    fn a_draw_record_is_the_size_the_shader_strides_over() {
+    fn a_draw_record_is_the_size_the_shader_fetches() {
         let Some(terrain) = modtree::shader("terrain") else {
             modtree::skip("the draw-record checks");
             return;
@@ -4458,49 +4450,91 @@ mod binding_visibility_tests {
             return;
         };
 
+        let layout = crate::mc::SectionDraw::vertex_layout();
+
+        assert_eq!(
+            layout.array_stride as usize,
+            std::mem::size_of::<crate::mc::SectionDraw>(),
+            "the record buffer's stride is the record's size, and the record the pass writes is {} \
+             bytes",
+            std::mem::size_of::<crate::mc::SectionDraw>()
+        );
+        assert_eq!(
+            layout.step_mode,
+            wgpu::VertexStepMode::Instance,
+            "the record is fetched per draw, which is what the instance step is for - a vertex step \
+             would fetch one record per vertex and every corner of every quad would read the same one"
+        );
+        assert_eq!(layout.attributes.len(), 1);
+        assert_eq!(layout.attributes[0].format, wgpu::VertexFormat::Sint32x4);
+        assert_eq!(layout.attributes[0].offset, 0);
+        assert_eq!(layout.attributes[0].shader_location, 0);
+
         for (name, source) in [
             ("terrain", terrain.as_str()),
             ("terrain_solid", terrain_solid.as_str()),
         ] {
             let module = naga::front::wgsl::parse_str(source).expect("the terrain shader parses");
 
-            let structure = module
-                .types
+            // The record arrives as the `vert` entry point's `@location(0)` argument - the WGSL front
+            // end keeps an input where it was declared, and this fork's naga carries locations on
+            // entry-point arguments only.
+            let entry = module
+                .entry_points
                 .iter()
-                .find(|(_, ty)| ty.name.as_deref() == Some("SectionDraw"))
-                .map(|(handle, _)| handle)
-                .unwrap_or_else(|| panic!("{name}.wgsl declares no `SectionDraw`"));
+                .find(|entry| entry.stage == naga::ShaderStage::Vertex && entry.name == "vert")
+                .expect("the terrain shader has a `vert` entry point");
 
-            let size = module.types[structure].inner.size(module.to_ctx());
+            let argument_ty = entry
+                .function
+                .arguments
+                .iter()
+                .find(|argument| {
+                    matches!(
+                        argument.binding,
+                        Some(naga::Binding::Location { location: 0, .. })
+                    )
+                })
+                .map(|argument| argument.ty)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name}.wgsl's vertex stage declares no `@location(0)` input, and that is \
+                         where the draw record is fetched from"
+                    )
+                });
 
-            assert_eq!(
-                size as usize,
-                std::mem::size_of::<SectionDraw>(),
-                "{name}.wgsl's `SectionDraw` is {size} bytes and the one the pass writes is {} - the \
-                 records are a flat array, so a different stride is every draw reading its neighbour's \
-                 fields",
-                std::mem::size_of::<SectionDraw>()
+            assert!(
+                matches!(
+                    module.types[argument_ty].inner,
+                    naga::TypeInner::Vector {
+                        size: naga::VectorSize::Quad,
+                        scalar: naga::Scalar {
+                            kind: naga::ScalarKind::Sint,
+                            width: 4
+                        },
+                    }
+                ),
+                "{name}.wgsl's `@location(0)` input is not a `vec4<i32>`, and the attribute the \
+                 layout fetches is one - the four words of `SectionDraw` in declaration order"
             );
         }
     }
 
-    /// **`section_draws` is visible to the vertex stage alone, and this is the half of that a layout
-    /// cannot check for itself.**
+    /// **The draw records bind no group any more, and this is the half of that a layout cannot check
+    /// for itself.**
     ///
-    /// The layout in `create_bind_group_layouts` declares `ShaderStages::VERTEX` for this one binding -
-    /// the only binding in this renderer narrower than both stages - and that is legal exactly as long
-    /// as no other stage names it. If one ever does, wgpu refuses to build the pipeline:
-    ///
-    /// ```text
-    /// Shader global ResourceBinding { group: 2, binding: 0 } is not available in the pipeline layout
-    /// ```
-    ///
-    /// and that refusal arrives as a panic inside a `#[jni_fn]` frame, which ends the game rather than
-    /// the draw. Both terrain shaders, because one is a copy of the other and a change made to one of
-    /// them is exactly the shape this is here to catch. They are read out of the Neolectrum checkout, so
-    /// a clone of this repository without the mod skips the check rather than failing it.
+    /// They were a storage binding at group 2, visible to the vertex stage alone, and both halves of
+    /// that sentence had a test: the visibility one - a fragment read of a vertex-only binding is a
+    /// pipeline wgpu refuses to build, and a refusal on this path ends the process - and the fetch is
+    /// an attribute now, which leaves the stronger half: **no stage of either terrain shader may name
+    /// group 2 at all.** The graph's layout resolver has no answer for a group it does not know, and a
+    /// binding that reached the layout without a `BindGroupDef` behind it would be a missing bind
+    /// group at the draw rather than an error at the build. Both shaders, because one is a copy of the
+    /// other and a change made to one of them is exactly the shape this is here to catch. They are
+    /// read out of the Neolectrum checkout, so a clone of this repository without the mod skips the
+    /// check rather than failing it.
     #[test]
-    fn the_draw_records_are_read_by_the_vertex_stage_alone() {
+    fn the_draw_records_bind_no_group_any_more() {
         let Some(terrain) = modtree::shader("terrain") else {
             modtree::skip("the draw-record visibility checks");
             return;
@@ -4518,24 +4552,10 @@ mod binding_visibility_tests {
             let used = sampled(source);
 
             assert!(
-                used.iter().any(|(stage, kind, group, binding)| {
-                    *stage == naga::ShaderStage::Vertex
-                        && *group == 2
-                        && *binding == 0
-                        && *kind == ResourceKind::Storage
-                }),
-                "{name}.wgsl's vertex stage has to read group 2 binding 0 - the record with the \
-                 section's position and its arena slot in it - so if it no longer does, this test is \
-                 about nothing and the layout can be narrowed or the batching removed: {used:?}"
-            );
-
-            assert!(
-                !used.iter().any(|(stage, _, group, binding)| {
-                    *stage == naga::ShaderStage::Fragment && *group == 2 && *binding == 0
-                }),
-                "{name}.wgsl's fragment stage names group 2 binding 0, and the layout declares that \
-                 binding visible to the vertex stage only - which is a pipeline wgpu refuses to build, \
-                 and a refusal on this path ends the process"
+                !used.iter().any(|(_, _, group, _)| *group == 2),
+                "{name}.wgsl names group 2, and the draw records are a vertex buffer now - there is \
+                 no group behind them to bind, so a shader that reaches for one again is a missing \
+                 bind group at the draw rather than a working one: {used:?}"
             );
         }
     }

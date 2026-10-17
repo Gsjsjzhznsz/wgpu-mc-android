@@ -62,7 +62,6 @@ pipelines:
         16: "@texture_mc_block_atlas"
         17: "@texture_mc_block_atlas"
       1: "@bg_ssbo_chunks"
-      2: "@bg_section_draws"
     immediates:
       0: "@pc_section_position"
 
@@ -103,7 +102,6 @@ pipelines:
         16: "@texture_mc_block_atlas"
         17: "@texture_mc_block_atlas"
       1: "@bg_ssbo_chunks"
-      2: "@bg_section_draws"
     immediates:
       0: "@pc_section_position"
 
@@ -157,7 +155,6 @@ pipelines:
         16: "@texture_mc_block_atlas"
         17: "@texture_mc_block_atlas"
       1: "@bg_ssbo_chunks"
-      2: "@bg_section_draws"
     immediates:
       0: "@pc_section_position"
 

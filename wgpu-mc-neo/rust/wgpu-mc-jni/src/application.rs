@@ -328,13 +328,19 @@ mod tests {
 
         for (name, pipeline) in terrain {
             assert!(
+                pipeline.bind_groups.get(&2).is_none(),
+                "the '{name}' pipeline binds a group 2, and the terrain pipelines have nothing to \
+                 bind there: the draw records are a vertex buffer now (`SectionDraw::vertex_layout` \
+                 in `mc/mod.rs`), and a group in the layout without a bind behind it is a missing \
+                 bind group at the draw"
+            );
+            assert!(
                 matches!(
-                    pipeline.bind_groups.get(&2),
-                    Some(BindGroupDef::Resource(resource)) if resource == "@bg_section_draws"
+                    pipeline.bind_groups.get(&1),
+                    Some(BindGroupDef::Resource(resource)) if resource == "@bg_ssbo_chunks"
                 ),
-                "the '{name}' pipeline has to bind the draw records at group 2: the section's position \
-                 travels in that buffer now, because a `multi_draw` cannot be handed an immediate per \
-                 draw"
+                "the '{name}' pipeline has to bind the arena at group 1, which is where the vertex \
+                 stage reads `chunk_data` from"
             );
         }
     }

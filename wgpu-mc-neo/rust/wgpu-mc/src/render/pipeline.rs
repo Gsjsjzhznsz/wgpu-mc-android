@@ -465,31 +465,9 @@ pub fn create_bind_group_layouts(device: &wgpu::Device) -> HashMap<String, BindG
                 ],
             }),
         ),
-        (
-            "section_draws".into(),
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Section Draw Bind Group Layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    // **The vertex stage alone**, which is the one thing about this layout that can be
-                    // wrong in a way wgpu refuses rather than in a way a picture shows: the fragment stage
-                    // never reads a draw's record, and a binding declared visible to one stage and named by
-                    // the other is a pipeline wgpu will not build - and a refusal on this path ends the
-                    // process. The test that reads both terrain shaders for exactly that is
-                    // `the_draw_records_are_read_by_the_vertex_stage_alone` in `graph.rs`.
-                    //
-                    // Read-only, because the pass only reads it: the records are written with
-                    // `Queue::write_buffer`, which is not a shader store.
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-            }),
-        ),
+        // (`section_draws` was here: a vertex-stage-only storage layout for the draw records at
+        // group 2. The records are a vertex buffer now - see `SectionDraw::vertex_layout` in
+        // `mc/mod.rs` - so there is no group and no layout behind them any more.)
     ]
     .into_iter()
     .collect()

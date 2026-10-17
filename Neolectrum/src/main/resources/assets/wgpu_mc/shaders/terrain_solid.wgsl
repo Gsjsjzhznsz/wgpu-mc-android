@@ -182,18 +182,12 @@ struct FogEnvironment {
 
 @group(1) @binding(0) var<storage> chunk_data: array<u32>;
 
-// **What one draw of this pass is, indexed by `instance_index`.** The same four members and the same
-// two hundred bytes of reasoning as `terrain.wgsl`, which is where the note is: `instance_index` is the
-// only channel a `multi_draw_indexed_indirect` has for anything per draw, and the two paths - batched
-// and one call per section - read this same record, so which one drew the frame is not visible in it.
-struct SectionDraw {
-    x: i32,
-    y: i32,
-    z: i32,
-    word_base: u32,
-};
-
-@group(2) @binding(0) var<storage> section_draws: array<SectionDraw>;
+// **What one draw of this pass is: a vertex attribute, fetched instance-stepped.** The same four words
+// and the same reasoning as `terrain.wgsl`, which is where the full note is: the record travels through
+// one `Sint32x4` at location 0, sixteen bytes, instance-stepped, and the record number reaches the
+// fetch through the record's `first_instance` - the fixed-function instance indexing, not the shader's
+// `instance_index` builtin, which is the path a driver failed to propagate on the first device the
+// batched draw turned on on.
 
 struct VertexResult {
     @builtin(position) pos: vec4<f32>,
@@ -250,15 +244,14 @@ struct VertexResult {
     @interpolate(flat) @location(22) lod_floor: u32
 };
 
-// What one terrain draw is told about itself **beyond its own `SectionDraw`**: the alpha cutoff its
+// What one terrain draw is told about itself **beyond its own draw record**: the alpha cutoff its
 // layer asks for, and the five per-frame numbers about the two atlases. Seven `u32`s, twenty-eight
 // bytes, and no padding - which is the size the pass declares for them (see `@pc_section_position` in
 // `graph.yaml` and the sizes in `RenderGraph::new`).
 //
 // **The section's x, y and z are not here any more.** They are per draw, and the batched path is one
-// call for thousands of draws - so they are in `section_draws`, which the vertex stage indexes by
-// `instance_index`. The `SectionDraw` struct above `chunk_data` carries the whole of it, and
-// `terrain.wgsl` documents it.
+// call for thousands of draws - so they travel in the instance-step vertex attribute this file's
+// `vert` fetches, and `terrain.wgsl` documents the whole of it.
 struct SectionPosition {
     // **Declared and never read.** Minecraft's own `SOLID_TERRAIN` defines no `ALPHA_CUTOUT` at all,
     // and the point of this file is that neither does it - there is no test at the fragment stage, so
@@ -294,16 +287,16 @@ var<immediate> section_pos: SectionPosition;
 @vertex
 fn vert(
     @builtin(vertex_index) vi: u32,
-    // The index of this draw's record. See `SectionDraw` above for why it is not the arena slot any
-    // more, and `terrain.wgsl` for the whole of it.
-    @builtin(instance_index) instance: u32
+    // **This draw's record, fetched by the input assembler.** See the note above `VertexResult` and
+    // the one in `terrain.wgsl` for why the record is an attribute rather than a binding the stage
+    // indexes by `instance_index`.
+    @location(0) draw_record: vec4<i32>
 ) -> VertexResult {
 //    var vert1_i = (vi >> 2) << 4;
 //    var vert1_i = (vi << 2) & 0xfffffffc;
 //    var vert1_i = ((vi >> 2u) << 2u)+base_vertex;
 
-    let draw = section_draws[instance];
-    let base_vertex = draw.word_base;
+    let base_vertex = u32(draw_record.w);
     var offset = vi & 3;
     var vert1_i = vi & ~3u;
 
@@ -405,7 +398,8 @@ fn vert(
     // No flag test and no `16.0` here any more: see the decode above for where those three bits went.
     var pos = vec3<f32>(x, y, z);
 
-    var section_origin = vec3<f32>(f32(draw.x), f32(draw.y), f32(draw.z)) * 16.0;
+    var section_origin =
+        vec3<f32>(f32(draw_record.x), f32(draw_record.y), f32(draw_record.z)) * 16.0;
     var world_pos = pos + section_origin;
 
     vr.pos = mat4_persp * mat4_view * mat4_model * vec4(world_pos, 1.0);

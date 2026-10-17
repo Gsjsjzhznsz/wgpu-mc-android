@@ -737,6 +737,305 @@ pub fn can_batch_terrain_draws() -> bool {
     MULTI_DRAW.load(std::sync::atomic::Ordering::Relaxed) & (1 | 2 | 8) == (1 | 2 | 8)
 }
 
+/// What the first-instance probe concluded: 0 not run, 1 passed, 2 failed.
+///
+/// Recorded where the device is created and reported later, for the reason [`MULTI_DRAW`] is: the
+/// probe runs beside it, before anything is listening to the log, and the per-world capability report
+/// is where its answer has to be readable.
+static FIRST_INSTANCE_PROBE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The number each probe record carries in its `x`, one more per record.
+///
+/// A base of 100 rather than 0 is the whole point: a driver that does not fetch the record returns
+/// **zero** for every draw (an unbound or unfetched attribute reads zero), and zeros are also what a
+/// cleared target holds - so a probe asking for 0..3 could pass on a clear and a no-fetch both. 100,
+/// 101, 102, 103 distinguishes fetched from cleared, and distinguishes "every draw fetched record 0"
+/// - the collapsed world, the D3D12 `SV_InstanceID` signature - from both.
+const PROBE_SENTINELS: [u32; 4] = [100, 101, 102, 103];
+
+/// Whether the readback the probe asked for came back with one sentinel per pixel, in order.
+///
+/// Split out from the GPU work so the shape of a failure can be tested without a device: a collapsed
+/// fetch (every pixel carrying record 0's number), a dead fetch (every pixel zero) and a cleared
+/// target (every pixel 999) are three different driver answers and all three fail here.
+fn the_probe_records_came_back(readback: &[u32]) -> bool {
+    readback.len() == PROBE_SENTINELS.len()
+        && readback
+            .iter()
+            .zip(PROBE_SENTINELS)
+            .all(|(got, want)| *got == want)
+}
+
+/// Whether `first_instance` of an indirect record reaches the vertex fetch on this device, **asked
+/// with the shapes the terrain pass itself draws with**.
+///
+/// Why a probe at all: the batched terrain path carries each draw's record number in the record's
+/// `first_instance`, and *something* has to turn that number into the address the record is fetched
+/// at. The adapters that answer wgpu's `INDIRECT_FIRST_INSTANCE` question are trusted to have answered
+/// honestly, and the first device the batching turned on on - an Adreno 640 - answered honestly and
+/// then drew a world that was hollow: the signature of a driver that accepts a non-zero
+/// `firstInstance` and does not carry it through. A capability bit is a driver quoting its own
+/// documentation; a probe is the driver doing the thing.
+///
+/// What it does: four records, four pixels, one render. Each record carries one sentinel in its
+/// `SectionDraw::x` (100, 101, 102, 103) and draws one pixel of a 4x1 `R32Uint` target through
+/// `multi_draw_indexed_indirect` - the same call, the same `SectionDraw::vertex_layout` instance-step
+/// attribute, the same `first_instance`-per-record convention the terrain pass uses. The target is
+/// read back and compared against the sentinels: one per pixel, in order, or the fetch does not work
+/// and the batched path must not be allowed on this device.
+///
+/// The caller answers a `false` by taking the batching away
+/// (`set_terrain_batching_possible(false)`), which is the same answer the DX12 exclusion gives - and
+/// the same one it logs, a per-section fallback that draws correctly and slowly rather than a batched
+/// one that draws wrongly.
+///
+/// Runs once per device, right after the device exists: before any pipeline of the game is compiled,
+/// against buffers that live and die inside this function. It logs nothing - nothing is listening
+/// yet - and records its answer into [`FIRST_INSTANCE_PROBE`] for the per-world report to carry.
+pub fn probe_first_instance_fetch(device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+    const RECORDS: u64 = 4;
+    const INDICES_PER_RECORD: u64 = 6;
+
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("wgpu-mc: the first-instance probe"),
+        source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
+            r#"
+            // wgpu-mc: the first-instance probe. Four records, four pixels: record r carries the
+            // sentinel 100 + r in its `x` and draws pixel r, and the readback has to name them in
+            // order. One vertex per index, indexed so that `vi >> 2` is the pixel and `vi & 3` the
+            // corner of the quad that covers it.
+            struct ProbeOut {
+                @builtin(position) pos: vec4<f32>,
+                @location(0) @interpolate(flat) record: u32,
+            }
+
+            @vertex
+            fn vert(
+                @builtin(vertex_index) vi: u32,
+                @location(0) draw_record: vec4<i32>,
+            ) -> ProbeOut {
+                let pixel = f32(vi >> 2u);
+                let corner = vi & 3u;
+                let x = pixel * 0.5 - 1.0 + f32(corner & 1u) * 0.5;
+                let y = f32(corner >> 1u) * 2.0 - 1.0;
+
+                var out: ProbeOut;
+                out.pos = vec4<f32>(x, y, 0.0, 1.0);
+                out.record = u32(draw_record.x);
+                return out;
+            }
+
+            @fragment
+            fn frag(in: ProbeOut) -> @location(0) u32 {
+                return in.record;
+            }
+            "#,
+        )),
+    });
+
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("wgpu-mc: the first-instance probe"),
+        layout: None,
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vert"),
+            compilation_options: Default::default(),
+            buffers: &[Some(wgpu_mc::mc::SectionDraw::vertex_layout())],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("frag"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::R32Uint,
+                blend: None,
+                write_mask: wgpu::ColorWrites::default(),
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    // The records: one sentinel each, in the very struct the pass uploads.
+    let instances = (0..RECORDS)
+        .map(|r| wgpu_mc::mc::SectionDraw {
+            x: PROBE_SENTINELS[r as usize] as i32,
+            y: 0,
+            z: 0,
+            word_base: 0,
+        })
+        .collect::<Vec<_>>();
+
+    let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu-mc: the first-instance probe records"),
+        size: RECORDS * std::mem::size_of::<wgpu_mc::mc::SectionDraw>() as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::VERTEX,
+        mapped_at_creation: false,
+    });
+
+    // The indices: per record, the six corners of the two triangles that cover its pixel. Filled
+    // through `create_buffer_with_contents` rather than `DeviceExt::create_buffer_init` for the same
+    // reason the rest of this file is - a refused creation is a log line, not a panic.
+    let mut indices = Vec::with_capacity((RECORDS * INDICES_PER_RECORD) as usize);
+    for pixel in 0..RECORDS as u32 {
+        let base = pixel * 4;
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+
+    let index_buffer = create_buffer_with_contents(
+        device,
+        "wgpu-mc: the first-instance probe indices",
+        wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::INDEX,
+        bytemuck::cast_slice(&indices),
+    );
+
+    let indirect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu-mc: the first-instance probe indirect records"),
+        size: RECORDS * std::mem::size_of::<wgpu::util::DrawIndexedIndirectArgs>() as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::INDIRECT,
+        mapped_at_creation: false,
+    });
+
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("wgpu-mc: the first-instance probe target"),
+        size: wgpu::Extent3d {
+            width: RECORDS as u32,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Uint,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+    // One readback row, padded the way a copy has to be: 256 bytes to the row, whatever the width.
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu-mc: the first-instance probe readback"),
+        size: 256,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    queue.write_buffer(&instance_buffer, 0, bytemuck::cast_slice(&instances));
+
+    let args = (0..RECORDS)
+        .map(|r| wgpu::util::DrawIndexedIndirectArgs {
+            index_count: INDICES_PER_RECORD as u32,
+            instance_count: 1,
+            first_index: (r * INDICES_PER_RECORD) as u32,
+            base_vertex: 0,
+            // The whole question, one number per record: the input assembler has to index the record
+            // buffer here, or the sentinel does not arrive.
+            first_instance: r as u32,
+        })
+        .collect::<Vec<_>>();
+
+    queue.write_buffer(&indirect_buffer, 0, bytemuck::cast_slice(&args));
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("wgpu-mc: the first-instance probe"),
+    });
+
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("wgpu-mc: the first-instance probe"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    // 999 in every pixel before the draw, so a draw that never happened cannot be
+                    // mistaken for one that drew the wrong thing.
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 999.0,
+                        g: 999.0,
+                        b: 999.0,
+                        a: 999.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+
+        pass.set_pipeline(&pipeline);
+        pass.set_vertex_buffer(0, instance_buffer.slice(..));
+        pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        pass.multi_draw_indexed_indirect(&indirect_buffer, 0, RECORDS as u32);
+    }
+
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(256),
+                rows_per_image: Some(1),
+            },
+        },
+        wgpu::Extent3d {
+            width: RECORDS as u32,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    queue.submit([encoder.finish()]);
+
+    let slice = readback.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+
+    if device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
+        .is_err()
+    {
+        return false;
+    }
+
+    if receiver.recv().is_err() {
+        return false;
+    }
+
+    let Ok(data) = slice.get_mapped_range() else {
+        return false;
+    };
+
+    let words: &[u32] = bytemuck::cast_slice(&data[..16]);
+    let answer = the_probe_records_came_back(words);
+
+    drop(data);
+    readback.unmap();
+
+    FIRST_INSTANCE_PROBE.store(
+        if answer { 1 } else { 2 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
+    answer
+}
+
 /// Writes the lines about what the device can do, from somewhere the log is actually listening.
 ///
 /// Called once per world, beside the arena sizing, which is a line that is known to reach the log -
@@ -758,11 +1057,12 @@ fn report_device_capabilities() {
     // `terrain_indirect` is a switch, and this is the setting *and* the hardware *and* the backend
     // resolved into the one flag the draw path reads. See `debug::apply`.
     //
-    // **The three ways it can be off are named separately**, because they call for different things: a
-    // switch that is off is a setting, a device that cannot is hardware, and DirectX 12 is a defect in
-    // the backend's multi-draw indirect (see `try_create_renderer`). A single "the switch is off, or it
-    // is DX12" was the first version of this line and it is the reason the wiring bug it hid took a run
-    // to find.
+    // **The ways it can be off are named separately**, because they call for different things: a
+    // switch that is off is a setting, a device that cannot is hardware, DirectX 12 is a defect in
+    // the backend's multi-draw indirect (see `try_create_renderer`), and a failed probe is a driver
+    // that reported a feature and then did not carry it through (see `probe_first_instance_fetch`).
+    // A single "the switch is off, or it is DX12" was the first version of this line and it is the
+    // reason the wiring bug it hid took a run to find.
     info!(
         "wgpu-mc: the terrain pass is drawing {}",
         if wgpu_mc::render::graph::terrain_batches_draws() {
@@ -778,6 +1078,11 @@ fn report_device_capabilities() {
              buffer read per draw on top"
         } else if !wgpu_mc::render::graph::terrain_indirect_requested() {
             "one section at a time: the `terrain_indirect` switch is off, and this device could batch"
+        } else if FIRST_INSTANCE_PROBE.load(Ordering::Relaxed) == 2 {
+            "one section at a time, because the first-instance probe failed: this driver accepts a \
+             non-zero `first_instance` in an indirect record and does not fetch the matching record \
+             with it, so every section would be drawn out of somebody else's geometry - the defect \
+             the probe exists to catch. See `probe_first_instance_fetch`"
         } else {
             "one section at a time: this is the DirectX 12 backend, where wgpu's implementation of \
              multi-draw indirect is broken, so the terrain pass is not allowed to use it - every \
@@ -785,6 +1090,25 @@ fn report_device_capabilities() {
              `try_create_renderer`"
         }
     );
+
+    // What the probe itself said, which is a sentence about honesty rather than about capability: a
+    // driver can report every bit above and still not fetch what a batched draw asks it to. The
+    // three answers are named, because "not run" is itself information - it means the batching was
+    // never going to happen anyway.
+    match FIRST_INSTANCE_PROBE.load(Ordering::Relaxed) {
+        1 => info!(
+            "wgpu-mc: the first-instance probe drew four records and read its four sentinels back in \
+             order: the batched path's per-draw channel works on this driver"
+        ),
+        2 => info!(
+            "wgpu-mc: the first-instance probe did not read its sentinels back in order, and the \
+             terrain pass will not batch on this driver"
+        ),
+        _ => info!(
+            "wgpu-mc: the first-instance probe did not run, because the batching was already ruled \
+             out by the adapter or the backend"
+        ),
+    }
 
     info!(
         "wgpu-mc: anisotropic filtering is {} on this device, and the atlas samplers ask for \
@@ -1180,6 +1504,19 @@ fn try_create_renderer(
             );
         }
     });
+
+    // **The probe that asks whether the batched path's one per-draw channel actually works here.**
+    // Everything above is what the adapter claims; this is the device doing the thing. A `false`
+    // takes the batching away for the life of the device - the same answer the DX12 exclusion gives,
+    // and the same fallback: one draw per section, correct and slow. Runs before any pipeline of the
+    // game is compiled, so a driver that chokes on the probe does not get to choke on anything else
+    // first. See `probe_first_instance_fetch`.
+    if backend != GraphicsBackend::DirectX12
+        && can_batch_terrain_draws()
+        && !probe_first_instance_fetch(&device, &queue)
+    {
+        wgpu_mc::render::graph::set_terrain_batching_possible(false);
+    }
 
     // **The limits the device answered with, once per launch.** Alignment is the one limit a port
     // has to reason about on the JVM side - the per-draw ring's stride comes from
@@ -8137,5 +8474,31 @@ mod per_face_strip_tests {
             ),
             None
         );
+    }
+
+    /// The probe's verdict, tested without a device: the four answers a driver can give and which of
+    /// them is honest. The sentinels start at 100 so that neither a cleared target (999) nor a fetch
+    /// that reads nothing (0) can be mistaken for a pass, and so that a driver which collapses every
+    /// draw onto record 0 - the D3D12 `SV_InstanceID` signature, and the shape the Adreno 640 report
+    /// drew - fails with a *distinguishable* answer rather than an ambiguous one.
+    #[test]
+    fn the_probe_verdict_distinguishes_the_failures() {
+        // The honest answer: one sentinel per pixel, in order.
+        assert!(the_probe_records_came_back(&[100, 101, 102, 103]));
+
+        // The collapsed fetch: every draw read record 0.
+        assert!(!the_probe_records_came_back(&[100, 100, 100, 100]));
+
+        // The dead fetch: the attribute never reached the shader, and zeros are what that reads.
+        assert!(!the_probe_records_came_back(&[0, 0, 0, 0]));
+
+        // The draw that never happened: what the clear left.
+        assert!(!the_probe_records_came_back(&[999, 999, 999, 999]));
+
+        // And a wrong order is a wrong answer even when every number is a sentinel.
+        assert!(!the_probe_records_came_back(&[101, 100, 102, 103]));
+
+        // Short reads and long ones are the copy going wrong, not the fetch.
+        assert!(!the_probe_records_came_back(&[100, 101, 102]));
     }
 }

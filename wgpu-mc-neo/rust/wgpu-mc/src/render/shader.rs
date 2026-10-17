@@ -32,13 +32,14 @@ impl WgslShader {
     /// `create_shader_module` asks naga to make the shader safe against itself: every indexing of a
     /// runtime-sized array gets an `arrayLength` load and a `min` in front of it, so that an
     /// out-of-range index reads the last element (or zero) instead of whatever is past the binding.
-    /// **For this renderer's terrain shaders that is nine clamped loads per vertex** - eight into the
-    /// section arena and one into `section_draws` - and the arena is bound as one buffer with
-    /// `min_binding_size: None`, so the length the clamp compares against is the *whole* arena. The
-    /// check can therefore only ever fire on an index that is wrong by more than the entire arena,
-    /// which is not a mistake the indices can make: they are `word_base` (the slot the Rust baker
-    /// allocated) plus offsets into the section it baked there, and the instance number the pass wrote
-    /// into `first_instance`, which is bounded by `SECTION_DRAW_CAPACITY`.
+    /// **For this renderer's terrain shaders that is eight clamped loads per vertex**, all into the
+    /// section arena, which is bound as one buffer with `min_binding_size: None`, so the length the
+    /// clamp compares against is the *whole* arena. The check can therefore only ever fire on an index
+    /// that is wrong by more than the entire arena, which is not a mistake the indices can make: they
+    /// are `word_base` (the slot the Rust baker allocated) plus offsets into the section it baked
+    /// there. The draw record - the other per-draw value - is a vertex attribute now, fetched by the
+    /// input assembler, which has no `arrayLength` to clamp and needs none: the record buffer is
+    /// `SECTION_DRAW_CAPACITY` records and nothing indexes past the fetch.
     ///
     /// So the promise this makes is a real one and it is about *this* repository's shaders: **every
     /// storage buffer here is addressed by a value the baker or the pass computed to be in range, and
@@ -62,12 +63,13 @@ impl WgslShader {
 
         let shader_src = std::str::from_utf8(&shader_src).ok()?;
 
-        // SAFETY: the two promises above. The buffers these shaders index are `chunk_data` (the arena)
-        // and `section_draws`, both written by this side; the values indexed with are the section's
-        // slot in the arena and the record number the pass chose, and no shader here loops without a
-        // bound it can see. Note what is *not* claimed: nothing verifies this at run time any more, so
-        // a change that makes an index unbounded is a change that has to be made carefully - see the
-        // tests in `graph.rs` that pin the sizes and the shapes these indices depend on.
+        // SAFETY: the two promises above. The one buffer these shaders index is `chunk_data` (the
+        // arena), written by this side; the values indexed with are the section's slot in the arena,
+        // and no shader here loops without a bound it can see. The draw record is fetched as a vertex
+        // attribute, which no index reaches. Note what is *not* claimed: nothing verifies this at run
+        // time any more, so a change that makes an index unbounded is a change that has to be made
+        // carefully - see the tests in `graph.rs` that pin the sizes and the shapes these indices
+        // depend on.
         let module = unsafe {
             device.create_shader_module_trusted(
                 ShaderModuleDescriptor {
@@ -223,16 +225,16 @@ mod unguarded_index_tests {
     ///
     /// `WgslShader::init` builds its modules with `ShaderRuntimeChecks::unchecked()`, so naga adds no
     /// clamp in front of any of these - that is the point of it, and on the terrain's vertex stage it is
-    /// nine clamped `arrayLength` loads per vertex saved. What it turns into is a list somebody has to
+    /// eight clamped `arrayLength` loads per vertex saved. What it turns into is a list somebody has to
     /// keep: an index expression that is not bounded by construction is a read past the binding, and
     /// this table is where that is true.
     ///
-    /// Into the arena, eight of them per terrain shader: the four corners of the quad this vertex
-    /// belongs to, read twice - once for the occlusion count packed into each corner's fourth word, and
-    /// once for the position, the light and the colour. The ninth is `section_draws[instance]`, which
-    /// carries the arena slot and the section's position. Every one is `word_base + k` for `k` in
-    /// `0..16`, or the draw's own record number; see the shader and `SectionDraw` for why those are in
-    /// range.
+    /// Into the arena, all eight per terrain shader: the four corners of the quad this vertex belongs
+    /// to, read twice - once for the occlusion count packed into each corner's fourth word, and once
+    /// for the position, the light and the colour. Every one is `word_base + k` for `k` in `0..16`,
+    /// where `word_base` is the arena slot the pass wrote into the draw's record - which travels as a
+    /// vertex attribute, fetched by the input assembler and indexed by nothing; see the shader and
+    /// `SectionDraw` for why those are in range.
     ///
     /// Asserted rather than described because **the numbers are load-bearing now**: with the checks on, a
     /// read that went out of range was clamped and the picture was merely wrong. This is what says the

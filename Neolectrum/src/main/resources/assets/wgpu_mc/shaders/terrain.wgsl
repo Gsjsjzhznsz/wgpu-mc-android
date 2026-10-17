@@ -101,30 +101,34 @@ struct FogEnvironment {
 
 @group(1) @binding(0) var<storage> chunk_data: array<u32>;
 
-// **What one draw of this pass is, indexed by `instance_index`**, which is the only channel a
-// `multi_draw_indexed_indirect` has for anything per draw: an immediate is set once for the whole call
-// and one call may cover thousands of sections.
+// **What one draw of this pass is: a vertex attribute, fetched instance-stepped.** The four words the
+// pass writes per draw - the section, relative to the camera's, and the arena slot its vertices start
+// at - arrive at this stage through the input assembler rather than through a binding, one fetch per
+// draw off a buffer the pass fills once before its first draw.
 //
-// Both paths read it - the batched one and the one that issues a `draw_indexed` per section - so the
-// switch between them is a switch in the number of calls and not in the picture. The pass writes it
-// once per pass, before its first draw, and each dispatch entry's `first_instance` is the index of its
-// own record.
+// The channel a `multi_draw_indexed_indirect` has for anything per draw is still the record's
+// `first_instance` - an immediate is set once for the whole call and one call may cover thousands of
+// sections - but the record number is now consumed by the *fixed-function* vertex fetch, which offsets
+// instance-step attributes by it, and no longer by the `instance_index` builtin in here. Both paths
+// feed the fetch: the batched one through `first_instance`, the one-draw-per-section fallback through
+// the instance range of its `draw_indexed`, so the switch between them is a switch in the number of
+// calls and not in the picture.
 //
-// See `SectionDraw` in `mc/mod.rs`, which is the same four members written by the other side.
-struct SectionDraw {
-    // The section, **relative to the section the camera is in** - the same relative position the
-    // immediate used to carry for one draw at a time, and for the same reason: `x + 30000` in `f32`
-    // steps by four thousandths of a block, and the depth test between the ground and a shadow lying on
-    // it is decided by exactly those bits. See `SectionPosition`.
-    x: i32,
-    y: i32,
-    z: i32,
-    // The u32 slot in the arena this draw's vertices start at. This was `@builtin(instance_index)`,
-    // which is the record's own index now.
-    word_base: u32,
-};
-
-@group(2) @binding(0) var<storage> section_draws: array<SectionDraw>;
+// **Why the builtin lost its job: a driver that does not propagate it.** The batched path shipped
+// reading `section_draws[instance_index]` out of a storage binding, and the first device it turned on
+// on - an Adreno 640 - reported every feature the path asks for and then drew a world whose sections
+// were missing or piled into one place: the signature of a driver that accepts non-zero `firstInstance`
+// in an indirect record and does not carry it into the shader's `instance_index`. wgpu hit the same
+// class on D3D12, where `SV_InstanceID` by definition ignores it (see the exclusion in
+// `wgpu-mc-jni/src/device.rs` and wgpu#2471), and a builtin is a *compiler* path - which is exactly
+// where a driver bug hides. The vertex fetch is a different unit: Vulkan folds `firstInstance` into
+// instance-rate attribute indexing at the fixed-function level, and D3D12's `StartInstanceLocation`
+// does the same for its instance-step reads. So the record moved from a binding the shader indexed to
+// a buffer the assembler fetches, which is the shape that works everywhere the batching works at all.
+//
+// See `SectionDraw` in `mc/mod.rs` for the Rust side and for `vertex_layout`, which declares the
+// attribute these four words are fetched through: one `Sint32x4` at location 0, sixteen bytes,
+// instance-stepped.
 
 struct VertexResult {
     @builtin(position) pos: vec4<f32>,
@@ -186,7 +190,7 @@ struct VertexResult {
     @interpolate(flat) @location(23) mipped: u32
 };
 
-// What one terrain draw is told about itself **beyond its own `SectionDraw`**: the alpha cutoff its
+// What one terrain draw is told about itself **beyond its own draw record**: the alpha cutoff its
 // layer asks for, and the five per-frame numbers about the two atlases. Seven `u32`s, twenty-eight
 // bytes, and no padding - which is the size the pass declares for them (see `@pc_section_position` in
 // `graph.yaml` and the sizes in `RenderGraph::new`).
@@ -194,7 +198,7 @@ struct VertexResult {
 // **The section's x, y and z are not here any more, and that is what the batched path cost.** They were
 // the first three members, written per draw, and `multi_draw_indexed_indirect` is one call: everything
 // an immediate holds is held for every draw in it, so the position had to move to something the vertex
-// stage can index per draw - `section_draws` above, by `instance_index`.
+// stage can fetch per draw - the instance-step attribute described above the `VertexResult`.
 //
 // The rest stays, because it is not per draw: the bias and the two texel sizes are frame constants, and
 // the cutoff is a property of the layer, which is one immediate write per layer.
@@ -660,18 +664,19 @@ fn frag_game_atlas(
 @vertex
 fn vert(
     @builtin(vertex_index) vi: u32,
-    // **The index of this draw's record**, which is what the pass writes into `first_instance` of an
-    // indirect dispatch entry and into the instance range of a plain `draw_indexed`. It used to *be*
-    // the section's arena slot; the slot is in the record now, because a `multi_draw` cannot be told
-    // anything per draw except through a buffer.
-    @builtin(instance_index) instance: u32
+    // **This draw's record, fetched by the input assembler.** The four words `SectionDraw` writes:
+    // the section, relative to the camera's, then the arena slot its vertices start at. The record
+    // number is what the pass writes into `first_instance` of an indirect dispatch entry and into the
+    // instance range of a plain `draw_indexed`, and the fetch is offset by it - through the
+    // fixed-function instance indexing, not the builtin this used to read. See the note above
+    // `VertexResult` for why the two are different things to a driver.
+    @location(0) draw_record: vec4<i32>
 ) -> VertexResult {
 //    var vert1_i = (vi >> 2) << 4;
 //    var vert1_i = (vi << 2) & 0xfffffffc;
 //    var vert1_i = ((vi >> 2u) << 2u)+base_vertex;
 
-    let draw = section_draws[instance];
-    let base_vertex = draw.word_base;
+    let base_vertex = u32(draw_record.w);
     var offset = vi & 3;
     var vert1_i = vi & ~3u;
 
@@ -808,7 +813,7 @@ fn vert(
     // No flag test and no `16.0` here any more: see the decode above for where those three bits went.
     var pos = vec3<f32>(x, y, z);
 
-    var section_origin = vec3<f32>(f32(draw.x), f32(draw.y), f32(draw.z)) * 16.0;
+    var section_origin = vec3<f32>(f32(draw_record.x), f32(draw_record.y), f32(draw_record.z)) * 16.0;
     var world_pos = pos + section_origin;
 
     vr.pos = mat4_persp * mat4_view * mat4_model * vec4(world_pos, 1.0);

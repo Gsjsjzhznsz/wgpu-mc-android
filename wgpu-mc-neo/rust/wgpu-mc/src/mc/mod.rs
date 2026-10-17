@@ -478,18 +478,24 @@ pub const INDIRECT_DRAW_CAPACITY: usize = 24_000;
 /// read past the end of a buffer.
 pub const SECTION_DRAW_CAPACITY: usize = 1 << 15;
 
-/// One terrain draw's arguments, as the vertex stage reads them: `section_draws[instance_index]`.
+/// One terrain draw's arguments, as the input assembler fetches them for the vertex stage: one
+/// instance-step `Sint32x4` at location 0, sixteen bytes.
 ///
-/// Sixteen bytes, four `u32`s, and the layout is the shader's - `SectionDraw` in `terrain.wgsl` and
-/// `terrain_solid.wgsl` spells the same four members in the same order. A struct with a `vec3` in it was
-/// the other shape this could have had and it is the one to avoid: `vec3<i32>` is sixteen bytes of
-/// storage for twelve bytes of data, and three scalars say what the four offsets are without anyone
-/// having to know the alignment rule.
+/// Four `u32`s, and the layout is the fetch's - [`vertex_layout`][Self::vertex_layout] declares it,
+/// and the terrain shaders read it as `@location(0) draw_record: vec4<i32>`. A struct with a `vec3`
+/// in it was the other shape this could have had and it is the one to avoid: `vec3<i32>` is sixteen
+/// bytes of storage for twelve bytes of data, and three scalars say what the four offsets are without
+/// anyone having to know the alignment rule.
 ///
-/// **`word_base` was `@builtin(instance_index)`.** Every section's draw used to pass its arena slot as
-/// the instance number, which is exactly what `first_instance` is for in an indirect record - except
-/// that `instance_index` now has a job of its own: it is the index of the record being drawn, because a
-/// multi-draw cannot be told anything per draw any other way.
+/// **The record used to be a storage binding the shader indexed by `@builtin(instance_index)`.**
+/// Every section's draw used to pass its arena slot as the instance number, which is exactly what
+/// `first_instance` is for in an indirect record - except that `instance_index` then had a job of its
+/// own: it was the index of the record being drawn, because a multi-draw cannot be told anything per
+/// draw any other way. The first device the batched path turned on on accepted the feature and then
+/// did not propagate the number into the builtin, and the world drew hollow - so the record moved
+/// from a binding the shader indexed to a buffer the input assembler fetches, which offsets
+/// instance-step reads by `firstInstance` at the fixed-function level. See the note above
+/// `VertexResult` in `terrain.wgsl` for the whole of it.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SectionDraw {
@@ -501,6 +507,33 @@ pub struct SectionDraw {
     /// The u32 slot in the arena the section's vertices start at: the old `instance_index`, and what
     /// `chunk_data` is indexed by in the shader.
     pub word_base: u32,
+}
+
+impl SectionDraw {
+    /// The one attribute the record is fetched through, and the only place its shape is written:
+    /// `Sint32x4` at location 0, offset zero - the four members in declaration order, no padding. The
+    /// tests in `graph.rs` hold the shaders to the same shape.
+    pub const DRAW_RECORD_ATTRIBUTES: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Sint32x4,
+        offset: 0,
+        shader_location: 0,
+    }];
+
+    /// The vertex layout every terrain pipeline fetches its draw records through: sixteen bytes per
+    /// record, `wgpu::VertexStepMode::Instance`, one attribute. The pass binds the very buffer the
+    /// records were uploaded to as this layout's vertex buffer, so a record is never copied to be
+    /// fetched.
+    ///
+    /// **Instance-stepped, and that is the whole mechanism.** The input assembler indexes this buffer
+    /// at `firstInstance + i` for the `i`th draw of a call - the same number the shader builtin would
+    /// have received, consumed one unit earlier, where every backend honours it.
+    pub fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<SectionDraw>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &Self::DRAW_RECORD_ATTRIBUTES,
+        }
+    }
 }
 
 pub struct Scene {
@@ -574,12 +607,14 @@ pub struct Scene {
     /// **The draw arguments, one pair of buffers per terrain pass.** See [`SECTION_DRAW_SLOTS`] for why
     /// there is a pair per pass rather than one for the frame, and [`SectionDraw`] for what is in them.
     ///
-    /// `section_draws[i]` is the storage buffer the vertex stage reads a draw's section position and
-    /// arena slot out of, and `indirect_buffers[i]` is the `DrawIndexedIndirectArgs` array the batched
-    /// path draws from. Index `i` is a *slot*, not a pipeline: `BoundPipeline::draw_slot` says which
-    /// pass owns which, and two passes may not share one - which is the whole of what the slot
-    /// assignment has to get right.
-    pub section_draws: Vec<Arc<BindableBuffer>>,
+    /// `section_draws[i]` is the **vertex buffer** the input assembler fetches a draw's section position
+    /// and arena slot from - one instance-step attribute over the whole allocation, which is why this
+    /// is a plain buffer now and not the `BindableBuffer` it used to be: that type exists to bind a
+    /// buffer into a group, and the records bind into no group any more. `indirect_buffers[i]` is the
+    /// `DrawIndexedIndirectArgs` array the batched path draws from. Index `i` is a *slot*, not a
+    /// pipeline: `BoundPipeline::draw_slot` says which pass owns which, and two passes may not share
+    /// one - which is the whole of what the slot assignment has to get right.
+    pub section_draws: Vec<Arc<wgpu::Buffer>>,
     pub indirect_buffers: Vec<Arc<wgpu::Buffer>>,
 
     pub entity_instances: Mutex<HashMap<String, BundledEntityInstances>>,
@@ -721,16 +756,21 @@ impl Scene {
         // created on a rebuild, which is a resource the frame in flight may still be reading. See
         // `SECTION_DRAW_SLOTS`.
         //
-        // `min_binding_size` is left open in the layout, so the whole of each is bound and the shader
-        // indexes it by `instance_index`; the arena's storage buffer is declared the same way.
+        // `min_binding_size` is left open in the layout, so the whole of each is bound; the arena's
+        // storage buffer is declared the same way. The records are fetched as a **vertex buffer** now -
+        // one instance-step attribute over this same allocation - and a plain buffer is what that
+        // needs: `BindableBuffer` exists to bind a buffer into a group, and the records bind into no
+        // group any more. See the note at the `@bg_section_draws` removal in `graph.rs`.
         let section_draws = (0..SECTION_DRAW_SLOTS)
             .map(|_| {
-                Arc::new(BindableBuffer::new_deferred(
-                    wm,
-                    (SECTION_DRAW_CAPACITY * std::mem::size_of::<SectionDraw>()) as u64,
-                    wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
-                    "section_draws",
-                ))
+                let size = (SECTION_DRAW_CAPACITY * std::mem::size_of::<SectionDraw>()) as u64;
+
+                Arc::new(wm.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("section_draws"),
+                    size,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::VERTEX,
+                    mapped_at_creation: false,
+                }))
             })
             .collect::<Vec<_>>();
 
