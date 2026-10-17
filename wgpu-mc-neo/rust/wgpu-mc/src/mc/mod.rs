@@ -307,6 +307,32 @@ pub(crate) const ARENA_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::COPY_DST
 /// view the player asked for.
 pub const ARENA_MEMORY_BUDGET: u64 = 5_000_000_000;
 
+/// **The largest pool a view is ever worth: what the record table can name, with room to spare.**
+///
+/// A slot of arena that no draw can reach is not capacity, it is pressure. Every (section, layer) the
+/// arena holds names itself through one [`SECTION_DRAW_CAPACITY`]-slot record table, and the table is the
+/// binding ceiling on what the terrain path can serve - past it a section is refused and drawn by
+/// Minecraft's own meshes no matter how much arena sits behind it. A view that asks the arena for more
+/// slots than the records can name at plausible density is asking for memory the draws can never touch.
+///
+/// The density this is written at is four thousand slots per record, a quarter over what the sessions
+/// measured: the phone's 12-chunk world held 24.3M slots across ~7,100 records (3.4k slots each), and
+/// the 32-chunk run that found this constant held 22M across ~11,400 (1.9k each - the far view is
+/// shallower). At 4k the table's whole reach is 512 MB of arena; a world dense enough to exhaust that
+/// before the records (an ocean at 32 chunks, where one section's water surface runs large) is refused
+/// into Minecraft's own meshes - the ordinary, graceful answer - rather than into a device that cannot
+/// breathe.
+///
+/// **Why this is a policy constant and not arithmetic**, when it is derived: it rides on
+/// [`SECTION_DRAW_CAPACITY`], so a future index encoding that widens the table widens the ceiling with
+/// it, and the two move as one. What it does *not* ride on is the device: the memory it saves is exactly
+/// the memory a phone was dying of, and the memory a desktop wastes is a rounding error. The phone run
+/// that demanded it: a switch to 32 chunks asked [`crate::mc::chunk::arena_slots`] for 285,660,000 slots
+/// and was granted all of it - ten buffers, **1,216 MB** - held 22M slots (6%, 83 MB), and the device
+/// spent the session at a frame a second with the system UI crawling under the swap the arena's reach
+/// caused. The view's own ask was thirteen times the memory its draws could name.
+pub const ARENA_SLOTS_CEILING: u32 = (SECTION_DRAW_CAPACITY * 4_096) as u32;
+
 /// The arena's budget **for this device**, from the two numbers a device actually gives.
 ///
 /// `max_buffer_size` is a *per-buffer* limit, and [`ARENA_BUFFERS`] of them is the most the device's own
@@ -337,7 +363,9 @@ pub fn arena_memory_budget(max_buffer_size: u64) -> u64 {
 ///
 ///  * **`target`** - what [`chunk::arena_slots`] says the current render distance wants. The pool should
 ///    reach this and not more, and it is the number the growth exists for. This is the *size* now rather
-///    than the ceiling.
+///    than the ceiling. Callers are expected to pass it through [`chunk::arena_slots_for_view`], which
+///    holds it under [`ARENA_SLOTS_CEILING`] - and the min chain below applies the ceiling again, so a
+///    caller that forgot inherits the policy rather than the memory bill.
 ///  * **`largest_section`** - a floor. An arena smaller than the largest section this session has meshed
 ///    cannot hold one, and holding sections is the whole point.
 ///  * **`cap_slots`** - the device's per-buffer ceiling, which is still a real limit and the reason the
@@ -358,7 +386,11 @@ pub fn arena_growth_slots(
     let room = budget.saturating_sub(pool_slots as u64 * 4) / 4;
     let room = room.min(u32::MAX as u64) as u32;
 
-    target.max(largest_section).min(cap_slots).min(room)
+    target
+        .max(largest_section)
+        .min(cap_slots)
+        .min(room)
+        .min(ARENA_SLOTS_CEILING)
 }
 
 /// The most u32 slots **one** arena buffer may hold, from the two limits its two uses have to satisfy.

@@ -876,8 +876,14 @@ impl WmRenderer {
         //
         // `pending_arena_growth` is a marker rather than a size - the refusal that sets it only knows
         // that something did not fit - so the target is read from the pool the world actually wants:
-        // `arena_slots` at the current width.
-        let target = mc::chunk::arena_slots(scene.section_storage.read().width().max(0) as u32);
+        // `arena_slots` at the current width, under the policy ceiling (`arena_slots_for_view`). The
+        // ceiling is what stands between a render-distance change and the phone run that asked it for
+        // 285,660,000 slots - 1,216 MB, 6% held, a device at a frame a second - because the growth
+        // here is the path a *change* takes: the pool is not empty, `set_arena_slots` refuses it, and
+        // this target is the size the change reaches by.
+        let raw_view_ask =
+            mc::chunk::arena_slots(scene.section_storage.read().width().max(0) as u32);
+        let target = raw_view_ask.min(mc::ARENA_SLOTS_CEILING);
         let budget = scene.arena_memory_budget;
         let mut at_limit = false;
 
@@ -1029,10 +1035,19 @@ impl WmRenderer {
 
         let stored = scene.section_storage.read();
 
+        // The ask the log names is the one growth obeyed - and when the policy ceiling clipped the
+        // view's own number, the difference is the memory the device did *not* have to die of, which
+        // is the one fact a "why is the arena smaller than my view" question is really asking for.
+        let view_ask = if raw_view_ask != target {
+            format!("{raw_view_ask} asked, {target} after the record table's ceiling")
+        } else {
+            format!("{target}")
+        };
+
         log::warn!(
             "wgpu-mc: the section arena was full, so it grew to {} arena(s) holding {} slot(s), {} MB \
              total ({} slot(s) handed out, the largest section meshed so far {} slot(s), and the view \
-             asked for {target} slot(s))",
+             asked for {view_ask} slot(s))",
             stored.arena_count(),
             stored.pool_slots(),
             stored.pool_slots() as u64 * 4 / (1024 * 1024),
@@ -1284,7 +1299,7 @@ mod arena_budget_tests {
 
 #[cfg(test)]
 mod arena_growth_tests {
-    use crate::mc::{ARENA_MEMORY_BUDGET, arena_growth_slots};
+    use crate::mc::{ARENA_MEMORY_BUDGET, ARENA_SLOTS_CEILING, arena_growth_slots};
 
     /// **The bug, in the numbers a run actually printed.**
     ///
@@ -1310,11 +1325,22 @@ mod arena_growth_tests {
             "one appended arena must fit inside the budget on its own"
         );
 
-        // The same case on the machine the code was written for, whose ceiling is 2 GB: the cap binds
-        // when the view asks for more than the device will make.
+        // The same case on the machine the code was written for, whose ceiling is 2 GB: two policy
+        // ceilings bind in order now, and the record table's reach (`ARENA_SLOTS_CEILING`,
+        // 134,217,728 slots) is the tighter - a view past it is memory no record can name, whatever
+        // the device would have made. That is the bound the phone's 32-chunk run found: 1,216 MB
+        // granted, 6% held, a frame a second.
         assert_eq!(
             arena_growth_slots(3_000_000_000, 82_140_000, 77_132, 536_870_911, budget),
-            536_870_911,
+            ARENA_SLOTS_CEILING,
+            "a view past the record table's ceiling is clipped to it before the device is asked"
+        );
+
+        // And a device smaller than the policy ceiling still binds where it always did - the ceiling
+        // is one clamp in a chain, not a replacement for the device's own answer.
+        assert_eq!(
+            arena_growth_slots(3_000_000_000, 82_140_000, 77_132, 100_000_000, budget),
+            100_000_000,
             "a view larger than the device's per-buffer limit is clamped to it"
         );
     }

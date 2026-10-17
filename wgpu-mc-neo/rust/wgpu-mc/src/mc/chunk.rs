@@ -194,6 +194,24 @@ pub const fn arena_slots(render_distance: u32) -> u32 {
     width * width * SECTIONS_PER_COLUMN * SLOTS_PER_SECTION
 }
 
+/// What a view of this many chunks is worth **to the arena**, under the policy ceiling.
+///
+/// [`arena_slots`] answers "what does the view weigh" and has no opinion on whether the answer is worth
+/// holding; [`crate::mc::ARENA_SLOTS_CEILING`] is where that opinion lives - past the record table's
+/// reach the extra slots are memory no draw can name, and on a phone that memory is the difference
+/// between a world and a device crawling in swap. Both places a view's ask becomes an arena size come
+/// through here: the render-distance report sizing a fresh pool (`setRenderDistance`), and the growth
+/// target a mid-session render-distance change reads (`WmRenderer::grow_arena_if_asked`) - so a clamp
+/// added in either place alone would let the other one back onto the path that found the ceiling.
+///
+/// At the distances phones run, this is [`arena_slots`] itself: the ceiling sits between a 21-chunk
+/// view's ask (132,540,000 slots) and a 22-chunk one's (144,060,000), and everything below asks for
+/// less anyway. The clamp bites at 22 chunks and up - exactly the views where the phone run measured
+/// the arena at 6% held while the device died of what it was granted.
+pub fn arena_slots_for_view(render_distance: u32) -> u32 {
+    arena_slots(render_distance).min(crate::mc::ARENA_SLOTS_CEILING)
+}
+
 /// The arena's pool in u32 slots, as the pool [`Scene`](crate::mc::Scene) starts with.
 ///
 /// A placeholder, and deliberately a small one: the pool is sized to the render distance the game
@@ -6697,6 +6715,59 @@ mod arena_tests {
             ARENA_SLOTS < arena_slots(16),
             "the pool a session starts with is a placeholder for a world that has not reported its \
              render distance yet, not the size of a real one"
+        );
+    }
+
+    /// **The view a phone can be granted stops where the record table's reach stops.**
+    ///
+    /// The 32-chunk run that found the ceiling: 285,660,000 slots granted, 22M held (6%), a device at
+    /// a frame a second under the swap. The ceiling exists so that ask comes back as 512 MB - the
+    /// most any draw can name through `SECTION_DRAW_CAPACITY` records at the density sessions
+    /// measured - and so every distance a phone actually runs passes through untouched.
+    #[test]
+    fn the_view_ask_stops_at_the_record_tables_reach() {
+        use crate::mc::{ARENA_SLOTS_CEILING, SECTION_DRAW_CAPACITY};
+
+        // The ceiling is the table's reach at measured density, and it moves with the table.
+        assert_eq!(
+            ARENA_SLOTS_CEILING,
+            SECTION_DRAW_CAPACITY as u32 * 4_096,
+            "the ceiling is derived, so an index-encoding change moves it with the table"
+        );
+        assert_eq!(ARENA_SLOTS_CEILING, 134_217_728);
+        assert_eq!(
+            ARENA_SLOTS_CEILING as u64 * 4,
+            512 * 1024 * 1024,
+            "512 MB - the memory the phone run's draws could actually have named, thirteen times \
+             under what was granted"
+        );
+
+        // Distances phones run are untouched: the clamp is a ceiling, not a resize.
+        for chunks in [8, 12, 16, 20] {
+            assert_eq!(
+                arena_slots_for_view(chunks),
+                arena_slots(chunks),
+                "{chunks} chunk(s) ask below the ceiling; the clamp must not bite there"
+            );
+        }
+
+        // And the views that overrun the table are held at it: 22 chunks asks 144,060,000 slots,
+        // 32 asks 285,660,000 - all past what the records can name, all answered with the same
+        // 512 MB the draws could reach anyway.
+        assert!(arena_slots(22) > ARENA_SLOTS_CEILING);
+        assert!(arena_slots(24) > ARENA_SLOTS_CEILING);
+        assert!(arena_slots(32) > ARENA_SLOTS_CEILING);
+        assert_eq!(arena_slots_for_view(22), ARENA_SLOTS_CEILING);
+        assert_eq!(arena_slots_for_view(24), ARENA_SLOTS_CEILING);
+        assert_eq!(
+            arena_slots_for_view(32),
+            ARENA_SLOTS_CEILING,
+            "the 32-chunk ask that granted 1,216 MB comes back as the ceiling"
+        );
+        assert_eq!(
+            arena_slots_for_view(200),
+            arena_slots_for_view(64),
+            "the const fn's own cap still applies under the ceiling"
         );
     }
 

@@ -7696,10 +7696,20 @@ pub fn setRenderDistance(_env: JNIEnv, _class: JClass, chunks: jint) {
     // The ceiling the request is held under is the pool's: `ARENA_BUFFERS` buffers, or the memory
     // budget, whichever is smaller. `set_arena_slots` splits the request into per-buffer pieces
     // itself (see `split_arena_slots`), so a pool past one buffer's size is its ordinary job.
+    //
+    // **And under the policy ceiling** (`arena_slots_for_view`), which is the bound the phone run
+    // found the hard way: a switch to 32 chunks asked for 285,660,000 slots and was granted all of
+    // it - 1,216 MB across ten buffers, 6% held - and the device spent the session at a frame a
+    // second with the whole system crawling under the swap. Past the record table's reach the extra
+    // slots are memory no draw can name; the growth path a mid-session change takes is clamped where
+    // its target is computed (`grow_arena_if_asked`), and this is the join path, clamped here.
     let pool_cap_slots = ((scene.arena_cap_slots as u64 * wgpu_mc::mc::ARENA_BUFFERS as u64)
         .min(scene.arena_memory_budget / 4))
     .min(u32::MAX as u64) as u32;
-    let wanted = wgpu_mc::mc::chunk::arena_slots(chunks as u32).min(pool_cap_slots);
+    let raw_view_ask = wgpu_mc::mc::chunk::arena_slots(chunks as u32);
+    let wanted = raw_view_ask
+        .min(wgpu_mc::mc::ARENA_SLOTS_CEILING)
+        .min(pool_cap_slots);
 
     // The pool *and* the buffer it lives in, in one call, and only while the arena is empty - see
     // `Scene::set_arena_slots`. The report arrives when a world is joined, which is the moment the
@@ -7710,10 +7720,23 @@ pub fn setRenderDistance(_env: JNIEnv, _class: JClass, chunks: jint) {
     scene.section_storage.write().set_width(chunks);
 
     if sized {
+        // The size the pool took is the size the log names - and when the policy ceiling clipped the
+        // view's own ask, the difference is the memory the draws could never have named, which is the
+        // number a "why is my 32-chunk world holding back" question wants in the same line.
+        let view_ask = if raw_view_ask != wanted {
+            format!("{} slot(s) the view itself asked for", raw_view_ask)
+        } else {
+            String::new()
+        };
         info!(
-            "wgpu-mc: the section arena holds {} slot(s), {} MB, for {chunks} chunk(s) of view",
+            "wgpu-mc: the section arena holds {} slot(s), {} MB, for {chunks} chunk(s) of view{}",
             wanted,
-            wanted as u64 * 4 / (1024 * 1024)
+            wanted as u64 * 4 / (1024 * 1024),
+            if view_ask.is_empty() {
+                String::new()
+            } else {
+                format!(" (past the record table's ceiling; {view_ask})")
+            }
         );
 
         // **The validation switches, said here because this is a line that reaches the log.**
