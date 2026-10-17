@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use lazy_static::lazy_static;
 use once_cell::sync::OnceCell;
@@ -331,6 +331,82 @@ fn no_adv_culling() -> IntSetting {
     IntSetting::of(0, 16, 1, 0)
 }
 
+/// The revision of the defaults the current build ships, and the migrations that bring older
+/// configs up to it.
+///
+/// **Why this exists.** A config file outlives the code that wrote it: `terrain_indirect` shipped
+/// as `false` - the batched path's observation period - and every build that shipped that answer
+/// also wrote it into the config it saved. The default moved to `on` when the observation ended
+/// (android.24), but a default only reaches a config that *omits* the key, and these configs carry
+/// it - so the flip never reached the installs that had been running without the batching, which is
+/// every install that had ever launched an earlier build. The android.24 log named it on exactly
+/// the phone this port targets: "the terrain pass is drawing one section at a time: the
+/// `terrain_indirect` switch is off, and this device could batch".
+///
+/// **How the revision travels.** Not as a field of [`Settings`]: the value document goes over the
+/// bridge to the options screen, which round-trips *rows of the schema* - and a bare integer where
+/// a `{"type": ..., "value": ...}` row is expected is one more shape the screen has no reason to
+/// tolerate. It is a small file beside the config instead (`wgpu-mc-renderer.defaults.json`),
+/// written once the migration has run and read on every load: it survives the options screen's
+/// apply, which rewrites the config but never this file, and a player who deletes the whole config
+/// folder gets the current defaults either way.
+///
+/// **One revision, one migration.** Revision 1 moves a `terrain_indirect` that still answers the
+/// observation-era `false` to the default the renderer draws now. After it has run, a player who
+/// turns the batching off - the "did the batching break something" question the setting exists for
+/// - keeps that answer: the marker says the config is current, and a current config is read as it
+/// stands.
+const CURRENT_DEFAULTS_REVISION: u32 = 1;
+
+/// Where the defaults revision lives: beside the config, in its own file.
+fn defaults_revision_path(config_path: &Path) -> PathBuf {
+    config_path.with_file_name("wgpu-mc-renderer.defaults.json")
+}
+
+/// The defaults revision the config was last written under, or **zero when the file does not say**
+/// - which is every config written before this existed.
+fn stored_defaults_revision(config_path: &Path) -> u32 {
+    let Ok(contents) = std::fs::read_to_string(defaults_revision_path(config_path)) else {
+        return 0;
+    };
+
+    serde_json::from_str::<serde_json::Value>(&contents)
+        .ok()
+        .and_then(|document| {
+            document
+                .get("defaults_revision")
+                .and_then(|revision| revision.as_u64())
+        })
+        // A hand-edited revision past the current one is honoured (it only ever makes the
+        // migration run *less* often), clamped into the field's range.
+        .map(|revision| revision.min(u32::MAX as u64) as u32)
+        .unwrap_or(0)
+}
+
+/// Writes the defaults revision beside the config, so the migration runs once.
+///
+/// A failure is logged and otherwise swallowed, exactly like [`Settings::write`]: the worst case
+/// is that the migration asks again on the next launch, and it is idempotent.
+fn write_defaults_revision(config_path: &Path, revision: u32) {
+    let path = defaults_revision_path(config_path);
+
+    if let Some(parent) = path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        log::error!("Couldn't create {parent:?} for the defaults revision: {err}");
+        return;
+    }
+
+    let written =
+        serde_json::to_string_pretty(&serde_json::json!({ "defaults_revision": revision }))
+            .map_err(|err| err.to_string())
+            .and_then(|text| std::fs::write(&path, text).map_err(|err| err.to_string()));
+
+    if let Err(err) = written {
+        log::error!("Couldn't write the defaults revision to {path:?}: {err}");
+    }
+}
+
 /// The default of `terrain_indirect`: **on**, which is one `multi_draw_indexed_indirect` per run of
 /// sections that share an arena. See [`Settings::terrain_indirect`] - the per-section path remains
 /// what a device falls back to when it cannot carry the batching, and a player can still turn the
@@ -433,7 +509,9 @@ lazy_static! {
     pub static ref SETTINGS_INFO: SettingsInfo = SettingsInfo {
         backend: EnumSettingInfo::new(
             "The graphics API the renderer uses. Vulkan is the default; DirectX 12 is Windows \
-             only; OpenGL ES is the Android fallback.",
+             only; Metal is the API of Apple's platforms; OpenGL ES is the Android fallback. A \
+             backend this machine cannot run is skipped at launch and the next one in line is \
+             tried.",
             true,
         ),
         vsync: SettingInfo {
@@ -707,10 +785,14 @@ lazy_static! {
 
 /// The graphics API the wgpu instance is created with.
 ///
-/// Only the backends this renderer has actually been exercised on are listed. `wgpu::Backends`
-/// knows about Metal and the WebGPU backends too, but neither can present to a GLFW window on
-/// the platforms this mod ships for, so offering them would only produce a launch that fails
-/// after the window is already up.
+/// **Every backend wgpu has is listed.** The list used to hold only the ones this renderer had been
+/// exercised on, on the argument that an option which cannot come up only produces a launch that
+/// fails - but the fallback order below is what actually happens to such a pick: it is skipped with
+/// a log line and the next backend in [`GraphicsBackend::fallback_chain`] is tried, so naming a
+/// backend this machine does not have costs one skipped attempt, not a launch. Metal is the API of
+/// Apple's own platforms (macOS, iOS), which a build of this renderer can target, and WebGPU is
+/// what a wasm build would reach; both are listed so the enum says what wgpu offers rather than
+/// what this port has shipped for.
 ///
 /// Android carries two of them: Vulkan, which the device's own driver provides and which is
 /// the backend the renderer defaults to, and OpenGL ES, which the renderer reaches through
@@ -718,7 +800,11 @@ lazy_static! {
 /// wgpu cannot bring up, and a slower one where it can: ES has no push constants, so the
 /// graph's terrain passes are not built there and the game draws its own meshes for those
 /// layers (see `create_renderer` for the attempt, and `TerrainPass.ready` for the takeover).
-#[derive(EnumIter, IntoStaticStr, Eq, PartialEq, Clone, Copy, Debug, Default)]
+///
+/// **The variants are ordered by when they were added, not by preference** - the config carries the
+/// selected variant as an *index* into this order, and inserting one in the middle would turn every
+/// config that named the ones after it into a different backend. Append only.
+#[derive(EnumIter, IntoStaticStr, Eq, PartialEq, Hash, Clone, Copy, Debug, Default)]
 pub enum GraphicsBackend {
     #[default]
     Vulkan,
@@ -730,6 +816,15 @@ pub enum GraphicsBackend {
     #[allow(clippy::upper_case_acronyms)]
     #[strum(serialize = "OpenGL ES")]
     GLES,
+    /// Apple's own API, on the machines that only have it: macOS, iOS and the rest of the Apple
+    /// targets. A build of this renderer for those platforms answers here; everywhere else the
+    /// backend is skipped at creation, with the reason in the log.
+    #[strum(serialize = "Metal")]
+    Metal,
+    /// The browser's WebGPU, which a wasm build of this renderer would reach. It cannot come up in
+    /// the JVM mod this crate ships as, and it is listed for the same reason Metal is.
+    #[strum(serialize = "WebGPU")]
+    WebGPU,
 }
 
 impl GraphicsBackend {
@@ -739,6 +834,11 @@ impl GraphicsBackend {
     /// `aarch64-linux-android` evaluates `cfg!(target_os = "linux")` to `false`, which is what
     /// made a config-carrying Vulkan backend silently vanish on a launcher. Both Android
     /// backends are therefore listed by name rather than folded into the desktop arms.
+    ///
+    /// The two appended for completeness answer the platforms their wgpu backends are built on:
+    /// Metal is compiled for the Apple targets (`target_vendor = "apple"` covers macOS, iOS and
+    /// the rest), and the browser backend only exists under wasm - so a pick of either on a
+    /// machine that cannot run it is a skipped attempt, not a broken launch.
     pub fn is_available_here(self) -> bool {
         match self {
             GraphicsBackend::Vulkan => {
@@ -746,32 +846,84 @@ impl GraphicsBackend {
             }
             GraphicsBackend::DirectX12 => cfg!(windows),
             GraphicsBackend::GLES => cfg!(target_os = "android"),
+            GraphicsBackend::Metal => cfg!(target_vendor = "apple"),
+            GraphicsBackend::WebGPU => cfg!(target_arch = "wasm32"),
         }
     }
 
     /// The backend to try when this one cannot be created.
     ///
     /// It exists as a named operation so that adding a backend to the enum forces a decision
-    /// here instead of silently making the fallback order depend on declaration order.
+    /// here instead of silently making the fallback order depend on declaration order - and
+    /// [`GraphicsBackend::fallback_chain`] is what walks these hops into the order the renderer
+    /// is created with.
     ///
     /// On Android the alternative to Vulkan is OpenGL ES: DirectX 12 does not exist there, and
     /// the launcher's GLES stack (the EGL the renderer plugins provide) is exactly what a
     /// device whose Vulkan driver cannot run wgpu needs. On Windows and Linux the pair stays
-    /// what it was.
+    /// what it was, and on the Apple targets it is Vulkan and Metal - the platform's own API -
+    /// rather than a DirectX 12 that is not built there.
     pub fn alternative(self) -> Self {
-        if cfg!(target_os = "android") {
+        self.alternative_on(cfg!(target_os = "android"), cfg!(target_vendor = "apple"))
+    }
+
+    /// [`GraphicsBackend::alternative`] with the platform handed in, so the arms have a test on
+    /// every host rather than only on the platforms they fire on - the same shape
+    /// [`Settings::enforce_android_terrain`] uses for the same reason.
+    fn alternative_on(self, android: bool, apple: bool) -> Self {
+        if android {
             return match self {
                 GraphicsBackend::Vulkan => GraphicsBackend::GLES,
-                GraphicsBackend::DirectX12 => GraphicsBackend::Vulkan,
                 GraphicsBackend::GLES => GraphicsBackend::Vulkan,
+                GraphicsBackend::DirectX12 | GraphicsBackend::Metal | GraphicsBackend::WebGPU => {
+                    GraphicsBackend::Vulkan
+                }
+            };
+        }
+
+        if apple {
+            return match self {
+                GraphicsBackend::Vulkan => GraphicsBackend::Metal,
+                GraphicsBackend::Metal => GraphicsBackend::Vulkan,
+                GraphicsBackend::DirectX12 | GraphicsBackend::GLES | GraphicsBackend::WebGPU => {
+                    GraphicsBackend::Metal
+                }
             };
         }
 
         match self {
             GraphicsBackend::Vulkan => GraphicsBackend::DirectX12,
             GraphicsBackend::DirectX12 => GraphicsBackend::Vulkan,
-            GraphicsBackend::GLES => GraphicsBackend::Vulkan,
+            GraphicsBackend::GLES | GraphicsBackend::Metal | GraphicsBackend::WebGPU => {
+                GraphicsBackend::Vulkan
+            }
         }
+    }
+
+    /// The order the backends are tried in when the renderer is created: the config's pick first,
+    /// then its alternative, then that one's alternative, until the walk comes back around.
+    ///
+    /// [`GraphicsBackend::alternative`] answers one hop, and the hops are pairwise; the chain is
+    /// what turns them into "the pick, then everything else that could work, closest first". It is
+    /// always short - every hop lands in the pair it came from or on a backend whose own
+    /// alternative is already in the chain, and the walk stops rather than revisit one. The walk
+    /// is also what makes the appended backends safe to pick: a Metal request on a phone walks
+    /// Metal, Vulkan, GLES before it gives up, and the two it cannot run are two skipped attempts
+    /// with a log line each.
+    pub fn fallback_chain(self) -> Vec<Self> {
+        let mut chain = vec![self];
+
+        while chain.len() < Self::iter().count() {
+            let next = chain[chain.len() - 1].alternative();
+
+            if chain.contains(&next) {
+                break;
+            }
+
+            chain.push(next);
+        }
+
+        chain
     }
 }
 
@@ -795,9 +947,52 @@ impl Settings {
             default.write();
             default
         };
+
+        // **A config written under an older revision of the defaults is brought up to date here**,
+        // once: the marker written beside the config is what keeps this from running again on a
+        // config a player has since edited on purpose. See `CURRENT_DEFAULTS_REVISION`.
+        let config_revision = stored_defaults_revision(config_path);
+        if setting.migrate_defaults(config_revision) {
+            setting.write();
+            write_defaults_revision(config_path, CURRENT_DEFAULTS_REVISION);
+        }
+
         setting.enforce_android_terrain();
         log::info!("Loaded settings: {setting:?}");
         setting
+    }
+
+    /// Brings a config written under an older revision of the defaults up to the current one.
+    ///
+    /// Answers **whether the revision marker has to be written**, which is also whether
+    /// [`Settings::load_or_default`] persists what this did. The mutations themselves are
+    /// idempotent, so a marker write that failed only means the work runs again on the next
+    /// launch.
+    ///
+    /// **One revision, one migration**, each with the reason it is safe to run on a config a
+    /// player may have edited:
+    ///
+    /// * `1` - `terrain_indirect`. Every build before the batched path's observation period ended
+    ///   wrote `false` into the config it saved, and a saved `false` outlived the default's flip
+    ///   to `on`, so the batching never reached the installs that had been running without it. A
+    ///   config that *omits* the key already takes the new default through serde; only the carried
+    ///   answer needs moving. Once the marker says revision 1, an explicit `false` - the switch
+    ///   answering "did the batching break something" - is read as the player's answer and held.
+    fn migrate_defaults(&mut self, config_revision: u32) -> bool {
+        if config_revision >= CURRENT_DEFAULTS_REVISION {
+            return false;
+        }
+
+        if config_revision < 1 && !self.terrain_indirect.value {
+            log::info!(
+                "wgpu-mc: this config carries the terrain's batching switch from the builds that \
+                 shipped it off; the batched draw is the default the renderer runs now, so the \
+                 switch moves with it - turning it off on the options screen holds from here"
+            );
+            self.terrain_indirect = terrain_indirect_default();
+        }
+
+        true
     }
 
     /// On Android the terrain is always drawn by this side's own path, whatever the config says.
@@ -1190,6 +1385,8 @@ impl LanguageKey for GraphicsBackend {
             GraphicsBackend::Vulkan => "wgpu_mc.option.backend.vulkan",
             GraphicsBackend::DirectX12 => "wgpu_mc.option.backend.directx12",
             GraphicsBackend::GLES => "wgpu_mc.option.backend.gles",
+            GraphicsBackend::Metal => "wgpu_mc.option.backend.metal",
+            GraphicsBackend::WebGPU => "wgpu_mc.option.backend.webgpu",
         }
     }
 }
@@ -2463,8 +2660,165 @@ mod tests {
         assert_eq!(backend["needs_restart"], serde_json::Value::Bool(true));
         assert_eq!(
             backend["variants"],
-            serde_json::json!(["Vulkan", "DirectX 12", "OpenGL ES"]),
+            // The order is load-bearing: the config carries the selected variant as an index into
+            // it, which is why Metal and WebGPU are appended rather than inserted.
+            serde_json::json!(["Vulkan", "DirectX 12", "OpenGL ES", "Metal", "WebGPU"]),
             "the options screen renders these verbatim"
         );
+        assert_eq!(
+            backend["variant_keys"],
+            serde_json::json!([
+                "wgpu_mc.option.backend.vulkan",
+                "wgpu_mc.option.backend.directx12",
+                "wgpu_mc.option.backend.gles",
+                "wgpu_mc.option.backend.metal",
+                "wgpu_mc.option.backend.webgpu",
+            ]),
+            "each variant names where its translation lives"
+        );
+    }
+
+    /// The appended backends answer the platforms their wgpu backends are built on, and every
+    /// other platform skips them at creation - which is the behaviour that makes listing them
+    /// safe. Android is where this mod ships, so it is the platform the assertions name.
+    #[test]
+    fn the_appended_backends_are_available_only_where_they_are_built() {
+        let on_android = cfg!(target_os = "android");
+
+        assert_eq!(
+            GraphicsBackend::Metal.is_available_here(),
+            cfg!(target_vendor = "apple"),
+            "Metal is an Apple-target backend"
+        );
+        assert_eq!(
+            GraphicsBackend::WebGPU.is_available_here(),
+            cfg!(target_arch = "wasm32"),
+            "the browser backend only exists under wasm"
+        );
+        assert!(
+            !on_android || !GraphicsBackend::Metal.is_available_here(),
+            "this mod's Android build cannot bring Metal up"
+        );
+    }
+
+    /// The fallback pairs, on all three platform shapes the decision has. [`GraphicsBackend::
+    /// alternative`] reads the platform from `cfg!`, so the injected form is what a test can
+    /// hold - the same shape `enforce_android_terrain_on` uses for the same reason.
+    #[test]
+    fn the_backend_fallback_pairs_hold_on_every_platform_shape() {
+        // Android: Vulkan and GLES pair, and everything else lands on Vulkan, which reaches GLES
+        // from there - so a Metal pick on a phone walks Metal, Vulkan, GLES.
+        assert_eq!(
+            GraphicsBackend::Vulkan.alternative_on(true, false),
+            GraphicsBackend::GLES
+        );
+        assert_eq!(
+            GraphicsBackend::GLES.alternative_on(true, false),
+            GraphicsBackend::Vulkan
+        );
+        assert_eq!(
+            GraphicsBackend::Metal.alternative_on(true, false),
+            GraphicsBackend::Vulkan
+        );
+        assert_eq!(
+            GraphicsBackend::WebGPU.alternative_on(true, false),
+            GraphicsBackend::Vulkan
+        );
+
+        // Apple: Vulkan and Metal pair - the platform's own API, where a DirectX 12 is not built.
+        assert_eq!(
+            GraphicsBackend::Vulkan.alternative_on(false, true),
+            GraphicsBackend::Metal
+        );
+        assert_eq!(
+            GraphicsBackend::Metal.alternative_on(false, true),
+            GraphicsBackend::Vulkan
+        );
+        assert_eq!(
+            GraphicsBackend::WebGPU.alternative_on(false, true),
+            GraphicsBackend::Metal
+        );
+
+        // Windows and Linux: the pair the desktop always had.
+        assert_eq!(
+            GraphicsBackend::Vulkan.alternative_on(false, false),
+            GraphicsBackend::DirectX12
+        );
+        assert_eq!(
+            GraphicsBackend::DirectX12.alternative_on(false, false),
+            GraphicsBackend::Vulkan
+        );
+    }
+
+    /// The chain the renderer walks never revisits a backend, starts at the pick, and every hop
+    /// in it is an alternative of the one before - or a skipped attempt would be a retry, and a
+    /// retry of a backend that failed is a second failure with the same reason.
+    #[test]
+    fn the_fallback_chain_never_repeats_a_backend() {
+        for backend in GraphicsBackend::iter() {
+            let chain = backend.fallback_chain();
+
+            assert_eq!(chain[0], backend, "the pick comes first");
+            for pair in chain.windows(2) {
+                assert_eq!(
+                    pair[0].alternative(),
+                    pair[1],
+                    "each hop in {chain:?} is an alternative of the one before"
+                );
+            }
+
+            let distinct = chain.iter().collect::<std::collections::HashSet<_>>();
+            assert_eq!(
+                distinct.len(),
+                chain.len(),
+                "{chain:?} visits a backend twice"
+            );
+        }
+    }
+
+    /// The defaults migration, which is what carries the batched draw onto the installs whose
+    /// config has been answering "off" since the builds that shipped it off. The revision is
+    /// handed in rather than read from disk, so the rule is testable without a run directory.
+    #[test]
+    fn the_defaults_migration_moves_a_carried_batching_switch() {
+        let mut carried: Settings =
+            serde_json::from_str(r#"{ "terrain_indirect": { "type": "bool", "value": false } }"#)
+                .expect("a config carrying the observation-era answer");
+
+        assert!(
+            carried.migrate_defaults(0),
+            "a config without a revision marker is due the migration"
+        );
+        assert!(
+            carried.terrain_indirect.value,
+            "the batching the renderer draws now is what the config asks for after the migration"
+        );
+
+        // The same refusal once the marker says the config is current: that answer is the
+        // player's own, and the migration holds off - or the switch would be a constant.
+        let mut refused: Settings =
+            serde_json::from_str(r#"{ "terrain_indirect": { "type": "bool", "value": false } }"#)
+                .expect("the same refusal, under the current revision");
+
+        assert!(!refused.migrate_defaults(CURRENT_DEFAULTS_REVISION));
+        assert!(
+            !refused.terrain_indirect.value,
+            "after the migration an explicit off is the player's answer"
+        );
+    }
+
+    #[test]
+    fn the_defaults_migration_leaves_an_agreeing_config_alone() {
+        let mut settings: Settings = serde_json::from_str(
+            r#"{ "vsync": { "type": "bool", "value": true },
+                  "terrain_indirect": { "type": "bool", "value": true } }"#,
+        )
+        .expect("a config that already agrees with the current defaults");
+
+        // The answer is true - the marker still has to be written, so the check does not run
+        // every launch - and the values are what they were.
+        assert!(settings.migrate_defaults(0));
+        assert!(settings.terrain_indirect.value);
+        assert!(settings.vsync.value);
     }
 }

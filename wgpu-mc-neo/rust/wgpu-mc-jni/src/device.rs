@@ -564,6 +564,11 @@ fn selected_backend() -> GraphicsBackend {
 ///
 /// The mapping lives here rather than as a `From` impl so that `settings.rs` stays free of any
 /// wgpu dependency: it only describes what the options screen is allowed to offer.
+///
+/// The two appended for completeness are honest anyway: a backend bit the instance is built with
+/// but the platform cannot answer simply finds no adapter, which is the skipped attempt
+/// `create_renderer` logs and walks past - `BROWSER_WEBGPU` on a phone is a bit set that matches
+/// nothing, not a call that misbehaves.
 fn wgpu_backends(backend: GraphicsBackend) -> wgpu::Backends {
     match backend {
         GraphicsBackend::Vulkan => wgpu::Backends::VULKAN,
@@ -571,6 +576,8 @@ fn wgpu_backends(backend: GraphicsBackend) -> wgpu::Backends {
         // wgpu's GL backend on Android: EGL against the display the launcher's renderer stack
         // provides, surfaces built from the same ANativeWindow the Vulkan backend gets.
         GraphicsBackend::GLES => wgpu::Backends::GL,
+        GraphicsBackend::Metal => wgpu::Backends::METAL,
+        GraphicsBackend::WebGPU => wgpu::Backends::BROWSER_WEBGPU,
     }
 }
 
@@ -1277,12 +1284,16 @@ pub fn create_renderer(
 ) -> jlong {
     let requested = selected_backend();
 
-    // The configured backend is tried first, then the other one. A backend that is valid in the
-    // config but unusable on this machine - a DX12 config carried onto a machine whose driver
-    // has no DX12 support, or a Vulkan config on a system without a Vulkan ICD - would otherwise
-    // leave the game with no renderer at all and no way to reach the options screen that would
-    // let the player change it back.
-    for backend in [requested, requested.alternative()] {
+    // The configured backend is tried first, then the rest of its fallback chain - the pick, its
+    // alternative, and the alternatives behind that, until the walk comes back around (see
+    // `GraphicsBackend::fallback_chain`). A backend that is valid in the config but unusable on
+    // this machine - a DX12 config carried onto a machine whose driver has no DX12 support, or a
+    // Vulkan config on a system without a Vulkan ICD, or a Metal pick on the phone this mod ships
+    // for - would otherwise leave the game with no renderer at all and no way to reach the options
+    // screen that would let the player change it back. The chain is what turns the appended
+    // backends into picks the game survives: each one that cannot run here is one skipped attempt
+    // with a log line, and the walk goes on to the next.
+    for backend in requested.fallback_chain() {
         if !backend.is_available_here() {
             info!("wgpu-mc: {backend:?} is not available on this platform, skipping it");
             continue;
@@ -1402,8 +1413,8 @@ pub fn create_renderer(
     }
 
     error!(
-        "wgpu-mc: neither {requested:?} nor its alternative could be created; no graphics \
-         backend is available"
+        "wgpu-mc: none of the backends {:?} could be created; no graphics backend is available",
+        requested.fallback_chain()
     );
     0
 }
