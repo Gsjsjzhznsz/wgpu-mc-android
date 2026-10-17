@@ -3395,9 +3395,9 @@ impl RenderGraph {
                     // Built once per scene: the sun never changes and the moon is one buffer per
                     // phase, and rebuilding both every frame was two GPU allocations and two
                     // uploads a frame for data that does not change between them.
-                    let sky = scene.sky_geometry.get_or_init(|| {
-                        crate::render::sky::SkyGeometry::new(&wm.gpu.device)
-                    });
+                    let sky = scene
+                        .sky_geometry
+                        .get_or_init(|| crate::render::sky::SkyGeometry::new(&wm.gpu.device));
 
                     render_pass.set_pipeline(&bound_pipeline.pipeline);
                     let pc = get_environmental_push_constants(scene);
@@ -3422,22 +3422,20 @@ impl RenderGraph {
                     }
 
                     // Built once per scene: the two domes are constants.
-                    let sky = scene.sky_geometry.get_or_init(|| {
-                        crate::render::sky::SkyGeometry::new(&wm.gpu.device)
-                    });
+                    let sky = scene
+                        .sky_geometry
+                        .get_or_init(|| crate::render::sky::SkyGeometry::new(&wm.gpu.device));
 
                     render_pass.set_pipeline(&bound_pipeline.pipeline);
                     let pc = get_environmental_push_constants(scene);
                     set_push_constants(pipeline_config, &mut render_pass, Some(pc));
 
                     render_pass.set_vertex_buffer(0, sky.light_sky.0.slice(..));
-                    render_pass
-                        .set_index_buffer(sky.light_sky.1.slice(..), IndexFormat::Uint32);
+                    render_pass.set_index_buffer(sky.light_sky.1.slice(..), IndexFormat::Uint32);
                     render_pass.draw_indexed(0..24, 0, 0..1);
 
                     render_pass.set_vertex_buffer(0, sky.dark_sky.0.slice(..));
-                    render_pass
-                        .set_index_buffer(sky.dark_sky.1.slice(..), IndexFormat::Uint32);
+                    render_pass.set_index_buffer(sky.dark_sky.1.slice(..), IndexFormat::Uint32);
                     render_pass.draw_indexed(0..24, 0, 0..1);
                 }
                 "@geo_sky_fog" => {
@@ -3451,9 +3449,9 @@ impl RenderGraph {
                     }
 
                     // Built once per scene: the fog sphere is a constant.
-                    let sky = scene.sky_geometry.get_or_init(|| {
-                        crate::render::sky::SkyGeometry::new(&wm.gpu.device)
-                    });
+                    let sky = scene
+                        .sky_geometry
+                        .get_or_init(|| crate::render::sky::SkyGeometry::new(&wm.gpu.device));
 
                     render_pass.set_pipeline(&bound_pipeline.pipeline);
                     let pc = get_environmental_push_constants(scene);

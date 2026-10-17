@@ -1059,22 +1059,97 @@ mod arena_budget_tests {
     use super::*;
     use crate::mc::arena_memory_budget;
 
+    /// **The binding cap is the smaller of the two byte limits, in whole slots.**
+    ///
+    /// The whole of the world-black fix: a bind group binds a buffer entire, and wgpu refuses any
+    /// binding past `max_storage_buffer_binding_size` even when `create_buffer` was happy - the two
+    /// limits are different limits, and sizing a buffer by the larger of them is how a 12-chunk view
+    /// on Adreno 640 made one 192 MB buffer whose bind group could not exist, and with it a world
+    /// that drew nothing. See `mc::arena_buffer_slot_cap`.
+    #[test]
+    fn the_binding_cap_is_the_smaller_limit_in_whole_slots() {
+        use crate::mc::arena_buffer_slot_cap;
+
+        // wgpu's default limits: 128 MiB of binding against a GiB of buffer. The binding binds.
+        assert_eq!(
+            arena_buffer_slot_cap(1 << 30, 128 * 1024 * 1024),
+            128 * 1024 * 1024 / 4,
+        );
+
+        // And the other order, because the function has no reason to care which argument is smaller.
+        assert_eq!(
+            arena_buffer_slot_cap(128 * 1024 * 1024, 1 << 30),
+            128 * 1024 * 1024 / 4,
+        );
+
+        // A device whose per-buffer ceiling is the smaller one: a tiny `max_buffer_size` decides.
+        assert_eq!(arena_buffer_slot_cap(1 << 20, 1 << 30), (1 << 20) / 4);
+
+        // Not a slot of a byte: a byte count that is not a multiple of four rounds down to whole slots.
+        assert_eq!(
+            arena_buffer_slot_cap(1 << 30, 128 * 1024 * 1024 + 3),
+            33_554_432
+        );
+
+        // And the clamp to what a u32 can count, for a device that reports limits past it.
+        assert_eq!(
+            arena_buffer_slot_cap(u64::MAX, u64::MAX),
+            u32::MAX as u64 as u32
+        );
+    }
+
+    /// **The split never makes a buffer the binding cannot take, and never a zero.**
+    ///
+    /// A pool of 50,460,000 slots - the 12-chunk view from the Adreno 640 log, 192 MB - against a
+    /// 128 MiB cap is two buffers, 128 MiB and the remainder. The remainder is why the loop is not a
+    /// `chunks()`: a trailing zero-slot buffer is one wgpu refuses to make, and a zero-sized slice of
+    /// an allocator is a pool that holds nothing.
+    #[test]
+    fn the_split_fits_every_buffer_under_the_cap() {
+        use crate::mc::{arena_buffer_slot_cap, split_arena_slots};
+
+        let cap = arena_buffer_slot_cap(1 << 30, 128 * 1024 * 1024);
+
+        // The pool from the log, and one that fits without a split, and one smaller than a slot's
+        // worth of cap arithmetic - each buffer under the cap, the total the pool that was asked for.
+        for slots in [50_460_000, cap, cap - 1, 1] {
+            let split = split_arena_slots(slots, cap);
+
+            assert_eq!(split.iter().map(|&s| s as u64).sum::<u64>(), slots as u64);
+            assert!(split.iter().all(|&s| s <= cap && s > 0), "{split:?}");
+        }
+
+        // Two of the log's pool: 128 MiB, then the 58 MB the view still wanted.
+        let split = split_arena_slots(50_460_000, cap);
+        assert_eq!(split, vec![33_554_432, 16_905_568]);
+
+        // A zero-slot ask is one slot, because a zero-sized buffer is a refused one and the callers
+        // build a buffer per entry.
+        assert_eq!(split_arena_slots(0, cap), vec![1]);
+    }
+
     /// **The budget is whichever of the device and the policy is smaller**, which is the whole of the fix
     /// for a constant that was calibrated on somebody else's machine.
     ///
     /// The constant said `ARENA_BUFFERS` x `max_buffer_size` "on the machine this was measured on", where
-    /// a buffer is 1.31 GB. That is a 5 GB budget there, and a 5 GB budget here, where a buffer is
-    /// 0.31 GB - so it is fifteen arenas away and the check that uses it never fires, while
-    /// `ARENA_BUFFERS` still allows four, which is more than the device handed over.
+    /// a buffer is 1.31 GB and four of them are the 5 GB the policy allows. The per-buffer ceiling is the
+    /// *binding* limit now (`arena_buffer_slot_cap`, 128 MiB on the default limits), so `ARENA_BUFFERS`
+    /// is thirty-two to keep the reach - and a device whose `max_buffer_size` is a GiB answers thirty-two
+    /// GiB of reach, which is the policy's job to bound: the budget is the policy's 5 GB there, and the
+    /// device's own arithmetic only binds on a device that cannot make 156 MB in one buffer.
     #[test]
     fn the_arena_budget_is_the_smaller_of_the_device_and_the_policy() {
-        // A device that will make a small buffer: four of them is what binds.
-        assert_eq!(arena_memory_budget(300_000_000), 1_200_000_000);
+        // A device that will only make a small buffer: thirty-two of them is what binds, under the
+        // policy.
+        assert_eq!(arena_memory_budget(150_000_000), 4_800_000_000);
 
-        // The device this was found on, whose `max_buffer_size` is 0.31 GB. The budget is four of those
-        // rather than the 5 GB written for 1.31 GB buffers.
-        assert_eq!(arena_memory_budget(328_560_000), 1_314_240_000);
-        assert!(arena_memory_budget(328_560_000) < crate::mc::ARENA_MEMORY_BUDGET);
+        // The device the log came from, whose `max_buffer_size` is 1 GiB: thirty-two of those is far
+        // past the policy, so the policy is the answer and the budget no longer moves with it.
+        assert_eq!(arena_memory_budget(1 << 30), crate::mc::ARENA_MEMORY_BUDGET);
+        assert_eq!(
+            arena_memory_budget(328_560_000),
+            crate::mc::ARENA_MEMORY_BUDGET,
+        );
 
         // A device that will make a very large one: the policy binds, so the arena is not allowed to grow
         // to several times the ceiling by arithmetic alone.

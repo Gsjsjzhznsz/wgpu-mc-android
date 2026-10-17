@@ -844,6 +844,40 @@ fn try_create_renderer(
         adapter_info.name, adapter_info.backend, adapter_info.device_type
     );
 
+    // **The probe that makes the GLES attempt honest.** The arena is read in the vertex stage and
+    // the vertex stage only, so a context without vertex shader storage blocks is a context whose
+    // every terrain pipeline is refused - and the refusal would not even be loud, because pipeline
+    // creation answers the uncaptured error handler and the graph logs the pipeline as skipped.
+    // Asking here, before anything is built, is the difference between "the option did not work, and
+    // the log says why, and the game came up on the other backend" and a world without ground.
+    //
+    // ES 3.1 made storage buffers required in every stage, so this arm is the ES 3.0 case: a
+    // translation layer that only offers an ES 3.0 context, or a driver stuck at 3.0. The indirect
+    // half of the same question is only logged rather than fatal - a pass that cannot batch draws
+    // one section at a time (see `TERRAIN_INDIRECT`), which is slower and still correct.
+    if backend == GraphicsBackend::GLES {
+        let downlevel = adapter.get_downlevel_capabilities().flags;
+
+        if !downlevel.contains(wgpu::DownlevelFlags::VERTEX_STORAGE) {
+            error!(
+                "wgpu-mc: the {backend:?} adapter ({} on {:?}) exposes no vertex-stage storage \
+                 buffers, and the section arena is read in the vertex stage; no terrain pipeline \
+                 could be built. Falling back to {:?}.",
+                adapter_info.name,
+                adapter_info.backend,
+                backend.alternative(),
+            );
+            return None;
+        }
+
+        if !downlevel.contains(wgpu::DownlevelFlags::INDIRECT_EXECUTION) {
+            info!(
+                "wgpu-mc: the {backend:?} adapter cannot execute indirect draws, so the terrain \
+                 pass will draw one section at a time rather than batched"
+            );
+        }
+    }
+
     // `PIPELINE_CACHE` is what lets the driver's own compilation results be carried into the next
     // launch. It is asked for when the adapter has it - Vulkan does, DX12 has no serialisable cache
     // at all - and the device is still created without it if not.
@@ -1214,18 +1248,40 @@ pub fn create_renderer(
             continue;
         }
 
-        // Android runs Vulkan only, by design and by request. The GLES attempt cannot succeed -
-        // wgpu's GL backend needs vertex-stage storage buffers, which GLES drivers do not expose
-        // (the `VERTEX_STORAGE` downlevel flag; the panic it produces names it) - and a failed
-        // attempt is worse than a skipped one: reaching the device would attach the shared
-        // window a second time, and the panic buries the Vulkan error that actually matters
-        // under a second stack trace.
-        if cfg!(target_os = "android") && backend == GraphicsBackend::GLES {
+        // **Android's GLES attempt is real now, not skipped.** It used to be refused here with the
+        // note that wgpu's GL backend needs vertex-stage storage buffers "which GLES drivers do not
+        // expose" - true of GLES 3.0 and false of everything since: ES 3.1 made shader storage
+        // buffers a required feature in *every* stage, the vertex one included, and wgpu's GL backend
+        // answers `DownlevelFlags::VERTEX_STORAGE` exactly when the context reports vertex shader
+        // storage blocks (`gles/adapter.rs`). Every device this mod ships for reports ES 3.1 or 3.2
+        // through its own EGL, so the attempt runs - and what it cannot have it reports rather than
+        // draws wrong:
+        //
+        //  - the shared window is released first, because our EGL context and the launcher's renderer
+        //    stack hold the same `ANativeWindow`, and a second attachment is the `IN_USE` answer the
+        //    Vulkan path already learned to clear (see `egl_release`);
+        //  - the probe in `try_create_renderer` turns a missing `VERTEX_STORAGE` into a clean
+        //    fall-through to the alternative backend, before a pipeline can be built without the arena;
+        //  - and the attempt itself is inside the same `catch_unwind` every backend gets, so a driver
+        //    that panics mid-context-creation costs a log line, not the process.
+        //
+        // What GLES cannot offer is immediates: ES has no push constants, so the graph's terrain
+        // passes - which carry each section's position that way - are not built (see
+        // `create_pipelines`), and the game draws its own meshes for those layers until the graph can
+        // take over, which on GLES is never (`TerrainPass.ready`). That is a slower world than
+        // Vulkan's, not a black one - and it is the option for a device whose Vulkan driver wgpu
+        // cannot bring up at all.
+        // The modules the release needs are Android-only, and so is the attempt: `GLES`
+        // is not `is_available_here` anywhere else, so the gate is on the arm rather than
+        // inside it.
+        #[cfg(target_os = "android")]
+        if backend == GraphicsBackend::GLES {
+            let environ = unsafe { pojav_bridge::resolve_pojav_environ() };
+            let released = unsafe { egl_release::release_window_attachment(environ) };
             info!(
-                "wgpu-mc: {backend:?} is not attempted on Android - the renderer is Vulkan-only \
-                 there"
+                "wgpu-mc: {backend:?} attempt - the launcher's hold on the shared window was \
+                 released first: {released}"
             );
-            continue;
         }
 
         // wgpu-hal's surface creation path is written with `expect`, and a panic reaching the
@@ -5173,7 +5229,8 @@ pub unsafe extern "C" fn compile_render_pipeline(
                         dump_pipeline_refused_or_lost(
                             &compilation,
                             "the GLSL did not parse after preprocessing, so the driver was \
-                             never asked for anything".to_string(),
+                             never asked for anything"
+                                .to_string(),
                             &message,
                             "",
                         );
@@ -6881,8 +6938,10 @@ pub fn setRenderDistance(_env: JNIEnv, _class: JClass, chunks: jint) {
         // device whose `max_buffer_size` is 0.31 GB is a budget fifteen arenas away, and the run that
         // found that out died in `create_buffer`.
         info!(
-            "wgpu-mc: the section arena: up to {} buffer(s) of {} slot(s) ({} MB each, the device's own \
-             `max_buffer_size`), a budget of {} MB, of which the device's limits allow {} MB",
+            "wgpu-mc: the section arena: up to {} buffer(s) of {} slot(s) ({} MB each, the smaller of the \
+             device's `max_buffer_size` and its storage binding limit - a bind group binds a buffer \
+             entire, and past `max_storage_buffer_binding_size` the bind group is refused and the world \
+             draws nothing), a budget of {} MB, of which the device's limits allow {} MB",
             wgpu_mc::mc::ARENA_BUFFERS,
             scene.arena_cap_slots,
             scene.arena_cap_slots as u64 * 4 / (1024 * 1024),
@@ -7910,10 +7969,7 @@ mod per_face_strip_tests {
         let armor = "#version 440\n#define PER_FACE_LIGHTING true\n";
 
         // Mali runs these pipelines as they are; the 2026-10-15 log is the proof.
-        assert_eq!(
-            strip_per_face_lighting_for_adreno("Mali-G710", armor),
-            None
-        );
+        assert_eq!(strip_per_face_lighting_for_adreno("Mali-G710", armor), None);
 
         // An Adreno adapter compiles the ten pipelines that never had the define unchanged.
         assert_eq!(

@@ -149,7 +149,10 @@ pub fn paletteReadPacket(
         // An out-of-range position reads nothing and the packet is refused.
         let start = (current_position as usize).min(array.len());
         unsafe {
-            slice::from_raw_parts(array.as_ptr().offset(start as isize) as *mut u8, array.len() - start)
+            slice::from_raw_parts(
+                array.as_ptr().offset(start as isize) as *mut u8,
+                array.len() - start,
+            )
         }
     };
 
@@ -159,7 +162,10 @@ pub fn paletteReadPacket(
         return 0;
     };
 
-    for blockstate_offset in blockstate_offsets.iter().take(packet_len.unsigned_abs() as usize) {
+    for blockstate_offset in blockstate_offsets
+        .iter()
+        .take(packet_len.unsigned_abs() as usize)
+    {
         let Ok(_var_int) = cursor.read_var_int().map(i32::from) else {
             log::warn!("wgpu-mc: paletteReadPacket: a blockstate could not be read");
             break;

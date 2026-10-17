@@ -384,10 +384,19 @@ pub const PARKED_LIMIT: usize = 256;
 
 impl SectionStorage {
     pub fn new(range: u32) -> Self {
+        Self::with_arenas(vec![range])
+    }
+
+    /// One arena per entry, in the order the buffers are created.
+    ///
+    /// The sizes come from `split_arena_slots`, so this list and `Scene::chunk_buffers` are the same
+    /// list by construction rather than by two computations agreeing: index `i` here is buffer `i`
+    /// there, and a mismatch between them is an allocator handing out ranges in a buffer nobody has.
+    pub fn with_arenas(slots_per_arena: Vec<u32>) -> Self {
         SectionStorage {
             storage: HashMap::new(),
             width: 0,
-            arenas: vec![SectionArena::new(range)],
+            arenas: slots_per_arena.into_iter().map(SectionArena::new).collect(),
             current_arena: 0,
             deferred: vec![Vec::new()],
             deferred_head: 0,
@@ -407,11 +416,20 @@ impl SectionStorage {
     /// before the world has anything to bake - and a later change is refused here rather than corrupting
     /// what is already drawn.
     pub fn set_pool(&mut self, slots: u32) -> bool {
+        self.set_pool_arenas(vec![slots])
+    }
+
+    /// [`Self::set_pool`] with the pool split across arenas up front.
+    ///
+    /// The sizes are per buffer, in buffer order, and they are the same list `Scene::chunk_buffers`
+    /// was built from - see `split_arena_slots`, which is where both come from. One arena per entry,
+    /// because a bind group binds one buffer entire and the binding limit is what made the split.
+    pub fn set_pool_arenas(&mut self, slots_per_arena: Vec<u32>) -> bool {
         if !self.storage.is_empty() {
             return false;
         }
 
-        self.arenas = vec![SectionArena::new(slots)];
+        self.arenas = slots_per_arena.into_iter().map(SectionArena::new).collect();
         self.current_arena = 0;
         self.refused = false;
         self.at_capacity = false;
@@ -2088,7 +2106,11 @@ mod ao_corner_tests {
                                 continue;
                             }
 
-                            let expected = if at_f32(position, axis) as i32 == 0 { -1 } else { 1 };
+                            let expected = if at_f32(position, axis) as i32 == 0 {
+                                -1
+                            } else {
+                                1
+                            };
                             assert_eq!(
                                 at(biases, axis),
                                 expected,

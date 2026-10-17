@@ -20,9 +20,54 @@ pub struct BindableBuffer {
     pub size: BufferAddress,
 }
 
+/// What `as_entire_binding()` on a buffer of `size` bytes may not go past, for the limit that matches
+/// `usage`.
+///
+/// A bind group binds a buffer in ranges, and wgpu refuses a range past the binding limit for the
+/// binding's type - `max_storage_buffer_binding_size` for a storage buffer, `max_uniform_buffer_binding_size`
+/// for a uniform, the storage one when a buffer is both. The limit is per *binding* and separate from
+/// `max_buffer_size`, which is why a buffer the device is happy to make can still be one no bind group
+/// can bind: `create_bind_group` does not answer a `Result`, so the refusal is silent - an uncaptured
+/// error and an invalid bind group whose every use drops the submit. The arena found that the hard way
+/// (see `split_arena_slots`), and this check is what makes the next one loud instead of black.
+fn binding_limit_for(device: &wgpu::Device, usage: wgpu::BufferUsages) -> u64 {
+    let limits = device.limits();
+
+    if usage.contains(wgpu::BufferUsages::STORAGE) {
+        limits.max_storage_buffer_binding_size
+    } else if usage.contains(wgpu::BufferUsages::UNIFORM) {
+        limits.max_uniform_buffer_binding_size
+    } else {
+        // Vertex and index buffers are bound as such, not through bind groups - the arenas use them
+        // that way - so a bind-group-only ceiling does not apply to a buffer with neither flag.
+        u64::MAX
+    }
+}
+
+/// Says whether `size` can be bound entire by a bind group on `device`, and says it loudly when not.
+///
+/// Called beside every `as_entire_binding()` in this file. The call still goes through - refusing it
+/// here would be a second, diverging answer to the one wgpu already gives - but the log names the
+/// buffer, its size and the limit, which is the difference between a diagnosis and a black world.
+fn assert_bindable_entire(device: &wgpu::Device, usage: wgpu::BufferUsages, size: u64) {
+    let limit = binding_limit_for(device, usage);
+
+    if size > limit {
+        log::error!(
+            "wgpu-mc: a {}-byte buffer with usage {usage:?} is about to be bound entire, past the {}-byte \
+             binding limit; its bind group will be invalid and every draw that binds it will be dropped. \
+             The buffer has to be split (see `split_arena_slots`) or bound in ranges.",
+            size,
+            limit,
+        );
+    }
+}
+
 impl BindableBuffer {
     pub fn new(wm: &WmRenderer, data: &[u8], usage: wgpu::BufferUsages, layout_name: &str) -> Self {
         let layout = wm.bind_group_layouts.get(layout_name).unwrap();
+
+        assert_bindable_entire(&wm.gpu.device, usage, data.len() as u64);
 
         let buffer = Arc::new(wm.gpu.device.create_buffer_init(&BufferInitDescriptor {
             label: None,
@@ -56,6 +101,8 @@ impl BindableBuffer {
         assert_eq!(size & 0b11, 0);
 
         let layout = wm.bind_group_layouts.get(layout_name).unwrap();
+
+        assert_bindable_entire(&wm.gpu.device, usage, size);
 
         let buffer = Arc::new(wm.gpu.device.create_buffer(&BufferDescriptor {
             label: None,

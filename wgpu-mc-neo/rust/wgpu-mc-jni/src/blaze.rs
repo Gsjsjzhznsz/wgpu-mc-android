@@ -1150,11 +1150,16 @@ fn call_sampler<'a>(
 /// The report-once flags of the draw-path refusals. Each of these used to be a panic or a wild
 /// dereference - the android.18 crash class: a field the safety comment calls an invariant, NULL
 /// on the day. Every one after the first is refused quietly: a missing draw, not a dead process.
-static NULL_BUFFERS_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static NO_PIPELINE_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static BINDING_OVERFLOW_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static SET_OVERFLOW_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static UNBOUND_SLOT_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static NULL_BUFFERS_REPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static NO_PIPELINE_REPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static BINDING_OVERFLOW_REPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static SET_OVERFLOW_REPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static UNBOUND_SLOT_REPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// The bit that tells a JVM-numbered combination apart from a folded key.
 ///
@@ -1494,7 +1499,8 @@ fn bind_groups_for_call(
                             })
                         }
                         PlannedResource::Sampler => {
-                            let Some((sampler, address)) = call_sampler(&plan.name, binding, &entry)
+                            let Some((sampler, address)) =
+                                call_sampler(&plan.name, binding, &entry)
                             else {
                                 return None;
                             };
@@ -1514,13 +1520,11 @@ fn bind_groups_for_call(
                 return None;
             };
 
-            Some(
-                wm.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(&plan.name),
-                    layout,
-                    entries: &entries,
-                }),
-            )
+            Some(wm.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&plan.name),
+                layout,
+                entries: &entries,
+            }))
         })
         .collect::<Option<Vec<wgpu::BindGroup>>>();
 
@@ -1964,8 +1968,13 @@ fn trace_call(plan: &BindGroupPlan, call: &DrawCall, alignment: u64, key: u64) {
                         Some((buffer, address)) => {
                             let range = entry.offset..entry.offset + entry.length;
                             let size = binding_size(buffer, &range, *min_size);
-                            let dynamic =
-                                dynamic_offset(plan, binding, &range, alignment, min_size.is_some());
+                            let dynamic = dynamic_offset(
+                                plan,
+                                binding,
+                                &range,
+                                alignment,
+                                min_size.is_some(),
+                            );
 
                             format!(
                                 "s{set}/b{} {} id={address:#x} start={} len={} size={} min={:?} {}",
@@ -1978,10 +1987,9 @@ fn trace_call(plan: &BindGroupPlan, call: &DrawCall, alignment: u64, key: u64) {
                                 if dynamic { "DYNAMIC" } else { "baked" }
                             )
                         }
-                        None => format!(
-                            "s{set}/b{} {} NOTHING BOUND",
-                            binding.binding, binding.name
-                        ),
+                        None => {
+                            format!("s{set}/b{} {} NOTHING BOUND", binding.binding, binding.name)
+                        }
                     }
                 }
                 PlannedResource::Storage | PlannedResource::PerDrawStorage => {
@@ -1990,10 +1998,9 @@ fn trace_call(plan: &BindGroupPlan, call: &DrawCall, alignment: u64, key: u64) {
                             "s{set}/b{} {} storage id={address:#x} start={}",
                             binding.binding, binding.name, entry.offset
                         ),
-                        None => format!(
-                            "s{set}/b{} {} NOTHING BOUND",
-                            binding.binding, binding.name
-                        ),
+                        None => {
+                            format!("s{set}/b{} {} NOTHING BOUND", binding.binding, binding.name)
+                        }
                     }
                 }
                 PlannedResource::Texture { .. } => {
@@ -2002,24 +2009,18 @@ fn trace_call(plan: &BindGroupPlan, call: &DrawCall, alignment: u64, key: u64) {
                             "s{set}/b{} {} tex={address:#x}",
                             binding.binding, binding.name
                         ),
-                        None => format!(
-                            "s{set}/b{} {} NOTHING BOUND",
-                            binding.binding, binding.name
-                        ),
+                        None => {
+                            format!("s{set}/b{} {} NOTHING BOUND", binding.binding, binding.name)
+                        }
                     }
                 }
-                PlannedResource::Sampler => {
-                    match call_sampler(&plan.name, binding, &entry) {
-                        Some((_, address)) => format!(
-                            "s{set}/b{} {} sampler={address:#x}",
-                            binding.binding, binding.name
-                        ),
-                        None => format!(
-                            "s{set}/b{} {} NOTHING BOUND",
-                            binding.binding, binding.name
-                        ),
-                    }
-                }
+                PlannedResource::Sampler => match call_sampler(&plan.name, binding, &entry) {
+                    Some((_, address)) => format!(
+                        "s{set}/b{} {} sampler={address:#x}",
+                        binding.binding, binding.name
+                    ),
+                    None => format!("s{set}/b{} {} NOTHING BOUND", binding.binding, binding.name),
+                },
             };
 
             line.push_str(&described);

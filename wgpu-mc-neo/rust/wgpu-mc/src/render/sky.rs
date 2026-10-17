@@ -1,6 +1,6 @@
 use parking_lot::RwLock;
-use wgpu::util::DeviceExt;
 use std::collections::HashMap;
+use wgpu::util::DeviceExt;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]

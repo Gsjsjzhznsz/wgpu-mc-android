@@ -709,9 +709,11 @@ lazy_static! {
 /// after the window is already up.
 ///
 /// Android carries two of them: Vulkan, which the device's own driver provides and which is
-/// the backend the renderer defaults to, and OpenGL ES, which reaches the device through the
-/// EGL the launcher's renderer stack puts in front of the game - the fallback for a device
-/// whose Vulkan driver wgpu cannot bring up.
+/// the backend the renderer defaults to, and OpenGL ES, which the renderer reaches through
+/// its own EGL context on the device's display - an option for a device whose Vulkan driver
+/// wgpu cannot bring up, and a slower one where it can: ES has no push constants, so the
+/// graph's terrain passes are not built there and the game draws its own meshes for those
+/// layers (see `create_renderer` for the attempt, and `TerrainPass.ready` for the takeover).
 #[derive(EnumIter, IntoStaticStr, Eq, PartialEq, Clone, Copy, Debug, Default)]
 pub enum GraphicsBackend {
     #[default]
@@ -2407,10 +2409,9 @@ mod tests {
             "android runs this side's terrain path over the config's answer"
         );
 
-        let mut settings: Settings = serde_json::from_str(
-            r#"{ "terrain": { "type": "bool", "value": true } }"#,
-        )
-        .expect("a config that already agrees");
+        let mut settings: Settings =
+            serde_json::from_str(r#"{ "terrain": { "type": "bool", "value": true } }"#)
+                .expect("a config that already agrees");
         settings.enforce_android_terrain_on(true);
         assert!(settings.terrain.value, "an agreeing config is left alone");
 

@@ -2210,9 +2210,16 @@ mod empty_source_regression {
         // The shape of a pipeline with no defines and the per-draw pad line: the same input the
         // launcher served for the GUI pipeline's depth variant.
         let directives = format!("#version 440\n{}\n", "\n#define WM_CHUNK_PAD 6\n");
-        let error = process_shaders("", "", &directives, &Default::default(), Default::default(), &Default::default())
-            .err()
-            .expect("an empty shader source must not translate");
+        let error = process_shaders(
+            "",
+            "",
+            &directives,
+            &Default::default(),
+            Default::default(),
+            &Default::default(),
+        )
+        .err()
+        .expect("an empty shader source must not translate");
 
         assert!(
             error.contains("the vertex shader did not parse"),

@@ -361,6 +361,52 @@ pub fn arena_growth_slots(
     target.max(largest_section).min(cap_slots).min(room)
 }
 
+/// The most u32 slots **one** arena buffer may hold, from the two limits its two uses have to satisfy.
+///
+/// The two limits are not the same limit. `max_buffer_size` is what `create_buffer` may make; a bind
+/// group that binds the buffer *entire* - which is how the arena is bound, see `BindableBuffer` - is
+/// refused past `max_storage_buffer_binding_size`, and wgpu's default limits put that at **128 MiB**
+/// while the per-buffer ceiling is a GiB or more. An arena buffer sized between the two is a buffer the
+/// device is happy to make and the bind group cannot bind: `create_bind_group` does not answer a
+/// `Result`, the refusal goes to the uncaptured error handler, and what it leaves behind is an *invalid*
+/// bind group whose every `set_bind_group` drops the whole submit - the world black, with the terrain
+/// lines reporting the very sections that could not draw.
+///
+/// Found on Adreno 640: a 12-chunk view reported `arena_slots(12)` = 50,460,000 slots, `set_arena_slots`
+/// made one buffer of 192 MB out of them, and the world was black from the first frame in it - while an
+/// 8-chunk view (105 MB) had always worked, which is why the other devices never saw it.
+///
+/// The smaller of the two byte limits, in whole slots (a slot is four bytes; both limits are byte counts
+/// and a slot cannot be split).
+pub fn arena_buffer_slot_cap(max_buffer_size: u64, max_binding_size: u64) -> u32 {
+    (max_buffer_size.min(max_binding_size) / 4).min(u32::MAX as u64) as u32
+}
+
+/// Splits a pool of `slots` into **per-buffer sizes** no larger than `per_arena` slots each.
+///
+/// The one place the split is decided, so that the two things that have to agree - the allocators in
+/// `SectionStorage` and the buffers in `Scene::chunk_buffers` - are built from the same list rather than
+/// from two computations of the same arithmetic. `Scene::set_arena_slots` and `Scene::new` both feed
+/// their list to both sides.
+///
+/// The last buffer carries the remainder, so a 192 MB pool on a 128 MiB device is a 128 MiB buffer and a
+/// 64 MB one - and never a trailing zero, which wgpu refuses in `create_buffer`. The list is never
+/// empty: a caller that asks for zero slots is answered with one buffer of zero slots is *not*
+/// answered at all - zero-sized buffers are refused - so the floor is one slot.
+pub fn split_arena_slots(slots: u32, per_arena: u32) -> Vec<u32> {
+    let per_arena = per_arena.max(1);
+    let mut split = Vec::new();
+    let mut left = slots.max(1);
+
+    while left > 0 {
+        let take = left.min(per_arena);
+        split.push(take);
+        left -= take;
+    }
+
+    split
+}
+
 /// How many arena buffers the arena may grow to.
 ///
 /// Each is capped at the device's `max_buffer_size`, so this is the arena's ceiling in buffers - and
@@ -368,7 +414,13 @@ pub fn arena_growth_slots(
 /// than a 32-chunk view needs and more than this renderer should be holding. This one exists so that a
 /// device with an unusually large `max_buffer_size` cannot reach the byte budget with a single buffer
 /// and then stop growing before a second would have fit.
-pub const ARENA_BUFFERS: usize = 4;
+///
+/// **Thirty-two, where four was enough for years**, because the cap on one buffer changed. The binding
+/// limit (`arena_buffer_slot_cap`) is the real per-buffer ceiling now - 128 MiB on wgpu's default
+/// limits, against a `max_buffer_size` of a GiB or more - so four buffers held 512 MB, and a 12-chunk
+/// view (192 MB) plus a growth or two was most of it. Thirty-two of them is 4 GiB of *reach*; the byte
+/// budget is what actually binds, and buffers are made only as the world asks for them.
+pub const ARENA_BUFFERS: usize = 32;
 
 /// One terrain pass's own draw buffers, and why one pair for the whole frame is not enough.
 ///
@@ -689,19 +741,45 @@ impl Scene {
             })
             .collect::<Vec<_>>();
 
+        // **The arena starts split across as many buffers as the binding limit asks for.** The
+        // placeholder is `arena_slots(8)` = 105 MB, which fits one 128 MiB binding on the default
+        // limits - but nothing here should depend on that staying true, and a device whose binding
+        // limit is lower would have its world black from the same `create_bind_group` refusal. One
+        // split, one list, both sides built from it: see `split_arena_slots`.
+        let arena_split = split_arena_slots(
+            crate::mc::chunk::ARENA_SLOTS,
+            arena_buffer_slot_cap(
+                wm.gpu.device.limits().max_buffer_size,
+                wm.gpu.device.limits().max_storage_buffer_binding_size,
+            ),
+        );
+
         Self {
-            section_storage: RwLock::new(SectionStorage::new(crate::mc::chunk::ARENA_SLOTS)),
+            section_storage: RwLock::new(SectionStorage::with_arenas(arena_split.clone())),
             camera_section_pos: RwLock::new(IVec3::ZERO),
             trimmed_section_pos: RwLock::new(ivec2(i32::MAX, i32::MAX)),
-            chunk_buffers: ArcSwap::from_pointee(vec![Arc::new(BindableBuffer::new_deferred(
-                wm,
-                crate::mc::chunk::ARENA_SLOTS as u64 * 4,
-                ARENA_USAGE,
-                "ssbo",
-            ))]),
+            chunk_buffers: ArcSwap::from_pointee(
+                arena_split
+                    .into_iter()
+                    .map(|arena_slots| {
+                        Arc::new(BindableBuffer::new_deferred(
+                            wm,
+                            arena_slots as u64 * 4,
+                            ARENA_USAGE,
+                            "ssbo",
+                        ))
+                    })
+                    .collect::<Vec<_>>(),
+            ),
             pending_arena_growth: AtomicU32::new(0),
-            arena_cap_slots: (wm.gpu.device.limits().max_buffer_size / 4).min(u32::MAX as u64)
-                as u32,
+            // The cap on one arena buffer is the binding limit now, not `max_buffer_size`: a buffer
+            // past `max_storage_buffer_binding_size` is one whose bind group cannot be created, and
+            // growth sized by `max_buffer_size` alone would append exactly such buffers. See
+            // `arena_buffer_slot_cap`.
+            arena_cap_slots: arena_buffer_slot_cap(
+                wm.gpu.device.limits().max_buffer_size,
+                wm.gpu.device.limits().max_storage_buffer_binding_size,
+            ),
             arena_memory_budget: arena_memory_budget(wm.gpu.device.limits().max_buffer_size),
             indirect_buffers,
             section_draws,
@@ -746,19 +824,39 @@ impl Scene {
     /// only copy of the geometry that is on screen. `false` is a report that arrived after the world
     /// had been meshed - the arena keeps the size it was built with, and the caller says so.
     pub fn set_arena_slots(&self, wm: &WmRenderer, slots: u32) -> bool {
-        if !self.section_storage.write().set_pool(slots) {
+        // **Split first, then build both sides from the one list.** `slots` is the whole pool the view
+        // wants, and one buffer of it past `max_storage_buffer_binding_size` is a buffer whose bind
+        // group `create_bind_group` refuses - not as a `Result`, but as an invalid bind group and an
+        // uncaptured error, which then drops every terrain submit for the life of the world. The world
+        // went black on Adreno 640 exactly this way at a 12-chunk view (192 MB against a 128 MiB
+        // binding). See `split_arena_slots` and `arena_buffer_slot_cap`.
+        let split = split_arena_slots(
+            slots,
+            arena_buffer_slot_cap(
+                wm.gpu.device.limits().max_buffer_size,
+                wm.gpu.device.limits().max_storage_buffer_binding_size,
+            ),
+        );
+
+        if !self.section_storage.write().set_pool_arenas(split.clone()) {
             return false;
         }
 
         // The old buffers go when the last frame that recorded a draw from them is done with them: the
         // pass holds its own reference, and this drops ours.
-        self.chunk_buffers
-            .store(Arc::new(vec![Arc::new(BindableBuffer::new_deferred(
-                wm,
-                slots as u64 * 4,
-                ARENA_USAGE,
-                "ssbo",
-            ))]));
+        self.chunk_buffers.store(Arc::new(
+            split
+                .into_iter()
+                .map(|arena_slots| {
+                    Arc::new(BindableBuffer::new_deferred(
+                        wm,
+                        arena_slots as u64 * 4,
+                        ARENA_USAGE,
+                        "ssbo",
+                    ))
+                })
+                .collect::<Vec<_>>(),
+        ));
 
         true
     }
