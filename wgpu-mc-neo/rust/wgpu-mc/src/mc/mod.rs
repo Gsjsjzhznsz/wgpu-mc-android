@@ -446,16 +446,23 @@ pub const ARENA_BUFFERS: usize = 32;
 /// sections, out of the last pass's arena slots. Two buffers are the whole fix: pass A's writes land in
 /// A's buffer and pass B's in B's, and the submission's ordering stops mattering.
 ///
-/// The cost is the memory, which is a few hundred kilobytes per pass - see [`SECTION_DRAW_CAPACITY`].
+/// The cost is the memory, which is about a megabyte per pass across the two buffers - see
+/// [`SECTION_DRAW_CAPACITY`].
 pub const SECTION_DRAW_SLOTS: usize = 3;
 
 /// How many draws one pass may hand to the GPU *indirectly*, which is the capacity of every slot's
-/// `DrawIndexedIndirectArgs` buffer: 10,000 records of five `u32`s.
+/// `DrawIndexedIndirectArgs` buffer: 24,000 records of five `u32`s.
 ///
 /// Above this the pass falls back to one `draw_indexed` per section rather than dropping anything - the
-/// indirect buffer is a batching device, not a limit on what can be drawn. It is the number this buffer
-/// has always been sized for.
-pub const INDIRECT_DRAW_CAPACITY: usize = 10_000;
+/// indirect buffer is a batching device, not a limit on what can be drawn.
+///
+/// It was 10,000 for as long as the batching sat behind a switch, because nobody had measured a pass
+/// against it. The port's phones did: a 12-chunk view measured solid and cutout passes at 7,600-8,200
+/// calls a piece, which is the fallback two-thirds of the way up the ladder - and a 16-chunk view
+/// climbs past it, silently losing the batching while looking exactly like a device that cannot batch.
+/// 24,000 keeps a 16-chunk view inside the indirect path with room to spare, at the cost of half a
+/// megabyte per slot.
+pub const INDIRECT_DRAW_CAPACITY: usize = 24_000;
 
 /// How many draws one pass may make at all, indirect or not, which is the capacity of every slot's
 /// [`SectionDraw`] buffer.
@@ -466,11 +473,10 @@ pub const INDIRECT_DRAW_CAPACITY: usize = 10_000;
 /// position there in both paths. A common capacity would make the fallback impossible and turn the
 /// batched path's limit into a hole in the world.
 ///
-/// Past *this* count the extra draws are dropped and said so in the log, once a second. Four thousand
-/// draws is a 32-chunk view's whole surface, so the ceiling is four times a case that has not been
-/// reached; it is here so that the failure is a line in a log rather than a read past the end of a
-/// buffer.
-pub const SECTION_DRAW_CAPACITY: usize = 1 << 14;
+/// Past *this* count the extra draws are dropped and said so in the log, once a second. The ceiling is
+/// twice what a 16-chunk view has measured per pass, so the failure is a line in a log rather than a
+/// read past the end of a buffer.
+pub const SECTION_DRAW_CAPACITY: usize = 1 << 15;
 
 /// One terrain draw's arguments, as the vertex stage reads them: `section_draws[instance_index]`.
 ///

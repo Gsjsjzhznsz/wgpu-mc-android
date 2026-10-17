@@ -108,17 +108,17 @@ pub struct Settings {
     /// Whether the terrain pass draws its sections with `multi_draw_indexed_indirect` rather than one
     /// `draw_indexed` per section. See [`Settings::terrain_indirect`].
     ///
-    /// **Off by default**, and the two reasons are different. The plumbing half: the batched path is
-    /// meant to draw the picture the per-section path draws, so a config that does not mention this key
-    /// is not asking for it either way - and an absent switch falling back to the path that has been
-    /// drawn all along is the answer that cannot surprise anyone. The working half: the terrain pipeline
-    /// is not what is being optimised right now, and a batching path that is not being measured should
-    /// not be what the frame time is measured through.
+    /// **On by default.** The port's target devices are phones, and the per-section path measured
+    /// ~15,000 `draw_indexed` calls a frame there - one per section per layer at a 12-chunk view -
+    /// which is the frame time going into submission work the batched path does not have. Where the
+    /// batching cannot be carried the answer is the same as it ever was, because the setting and the
+    /// device are resolved separately: a device without the three indirect feature bits, a backend
+    /// whose multi-draw is broken, and a pass over the indirect buffer's capacity all fall back to one
+    /// call per section, each with its reason in the log.
     ///
-    /// Where the device or the backend *could not* batch, that is discovered where the device is created
-    /// and reported there - it is not the same question as this switch, and the log says which of the two
-    /// answered. See `device::try_create_renderer` and `wgpu_mc::render::graph::terrain_batches_draws`.
-    #[serde(default = "no_terrain_indirect")]
+    /// See `device::try_create_renderer`, `device::report_device_capabilities` and
+    /// `wgpu_mc::render::graph::terrain_batches_draws`.
+    #[serde(default = "terrain_indirect_default")]
     pub terrain_indirect: BoolSetting,
 
     /// Whether **Minecraft's own** section layers are drawn with `multi_draw_indexed_indirect` rather
@@ -331,16 +331,17 @@ fn no_adv_culling() -> IntSetting {
     IntSetting::of(0, 16, 1, 0)
 }
 
-/// The default of `terrain_indirect`: **off**, which is one `draw_indexed` per section. See
-/// [`Settings::terrain_indirect`] - the batched path is kept behind the switch while the terrain
-/// pipeline is not the thing being worked on, and a player who wants it can still ask for it.
+/// The default of `terrain_indirect`: **on**, which is one `multi_draw_indexed_indirect` per run of
+/// sections that share an arena. See [`Settings::terrain_indirect`] - the per-section path remains
+/// what a device falls back to when it cannot carry the batching, and a player can still turn the
+/// batching off to answer "did the batching break something".
 ///
 /// Named rather than `#[serde(default)]` so that the choice is *stated* here: `#[serde(default)]` would
-/// read as "whatever `BoolSetting` does", which is `true`, and that was in fact the old default - the
-/// one this reverses. The type default and this default have to be changed together, and a test beside
-/// [`Settings::debug`] says which way they are meant to agree.
-fn no_terrain_indirect() -> BoolSetting {
-    BoolSetting::of(false)
+/// read as "whatever `BoolSetting` does", which happens to be `true` too - but the two agreeing by
+/// coincidence is not the same as agreeing on purpose, and a test beside [`Settings::debug`] says
+/// which way they are meant to agree.
+fn terrain_indirect_default() -> BoolSetting {
+    BoolSetting::of(true)
 }
 
 /// The default of `frames_in_flight`: one frame recorded ahead of the one being presented.
@@ -549,14 +550,17 @@ lazy_static! {
         terrain_indirect: SettingInfo::optimization(
             "Draw the terrain's sections with `multi_draw_indexed_indirect` - one draw call per run of \
             sections that share an arena - instead of one `draw_indexed` per section. **Both paths are \
-            meant to draw the same picture**, so this switch answers \"did the batching break \
+            meant to draw the same picture**, so turning this off answers \"did the batching break \
             something\".\n\n\
-            It is forced off where it cannot be worth anything, with the reason in the log. \
-            **DirectX 12 never gets it, and not because multi-draw is missing there** - the call is fine, \
-            but a batch has no channel for the per-draw block: naga's HLSL backend turns `instance_index` \
-            into `SV_InstanceID`, and D3D12 does not put `StartInstanceLocation` in it, so every section \
-            would be drawn at one section's position.",
-            false,
+            On by default: on the phones this port runs on, one call per section measured ~15,000 \
+            calls a frame, and the batching is the difference. It falls back by itself where it cannot \
+            be carried, with the reason in the log - a device without the three indirect feature bits, \
+            or a pass with more draws than the indirect buffer holds. **DirectX 12 never gets it, and \
+            not because multi-draw is missing there** - the call is fine, but a batch has no channel \
+            for the per-draw block: naga's HLSL backend turns `instance_index` into `SV_InstanceID`, \
+            and D3D12 does not put `StartInstanceLocation` in it, so every section would be drawn at \
+            one section's position.",
+            true,
         ),
         section_indirect: SettingInfo::optimization(
             "Draw **Minecraft's own** section layers with `multi_draw_indexed_indirect` - one call per \
@@ -963,14 +967,14 @@ impl Default for Settings {
             diagnostics: BoolSetting::of(false),
             bind_group_cache: BoolSetting::of(true),
             dynamic_offsets: BoolSetting::of(true),
-            // **Off, and it is the third option here to change its mind.** It was on, on the argument
-            // that the batched path draws the same picture and that a config written before the switch
-            // existed was not asking for anything different - both still true. What moved it is what the
-            // frame time is for: the terrain pipeline is not being optimised at the moment, so the path
-            // that is *not* being measured should not be the one the frame goes through, and a batching
-            // path with nobody watching it is a place for a difference to hide. Asking for it is one
-            // setting away, and the picture is meant to be identical when it is on.
-            terrain_indirect: no_terrain_indirect(),
+            // **On, and this is the switch that has changed its mind twice.** It was on, then off on the
+            // argument that the terrain pipeline was not being optimised and an unwatched batching path
+            // is a place for a difference to hide. What moved it back is the phone: the port's target
+            // devices measured ~15,000 `draw_indexed` calls a frame through the per-section path, which
+            // is submission work the batching does not do, and the batched path has now been carried by
+            // runs on the hardware it was written on. Where it cannot be carried, the device half of the
+            // answer says no and the per-section path draws - see [`Settings::terrain_indirect`].
+            terrain_indirect: terrain_indirect_default(),
             section_indirect: BoolSetting::default(),
             pin_camera: BoolSetting::of(false),
             // Off, and by the same reasoning the switch above it is on: the walk is a stricter cull than
@@ -1571,9 +1575,8 @@ mod tests {
 
         // The three that decide how the frame is rendered rather than what is said about it have a
         // heading of their own, above the debug ones - turning one off is a performance decision, not a
-        // diagnostic. **Not all three are on by default any more**: `terrain_indirect` is off, and the
-        // heading is about what the switch decides rather than about its default. See
-        // [`Settings::terrain_indirect`].
+        // diagnostic. All three are on by default now: `terrain_indirect` came back on once the batched
+        // path had been carried on the phones this port targets. See [`Settings::terrain_indirect`].
         //
         // **`terrain_indirect` is the one to check when this list grows.** It was written as a debug
         // switch, because the batched draw path was being brought up and every switch written during
@@ -2346,47 +2349,48 @@ mod tests {
         );
     }
 
-    /// The batched terrain draw is off unless a player asks for it, and the two ways a config can fail
-    /// to ask are both covered here: a file that has never mentioned the key, and the type's own default
-    /// that `#[serde(default)]` would have taken.
+    /// The batched terrain draw is on unless a player turns it off, and the two ways a config can
+    /// speak are both covered here: a file that has never mentioned the key, and the type's own
+    /// default that `#[serde(default)]` would have taken.
     ///
-    /// The second half is the one worth keeping. `BoolSetting::default()` is `true`, so the field's
-    /// serde default had to be *named* to say `false` - and a future change to `BoolSetting`'s `Default`
-    /// would silently move every config that omits the key, which is the failure this asserts against.
+    /// The named default is the part worth keeping. `BoolSetting::default()` is `true`, so the field's
+    /// serde default agrees with the type default *on purpose* rather than by coincidence - and a
+    /// future change to `BoolSetting`'s `Default` would silently move every config that omits the key,
+    /// which is the failure this asserts against.
     #[test]
-    fn the_batched_terrain_draw_is_off_unless_asked_for() {
+    fn the_batched_terrain_draw_is_on_unless_refused() {
         assert!(
-            !Settings::default().terrain_indirect.value,
-            "the renderer draws one section at a time unless a player turns the batching on"
+            Settings::default().terrain_indirect.value,
+            "the renderer batches the terrain's draws unless a player turns the batching off"
         );
         assert!(
-            !no_terrain_indirect().value,
-            "the named default is off: the per-section path is what the renderer draws unless a \
-             player asks for the batching"
+            terrain_indirect_default().value,
+            "the named default is on: the batched path is what the renderer draws on a device that \
+             can carry it"
         );
         assert!(
             BoolSetting::default().value,
-            "**and the type's own default is still `on`**, which is why the serde default had to be \
-             named at all - `#[serde(default)]` would have taken `true`. If this ever becomes `false` \
-             the naming is redundant but harmless; if the assertion above ever fails, the renderer is \
-             drawing the batched path without being asked to"
+            "**and the type's own default is still `on`**, which the named default agrees with on \
+             purpose - if this ever becomes `false` the naming is what keeps the field's default from \
+             silently flipping"
         );
 
         // A config written before the switch existed - which is the shape an existing install has, since
-        // the file carries every key it was written with and no others.
+        // the file carries every key it was written with and no others. The batching is what the
+        // renderer draws now, so an absent switch takes the batching.
         let settings: Settings =
             serde_json::from_str(r#"{ "vsync": { "type": "bool", "value": false } }"#)
                 .expect("config without the batching key");
         assert!(
-            !settings.terrain_indirect.value,
-            "an absent switch takes the path the renderer has always drawn"
+            settings.terrain_indirect.value,
+            "an absent switch takes the batching, which is what the renderer draws by default now"
         );
 
-        // And asking for it still works, in both directions, or the switch would be a constant.
-        let asked: Settings =
-            serde_json::from_str(r#"{ "terrain_indirect": { "type": "bool", "value": true } }"#)
-                .expect("config asking for the batching");
-        assert!(asked.terrain_indirect.value);
+        // And refusing it still works, in both directions, or the switch would be a constant.
+        let refused: Settings =
+            serde_json::from_str(r#"{ "terrain_indirect": { "type": "bool", "value": false } }"#)
+                .expect("config refusing the batching");
+        assert!(!refused.terrain_indirect.value);
     }
 
     /// Android runs the terrain this side draws, whatever the config it was handed says.
