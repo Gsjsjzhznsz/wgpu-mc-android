@@ -422,12 +422,25 @@ fn configure_surface_inner(
         return;
     }
 
+    // `COPY_SRC` is what lets the presented image be read back for diagnostics; surface textures
+    // support it on Vulkan and DX12 - and NOT on GL, where asking for it sank the whole configure
+    // and the first `get_current_texture` panicked with "Surface is not configured for
+    // presentation" (the android.22 startup crash on GLES). Asking only for what the driver
+    // offers keeps the swapchain alive everywhere; on a driver without `COPY_SRC` the readback
+    // entry points answer with a validation error of their own instead of a dead swapchain.
+    let mut surface_usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC;
+    if !capabilities.usages.contains(wgpu::TextureUsages::COPY_SRC) {
+        surface_usage &= wgpu::TextureUsages::RENDER_ATTACHMENT;
+        warn!(
+            "wgpu-mc: the driver does not offer COPY_SRC on the surface, so the presented image \
+             cannot be read back; screenshots and frame dumps of the final present are off"
+        );
+    }
+
     surface.configure(
         &wm.gpu.device,
         &wgpu::SurfaceConfiguration {
-            // `COPY_SRC` is what lets the presented image be read back for diagnostics; surface
-            // textures support it on both Vulkan and DX12.
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            usage: surface_usage,
             format,
             width,
             height,
@@ -2776,6 +2789,26 @@ pub fn wgpu_buffer_usages(usage: u32) -> wgpu::BufferUsages {
     // help being read.
     if usage & 1 == 0 {
         flags.insert(wgpu::BufferUsages::COPY_SRC);
+    }
+
+    // wgpu refuses to create a buffer whose `MAP` bits share the mask with anything but the
+    // opposite `COPY` bit, unless the device advertises `MAPPABLE_PRIMARY_BUFFERS` - the Vulkan
+    // adapters this stack has met do, the GL backend never does, and that is why every ring
+    // uniform and GUI vertex buffer was refused on GLES: the creation failed, every bind group on
+    // it failed, and the frame died with them. Nothing on this stack maps a buffer once it has
+    // left the create entry points - the JVM fills everything through the staging path
+    // (`write_to_buffer` → `Queue::write_buffer_with`, which needs `COPY_DST`, and a `MAP_WRITE`
+    // request sets exactly that) - so a `MAP` bit that would sink the creation is dropped and the
+    // buffer keeps every bind usage it was asked for.
+    if flags.contains(wgpu::BufferUsages::MAP_WRITE)
+        && !(wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC).contains(flags)
+    {
+        flags.remove(wgpu::BufferUsages::MAP_WRITE);
+    }
+    if flags.contains(wgpu::BufferUsages::MAP_READ)
+        && !(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST).contains(flags)
+    {
+        flags.remove(wgpu::BufferUsages::MAP_READ);
     }
 
     flags
@@ -5966,8 +5999,12 @@ pub extern "C" fn write_buffer_with(
 /// `usages` was ignored here, and the two flags written instead were not enough for anything that
 /// also gets bound: a caller asking for `USAGE_UNIFORM_TEXEL_BUFFER` got a buffer with no `STORAGE`,
 /// which is a bind group validation error - and a validation error ends the process on this side.
-/// `mapped_at_creation` requires `MAP_WRITE`, so that one is always set; `MAP_READ` is dropped when
-/// the mask asks for `COPY_SRC`, because wgpu rejects that pair outright.
+/// The mask is translated once in [`wgpu_buffer_usages`], which also drops the `MAP` bits off a
+/// buffer that also gets bound - wgpu refuses to create such a buffer unless the device advertises
+/// `MAPPABLE_PRIMARY_BUFFERS`, and the GL backend never does. What is left is a buffer the JVM can
+/// still fill (a `MAP_WRITE` request carries `COPY_DST` with it) and every bind group can still
+/// take. A pure staging mask is the one case that keeps `MAP_WRITE`, and only that one is created
+/// mapped.
 ///
 /// **The mapping is released before the buffer leaves this side, and that is the pool's precondition.**
 /// There is no entry point that hands a mapped range to the JVM - every write goes through the staging path
@@ -5987,16 +6024,25 @@ pub extern "C" fn allocate_gpu_buffer_mapped(
     LIVE_BUFFER_BYTES.fetch_add(size, Ordering::Relaxed);
     BUFFER_CREATES.fetch_add(1, Ordering::Relaxed);
 
-    let mut usage = wgpu_buffer_usages(usages as u32) | wgpu::BufferUsages::MAP_WRITE;
-    if !usage.contains(wgpu::BufferUsages::COPY_SRC) {
-        usage.insert(wgpu::BufferUsages::MAP_READ);
+    let mut usage = wgpu_buffer_usages(usages as u32);
+
+    // `mapped_at_creation` needs a usage that can carry `MAP_WRITE`, and the mask above keeps that
+    // bit only on a pure staging mask (see `wgpu_buffer_usages`): a buffer that also gets bound is
+    // created unmapped, which is the state this entry handed back anyway - it unmaps before
+    // returning, and the JVM fills it through the staging path.
+    let map_writable = {
+        let candidate = usage | wgpu::BufferUsages::MAP_WRITE;
+        (wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC).contains(candidate)
+    };
+    if map_writable {
+        usage.insert(wgpu::BufferUsages::MAP_WRITE);
     }
 
     let buffer = wm.gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size,
         usage,
-        mapped_at_creation: true,
+        mapped_at_creation: map_writable,
     });
 
     // A creation that was refused - the answer a lost device gives, silently - hands back a
@@ -6004,19 +6050,22 @@ pub extern "C" fn allocate_gpu_buffer_mapped(
     // was unmapped unconditionally used to reach the default error handler and, through it,
     // the abort. Probing the map instead of assuming it keeps this entry point off that path
     // the same way `create_buffer_init` is off it; a zero-sized buffer has no map to probe,
-    // and its unmap is as unconditional as it always was.
-    if size == 0 {
-        buffer.unmap();
-    } else {
-        match buffer.get_mapped_range_mut(..) {
-            Ok(mapping) => {
-                drop(mapping);
-                buffer.unmap();
-            }
-            Err(map_error) => {
-                error!(
-                    "wgpu-mc: a pooled buffer of {size} bytes could not be created: {map_error}"
-                );
+    // and its unmap is as unconditional as it always was. A buffer created unmapped - the
+    // also-gets-bound case above - has no map to release by construction.
+    if map_writable {
+        if size == 0 {
+            buffer.unmap();
+        } else {
+            match buffer.get_mapped_range_mut(..) {
+                Ok(mapping) => {
+                    drop(mapping);
+                    buffer.unmap();
+                }
+                Err(map_error) => {
+                    error!(
+                        "wgpu-mc: a pooled buffer of {size} bytes could not be created: {map_error}"
+                    );
+                }
             }
         }
     }
@@ -7893,6 +7942,66 @@ mod created_buffer_size_tests {
 
         // Below the floor, the floor: the util's `.max(COPY_BUFFER_ALIGNMENT)`.
         assert_eq!(buffer_size_for_contents(1), 4);
+    }
+}
+
+/// The usage masks the JVM hands over, after the map strip that keeps the GL backend creating
+/// anything at all: wgpu refuses `MAP` bits next to bind usages unless the device advertises
+/// `MAPPABLE_PRIMARY_BUFFERS`, and GL never does - android.21 died on GLES with every ring
+/// uniform and GUI vertex buffer refused, and every bind group on them refused after that.
+#[cfg(test)]
+mod buffer_map_usage_tests {
+    use super::{wgpu, wgpu_buffer_usages};
+    use wgpu::BufferUsages as U;
+
+    /// `USAGE_MAP_WRITE | USAGE_UNIFORM` - the Dynamic Transforms / Chunk Sections / Lightmap /
+    /// Fog / Cloud ring mask, the exact one the android.21 GLES log refused nine times at
+    /// startup. The bind usage survives; the map bit that sank the creation does not; the buffer
+    /// stays fillable because `COPY_DST` - which a `MAP_WRITE` request sets - is what the staging
+    /// path (`write_to_buffer`) writes through.
+    #[test]
+    fn a_map_write_next_to_a_bind_usage_loses_the_map_bit_and_keeps_the_binding() {
+        let flags = wgpu_buffer_usages(2 | 128);
+
+        assert!(flags.contains(U::UNIFORM), "the bind usage is the point");
+        assert!(
+            flags.contains(U::COPY_DST),
+            "the staging path writes through COPY_DST"
+        );
+        assert!(
+            !flags.contains(U::MAP_WRITE),
+            "this is the bit that got the buffer refused on GL"
+        );
+    }
+
+    /// The GUI vertex ring mask (`USAGE_MAP_WRITE | USAGE_COPY_DST | USAGE_COPY_SRC |
+    /// USAGE_VERTEX`): same refusal on GLES, same shape of answer.
+    #[test]
+    fn the_gui_vertex_ring_keeps_vertex_and_loses_map_write() {
+        let flags = wgpu_buffer_usages(2 | 8 | 16 | 32);
+
+        assert!(flags.contains(U::VERTEX));
+        assert!(flags.contains(U::COPY_DST));
+        assert!(flags.contains(U::COPY_SRC));
+        assert!(!flags.contains(U::MAP_WRITE));
+    }
+
+    /// A readback mask (`USAGE_MAP_READ | USAGE_COPY_DST`, what `Screenshot` asks for) is the
+    /// legal pairing and must pass through untouched - the strip is for the masks that would
+    /// sink a creation, not for the ones wgpu already takes.
+    #[test]
+    fn a_readback_mask_passes_through_untouched() {
+        assert_eq!(wgpu_buffer_usages(1 | 8), U::MAP_READ | U::COPY_DST);
+    }
+
+    /// `USAGE_COPY_SRC` on its own is the one mask a mapped create can still carry: with
+    /// `MAP_WRITE` added it is exactly the pair wgpu allows, which is what
+    /// `allocate_gpu_buffer_mapped` keys its `mapped_at_creation` on.
+    #[test]
+    fn a_pure_copy_src_mask_is_the_one_a_mapped_create_can_still_carry() {
+        let flags = wgpu_buffer_usages(16);
+        assert_eq!(flags, U::COPY_SRC);
+        assert!((U::MAP_WRITE | U::COPY_SRC).contains(flags | U::MAP_WRITE));
     }
 }
 
