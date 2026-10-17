@@ -133,6 +133,18 @@ pub struct Settings {
     /// See `device::try_create_renderer` and `wgpu_mc::render::graph::terrain_batching_possible`.
     #[serde(default)]
     pub section_indirect: BoolSetting,
+    /// Whether the terrain pass honours the game's occlusion graph. See [Settings::terrain_occlusion].
+    ///
+    /// Defaulted rather than `off`: the behaviour it names is the behaviour the renderer already had, so
+    /// a config written before this switch existed is not asking for anything different. `BoolSetting`'s
+    /// own default is `true`, which is exactly what that needs.
+    ///
+    /// **It sits with the optimizations rather than the debug switches**, and its field is here to keep
+    /// the row order the sections promise: a switch whose off answer is "draw every section the frustum
+    /// contains" is a performance and a correctness decision a player can reach for when terrain shows
+    /// holes, not a marker file written to bisect a picture. See `SettingInfo::optimization`.
+    #[serde(default)]
+    pub terrain_occlusion: BoolSetting,
     /// Whether the player is held still, so that two runs (or two paths) can be compared frame by
     /// frame. See [`Settings::pin_camera`].
     ///
@@ -225,13 +237,6 @@ pub struct Settings {
     /// rather than nothing.
     #[serde(default = "off")]
     pub terrain_no_cull: BoolSetting,
-    /// Whether the terrain pass honours the game's occlusion graph. See [Settings::terrain_occlusion].
-    ///
-    /// Defaulted rather than `off`: the behaviour it names is the behaviour the renderer already had, so
-    /// a config written before this switch existed is not asking for anything different. `BoolSetting`'s
-    /// own default is `true`, which is exactly what that needs.
-    #[serde(default)]
-    pub terrain_occlusion: BoolSetting,
     /// Whether the game's block atlas is sampled from its base mip level only. See
     /// [`Settings::atlas_base_mip_only`].
     #[serde(default = "off")]
@@ -462,6 +467,9 @@ pub struct SettingsInfo {
     dynamic_offsets: SettingInfo,
     terrain_indirect: SettingInfo,
     section_indirect: SettingInfo,
+    /// Under `Optimization` rather than `Debug` - see [`Settings::terrain_occlusion`], whose field
+    /// order this matches.
+    terrain_occlusion: SettingInfo,
     pin_camera: SettingInfo,
     host_validation: SettingInfo,
     gpu_based_validation: SettingInfo,
@@ -480,7 +488,6 @@ pub struct SettingsInfo {
     upload_report: SettingInfo,
     dump_frames: SettingInfo,
     terrain_no_cull: SettingInfo,
-    terrain_occlusion: SettingInfo,
     atlas_base_mip_only: SettingInfo,
     terrain_greater_depth: SettingInfo,
     atlas_lod_bias: SettingInfo,
@@ -533,10 +540,10 @@ lazy_static! {
             false,
         ),
         terrain: SettingInfo {
-            desc: "Draw the terrain from the meshes the Rust baker builds, in the pass Minecraft's own \
-            solid and cutout layers would have used. The translucent layer, the entities and \
-            everything after them stay Minecraft's. Takes about a second to show, because the \
-            sections are meshed again.",
+            desc: "Draw the terrain from the meshes the Rust baker builds - the solid, cutout and \
+            translucent layers all three, which is why Minecraft's own section meshes are skipped \
+            while this is on. The entities and everything after them stay Minecraft's. Takes about a \
+            second to show, because the sections are meshed again.",
             needs_restart: false,
             section: None,
         },
@@ -633,8 +640,11 @@ lazy_static! {
             On by default: on the phones this port runs on, one call per section measured ~15,000 \
             calls a frame, and the batching is the difference. It falls back by itself where it cannot \
             be carried, with the reason in the log - a device without the three indirect feature bits, \
-            or a pass with more draws than the indirect buffer holds. **DirectX 12 never gets it, and \
-            not because multi-draw is missing there** - the call is fine, but a batch has no channel \
+            a pass with more draws than the indirect buffer holds, or a driver the device's own probe \
+            caught failing the batched shape (the probe draws four records whose indices carry their \
+            own record at launch, and a driver that does not draw one record per record does not get \
+            the batching). **DirectX 12 never gets it, and not because multi-draw is missing there** - \
+            the call is fine, but a batch has no channel \
             for the per-draw block: naga's HLSL backend turns `instance_index` into `SV_InstanceID`, \
             and D3D12 does not put `StartInstanceLocation` in it, so every section would be drawn at \
             one section's position.",
@@ -725,14 +735,17 @@ lazy_static! {
             lighting. Applying it rebuilds the graph's pipelines.",
             false,
         ),
-        terrain_occlusion: SettingInfo::debug(
+        terrain_occlusion: SettingInfo::optimization(
             "Honour the game's own occlusion graph and skip the sections it did not name. On is the \
-            faster answer and, while that list is right, the correct one.\n\n\
-            It is a switch because the list is a **snapshot**: it is only refilled when the camera has \
-            turned by more than two degrees or the graph reports a change. A section it has not caught \
-            up with is skipped here while the game's own mesh for it stays suppressed, and a section \
-            neither side draws is a 16x16x16 hole. With this off every section the frustum contains is \
-            drawn.",
+            faster answer and, while that list is right, the correct one. **This is the switch to flip \
+            first if terrain shows 16x16x16 holes** - the list the culling obeys is a snapshot, and a \
+            section it has not caught up with is skipped here while the game's own mesh for it stays \
+            suppressed.\n\n\
+            The snapshot has two guards against going stale: a section the arena has taken over since \
+            the last refill is answered by the frustum instead, and so is everything the frame draws \
+            while the camera has moved out of the section the list was built in (the game refills its \
+            list on a two-degree turn or a graph update, never on movement). With this off, every \
+            section the frustum contains is drawn.",
             true,
         ),
         atlas_base_mip_only: SettingInfo::debug(
@@ -1809,7 +1822,13 @@ mod tests {
         };
 
         let plain = ["backend", "vsync"];
-        let optimization = ["bind_group_cache", "dynamic_offsets", "terrain_indirect"];
+        let optimization = [
+            "bind_group_cache",
+            "dynamic_offsets",
+            "terrain_indirect",
+            "section_indirect",
+            "terrain_occlusion",
+        ];
         let debug = [
             "gpu_based_validation",
             "logging",
@@ -1820,7 +1839,6 @@ mod tests {
             "gpu_timestamps",
             "pix_capture",
             "terrain_no_cull",
-            "terrain_occlusion",
             "atlas_base_mip_only",
             "terrain_greater_depth",
             "adv_culling",
@@ -1901,6 +1919,7 @@ mod tests {
         "dynamic_offsets",
         "terrain_indirect",
         "section_indirect",
+        "terrain_occlusion",
         "pin_camera",
         "adv_culling",
         "host_validation",
@@ -1920,7 +1939,6 @@ mod tests {
         "upload_report",
         "dump_frames",
         "terrain_no_cull",
-        "terrain_occlusion",
         "atlas_base_mip_only",
         "terrain_greater_depth",
         "atlas_lod_bias",

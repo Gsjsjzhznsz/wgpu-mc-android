@@ -58,6 +58,15 @@ enum SectionVisibility {
 /// taken over and the list has judged everything the arena holds.
 static SECTIONS_TOO_NEW: AtomicU64 = AtomicU64::new(0);
 
+/// How many frames obeyed no occlusion list at all because the camera has moved out of the section
+/// the list was built in. See `Scene::visible_sections_camera`.
+///
+/// The movement expiry is a per-frame decision rather than a per-section one, so this counts frames
+/// where it fired - a straight flight shows it climbing between the refills the turns make, and a
+/// camera that only looks around shows zero. A line that never stops moving is a graph that never
+/// catches up with where the player is, which is worth knowing on its own.
+static OCCLUSION_LIST_EXPIRED: AtomicU64 = AtomicU64::new(0);
+
 /// One section that survived the gather: where it is, what the arena holds for each layer, and how far
 /// away it is.
 ///
@@ -939,9 +948,11 @@ fn report_terrain_pass() {
         "wgpu-mc: terrain pass: {drawn} section draw(s) - solid and cutout of one pass, transparent of \
          the other -, {out_of_sight} not named by the game's occlusion graph and old enough to believe, \
          {} too new for it to have judged (the list had not been refilled since they were taken over, so \
-         the frustum decided them instead), {culled} culled by the frustum, {empty} with no layer at \
-         all; per layer: {}",
+         the frustum decided them instead), {} frame(s) that drew from the frustum because the camera has \
+         moved out of the section the list was built in, {culled} culled by the frustum, {empty} with no \
+         layer at all; per layer: {}",
         SECTIONS_TOO_NEW.load(Ordering::Relaxed),
+        OCCLUSION_LIST_EXPIRED.load(Ordering::Relaxed),
         per_layer.join(", ")
     );
 
@@ -2396,6 +2407,23 @@ impl RenderGraph {
             // this set at the publish, under the arena's write lock. See `section_visibility`.
             let sections_since_the_list = scene.sections_since_the_list.read();
 
+            // **And whether the list has been left behind by where the camera is now.** The list is a
+            // snapshot taken at the camera section its refill ran in, and the game refills it on a
+            // two-degree turn or a graph update - never on movement - so a camera that crossed into
+            // another section since then is looking at answers about a place it is no longer in. An
+            // unnamed section it is now exposed to is culled by a list that has not seen it, while
+            // Minecraft's own mesh for it stays suppressed: the 16x16x16 hole a straight flight walks
+            // into, which `sections_since_the_list` cannot catch because the list is older than the
+            // section, not newer. Such a frame asks the frustum about everything instead - over-drawn
+            // by exactly the culling's savings, rather than a hole in it - until the next refill
+            // catches up. Taken after the two locks above and held by nothing else, so the order
+            // cannot cycle. See `Scene::visible_sections_camera`.
+            let list_camera = *scene.visible_sections_camera.read();
+            let list_expired = visible.is_some() && list_camera != camera_section;
+            if list_expired {
+                OCCLUSION_LIST_EXPIRED.fetch_add(1, Ordering::Relaxed);
+            }
+
             // **The walk's own answer, when the setting asks for it.** One flood per frame, into a set
             // the loop below tests by position: the walk is a map of a few thousand sections while the
             // loop visits every section the arena holds, so building the set is the cheap side of that.
@@ -2429,8 +2457,12 @@ impl RenderGraph {
                     let drawn = match flooded.as_ref() {
                         Some(drawn) => drawn.contains(pos),
                         None => {
+                            // A list the camera has moved out of answers about a place the camera is
+                            // not in, so this frame reads it as "no list" - the frustum decides, the
+                            // same way it does before the first list of a session arrives. See
+                            // `Scene::visible_sections_camera`.
                             Self::section_visibility(
-                                visible.as_ref(),
+                                if list_expired { None } else { visible.as_ref() },
                                 &sections_since_the_list,
                                 pos,
                             ) != SectionVisibility::OutOfSight

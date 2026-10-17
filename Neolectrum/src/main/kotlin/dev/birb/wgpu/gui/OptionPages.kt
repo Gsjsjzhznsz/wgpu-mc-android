@@ -187,6 +187,28 @@ class OptionPages : Iterable<OptionPages.Page> {
             .setRange(0, 100)
             .build())
 
+        // The field of view, which is the one row of vanilla's Display group this screen had not
+        // carried: everything around it - brightness, GUI scale, the fullscreen mode, the frame-rate
+        // pair - was already here, and FOV was the gap a player coming from the game's own video
+        // settings notices. The option itself is the game's (`Options#fov`), so the value lives in
+        // `options.txt` and reaches the renderer the same way it reaches the game's own screen.
+        //
+        // The two named ends are vanilla's own words for them: 70 is what the game calls Normal and
+        // 110 is Quake Pro, and both captions come out of the game's language files rather than
+        // being invented here. The range is the option's own 30..110.
+        page.add(IntOption.Builder()
+            .setName(Component.translatable("options.fov"))
+            .setOption(options.fov())
+            .setFormatter { integer ->
+                when (integer) {
+                    70 -> Component.translatable("options.fov.min")
+                    110 -> Component.translatable("options.fov.max")
+                    else -> Component.literal(integer.toString())
+                }
+            }
+            .setRange(30, 110)
+            .build())
+
         page.space()
         page.add(IntOption.Builder()
             .setName(Component.translatable("options.guiScale"))

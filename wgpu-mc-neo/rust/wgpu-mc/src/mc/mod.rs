@@ -700,6 +700,24 @@ pub struct Scene {
     /// answered by the frustum instead; every other unnamed section is still culled, so the occlusion
     /// culling survives for the steady state, where all of its value is.
     pub sections_since_the_list: RwLock<HashSet<IVec3>>,
+
+    /// **The camera section the list above was built at**, captured when the list arrives.
+    ///
+    /// This is the third and last thing that tells a *stale* answer apart from an *occluded* one, and
+    /// it exists because the game refills its list on a two-degree turn or a graph update - **never on
+    /// movement**. A camera that flies a straight line over terrain the graph has already judged never
+    /// triggers either: the list keeps describing the camera's first position, and every section the
+    /// movement has since exposed is unnamed - and, not being "too new" either (it entered the arena
+    /// before the list did), it is culled while Minecraft's mesh for it stays suppressed. That is the
+    /// 16x16x16 hole a straight flight leaves behind it, the one `sections_since_the_list` cannot catch
+    /// because the list is older than the section, not newer.
+    ///
+    /// The gather compares this against the frame's own camera section: a crossing the list did not
+    /// ride through is a list that has not seen what the camera sees, and that frame asks the frustum
+    /// about everything until a refill arrives. Two-degree turns refill far more often than a section
+    /// is crossed, so the windows this opens are short - and a frame drawn from the frustum is
+    /// over-drawn by exactly the culling's savings, not a hole in it.
+    pub visible_sections_camera: RwLock<IVec3>,
 }
 
 impl Scene {
@@ -747,6 +765,13 @@ impl Scene {
 
         self.visible_sections_revision
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // **And the camera the list describes, captured here.** The caller is on the render thread of
+        // the frame whose `applyFrustum` just refilled the list, and this side's `camera_section_pos`
+        // is that same frame's - sent beside the matrices before the gather runs - so the value read
+        // here is the position the game's octree walk started from. See
+        // [`Scene::visible_sections_camera`] for what the gather does with it.
+        *self.visible_sections_camera.write() = *self.camera_section_pos.read();
     }
 
     /// Records that the arena has taken one section over. See [`Scene::sections_since_the_list`].
@@ -864,6 +889,7 @@ impl Scene {
             visible_sections: RwLock::new(None),
             visible_sections_revision: AtomicU64::new(0),
             sections_since_the_list: RwLock::new(HashSet::new()),
+            visible_sections_camera: RwLock::new(IVec3::ZERO),
         }
     }
 

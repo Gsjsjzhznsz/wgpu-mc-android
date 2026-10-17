@@ -1051,6 +1051,315 @@ pub fn probe_first_instance_fetch(device: &wgpu::Device, queue: &wgpu::Queue) ->
     answer
 }
 
+/// What the index-record probe concluded: 0 not run, 1 passed, 2 failed.
+///
+/// The terrain's own answer, beside [`FIRST_INSTANCE_PROBE`], which is the game path's.
+static INDEX_RECORD_PROBE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// One baked index of the probe's index buffer, spelled the way a bake spells every index it
+/// writes: the record slot above [`crate::mc::RECORD_ID_SHIFT`], the local vertex below it.
+///
+/// Split out so the encoding the probe draws with is the encoding a test can name - the whole
+/// question this probe asks is "does a multi-draw whose indices carry their record this way draw
+/// one record per record", and a test of the *decoder* half of that question is worthless unless
+/// the encoder it runs against is the one the probe runs against.
+fn probe_index_word(record_slot: u32, local_vertex: u32) -> u32 {
+    (record_slot << crate::wgpu_mc::mc::RECORD_ID_SHIFT) | local_vertex
+}
+
+/// Whether a batched multi-draw whose records travel **in the indices** draws one record per
+/// record, on this device - asked with the exact shape the terrain pass draws with.
+///
+/// The first-instance probe settled the fate of the *game* path's per-draw channel, and for two
+/// releases the terrain's move to index-carried records was taken to have left the probe's question
+/// behind - "its record channel is the indices, which no probe can take away". The device this port
+/// targets then drew a hollow world through the new channel too, which is how this file learned
+/// that a probe of the old channel says nothing about the new one: a driver can break a batched
+/// call in more than one way, and the ways are only told apart by asking each shape itself. This
+/// is the terrain's shape, whole:
+///
+/// - the records live in a **storage table** (`@group(0)`), read through the high bits of the
+///   fetched index, exactly as `terrain.wgsl` reads [`crate::mc::SectionRecord`];
+/// - the indices carry `(slot << 17) | local vertex`, exactly as a bake writes them (see
+///   [`probe_index_word`]);
+/// - one `multi_draw_indexed_indirect` carries **all four records**, each naming its own
+///   `first_index`, with `base_vertex` and `first_instance` zero - the convention the terrain's
+///   indirect arguments are written in.
+///
+/// Record `r` draws pixel `r` and carries sentinel `100 + r` in the table, so the readback answers
+/// every failure mode with its own shape: a collapsed call (every record drawing the first record's
+/// indices) reads 100 four times, a dead one reads zeros, an unrun one the clear colour - the same
+/// three-way split [`the_probe_records_came_back`] separates.
+///
+/// A `false` here takes the terrain's batching away
+/// (`set_terrain_batching_possible(false)`): the pass falls back to one draw per section, which
+/// draws correctly and slowly - the state every device was in before the batching ever shipped,
+/// and the state this device has proven it can draw.
+pub fn probe_index_record_batching(device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+    const RECORDS: u64 = 4;
+    const INDICES_PER_RECORD: u64 = 6;
+
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("wgpu-mc: the index-record probe"),
+        source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
+            r#"
+            // wgpu-mc: the index-record probe. The terrain's own shape, miniaturised: the index
+            // carries its record's slot above the local vertex id, the vertex stage reads the
+            // record out of a storage table through those bits, and the indirect record says
+            // nothing about which draw it is. Record r draws pixel r with its sentinel.
+            @group(0) @binding(0) var<storage> records: array<u32>;
+
+            struct ProbeOut {
+                @builtin(position) pos: vec4<f32>,
+                @location(0) @interpolate(flat) record: u32,
+            }
+
+            @vertex
+            fn vert(@builtin(vertex_index) vi: u32) -> ProbeOut {
+                let record = records[vi >> 17u];
+                let corner = vi & 3u;
+                let pixel = f32(record - 100u);
+
+                let x = pixel * 0.5 - 1.0 + f32(corner & 1u) * 0.5;
+                let y = f32(corner >> 1u) * 2.0 - 1.0;
+
+                var out: ProbeOut;
+                out.pos = vec4<f32>(x, y, 0.0, 1.0);
+                out.record = record;
+                return out;
+            }
+
+            @fragment
+            fn frag(in: ProbeOut) -> @location(0) u32 {
+                return in.record;
+            }
+            "#,
+        )),
+    });
+
+    let table_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("wgpu-mc: the index-record probe table layout"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("wgpu-mc: the index-record probe layout"),
+        bind_group_layouts: &[Some(&table_layout)],
+        immediate_size: 0,
+    });
+
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("wgpu-mc: the index-record probe"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vert"),
+            compilation_options: Default::default(),
+            // **No vertex buffer.** The terrain's pipelines declare none either - the record is
+            // not fetched by the input assembler any more, and this probe would not be testing
+            // the terrain's shape if it declared the fetch that shape has retired.
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("frag"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::R32Uint,
+                blend: None,
+                write_mask: wgpu::ColorWrites::default(),
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    // The table, one sentinel per slot, in the shape `Scene::section_records` has: a storage
+    // buffer the vertex stage reads through the index's own bits.
+    let table = create_buffer_with_contents(
+        device,
+        "wgpu-mc: the index-record probe records",
+        wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+        bytemuck::cast_slice(&PROBE_SENTINELS),
+    );
+
+    let table_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("wgpu-mc: the index-record probe table"),
+        layout: &table_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: table.as_entire_binding(),
+        }],
+    });
+
+    // The indices: per record, the two triangles of its quad, every word carrying the record's
+    // slot above its local vertex id - the same OR a bake applies at upload (see `chunk.rs`, which
+    // patches the slots in). Local vertex ids here are 0..4, well inside the 17 bits.
+    let mut indices = Vec::with_capacity((RECORDS * INDICES_PER_RECORD) as usize);
+    for record in 0..RECORDS as u32 {
+        for corner in [0u32, 1, 2, 0, 2, 3] {
+            indices.push(probe_index_word(record, corner));
+        }
+    }
+
+    let index_buffer = create_buffer_with_contents(
+        device,
+        "wgpu-mc: the index-record probe indices",
+        wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::INDEX,
+        bytemuck::cast_slice(&indices),
+    );
+
+    let indirect_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu-mc: the index-record probe indirect records"),
+        size: RECORDS * std::mem::size_of::<wgpu::util::DrawIndexedIndirectArgs>() as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::INDIRECT,
+        mapped_at_creation: false,
+    });
+
+    let target = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("wgpu-mc: the index-record probe target"),
+        size: wgpu::Extent3d {
+            width: RECORDS as u32,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Uint,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu-mc: the index-record probe readback"),
+        size: 256,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let args = (0..RECORDS)
+        .map(|r| wgpu::util::DrawIndexedIndirectArgs {
+            index_count: INDICES_PER_RECORD as u32,
+            instance_count: 1,
+            first_index: (r * INDICES_PER_RECORD) as u32,
+            // **Zero on both, always** - that is the convention the terrain's records are written
+            // in, and the one thing this probe must not smuggle back in.
+            base_vertex: 0,
+            first_instance: 0,
+        })
+        .collect::<Vec<_>>();
+
+    queue.write_buffer(&indirect_buffer, 0, bytemuck::cast_slice(&args));
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("wgpu-mc: the index-record probe"),
+    });
+
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("wgpu-mc: the index-record probe"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 999.0,
+                        g: 999.0,
+                        b: 999.0,
+                        a: 999.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &table_bind, &[]);
+        pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        pass.multi_draw_indexed_indirect(&indirect_buffer, 0, RECORDS as u32);
+    }
+
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &target,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(256),
+                rows_per_image: Some(1),
+            },
+        },
+        wgpu::Extent3d {
+            width: RECORDS as u32,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    queue.submit([encoder.finish()]);
+
+    let slice = readback.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+
+    if device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
+        .is_err()
+    {
+        return false;
+    }
+
+    if receiver.recv().is_err() {
+        return false;
+    }
+
+    let Ok(data) = slice.get_mapped_range() else {
+        return false;
+    };
+
+    let words: &[u32] = bytemuck::cast_slice(&data[..16]);
+    let answer = the_probe_records_came_back(words);
+
+    drop(data);
+    readback.unmap();
+
+    INDEX_RECORD_PROBE.store(
+        if answer { 1 } else { 2 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
+    answer
+}
+
 /// Writes the lines about what the device can do, from somewhere the log is actually listening.
 ///
 /// Called once per world, beside the arena sizing, which is a line that is known to reach the log -
@@ -1073,11 +1382,11 @@ fn report_device_capabilities() {
     // resolved into the one flag the draw path reads. See `debug::apply`.
     //
     // **The ways it can be off are named separately**, because they call for different things: a
-    // switch that is off is a setting, a device that cannot is hardware, and DirectX 12 stays
-    // excluded until a machine of that backend has been measured (see `try_create_renderer`). The
-    // probe is **not** one of the terrain's reasons any more: its record channel is the indices,
-    // which no probe can take away - the probe's answer is the game path's batching, reported below
-    // and read by nothing that draws terrain.
+    // switch that is off is a setting, a device that cannot is hardware, a probe that failed is a
+    // driver answering for itself, and DirectX 12 stays excluded until a machine of that backend
+    // has been measured (see `try_create_renderer`). The terrain's records travel in the indices,
+    // and the probe of that exact shape is the index-record probe below - the first-instance probe
+    // answers for the game path only.
     info!(
         "wgpu-mc: the terrain pass is drawing {}",
         if wgpu_mc::render::graph::terrain_batches_draws() {
@@ -1091,18 +1400,22 @@ fn report_device_capabilities() {
              buffer read per draw on top"
         } else if !wgpu_mc::render::graph::terrain_indirect_requested() {
             "one section at a time: the `terrain_indirect` switch is off, and this device could batch"
+        } else if INDEX_RECORD_PROBE.load(Ordering::Relaxed) == 2 {
+            "one section at a time, because the index-record probe failed: this driver was asked to \
+             draw four records whose indices carry their own record, and it did not draw one record \
+             per record - the batched call is not safe here"
         } else {
             "one section at a time: this is the DirectX 12 backend, which stays excluded until a \
              machine of that backend has measured the batched path"
         }
     );
 
-    // What the probe itself said, which is now a sentence about the **game path's** channel: the
+    // What the probe itself said, which is a sentence about the **game path's** channel: the
     // game's batched draws carry their per-draw data through a record's `first_instance`, and the
-    // probe is the driver demonstrating the fetch. The terrain needs no such proof - it stopped using
-    // the channel - so a failed probe costs the game path's batching and nothing else. The three
-    // answers are named, because "not run" is itself information - it means the batching was
-    // never going to happen anyway.
+    // probe is the driver demonstrating the fetch. The terrain's records travel in the indices, so
+    // a failed probe costs the game path's batching and nothing else - the terrain has a probe of
+    // its own, reported beside this one. The three answers are named, because "not run" is itself
+    // information - it means the batching was never going to happen anyway.
     match FIRST_INSTANCE_PROBE.load(Ordering::Relaxed) {
         1 => info!(
             "wgpu-mc: the first-instance probe drew four records and read its four sentinels back in \
@@ -1110,12 +1423,32 @@ fn report_device_capabilities() {
         ),
         2 => info!(
             "wgpu-mc: the first-instance probe did not read its sentinels back in order, so the \
-             game's own draws will not batch on this driver - the terrain pass is unaffected, its \
-             records travel in the indices"
+             game's own draws will not batch on this driver - the terrain pass has its own probe \
+             of its own record channel, reported below"
         ),
         _ => info!(
             "wgpu-mc: the first-instance probe did not run, because the game path's batching was \
              already ruled out by the adapter or the backend"
+        ),
+    }
+
+    // The terrain's own proof: a multi-draw whose indices carry their record - the exact shape the
+    // batched terrain pass draws with - drawing one record per record. This is the question the
+    // first-instance probe cannot answer, and the hollow world a driver can draw through the new
+    // channel while passing the old probe is the reason it is asked.
+    match INDEX_RECORD_PROBE.load(Ordering::Relaxed) {
+        1 => info!(
+            "wgpu-mc: the index-record probe drew four records through one multi-draw and read its \
+             four sentinels back in order: the batched terrain path works on this driver"
+        ),
+        2 => info!(
+            "wgpu-mc: the index-record probe did not read its sentinels back in order, so the batched \
+             terrain path does not draw one record per record on this driver - the terrain pass falls \
+             back to one draw per section, which draws correctly"
+        ),
+        _ => info!(
+            "wgpu-mc: the index-record probe did not run, because the terrain's batching was already \
+             ruled out by the adapter or the backend"
         ),
     }
 
@@ -1356,6 +1689,11 @@ fn try_create_renderer(
     // backend is not what any of this port's phones run, a fallback that draws correctly is what the
     // exclusion costs, and a defect found by shipping is more expensive than a feature not yet taken.
     //
+    // This is the **optimistic** answer, resolved from the adapter's claims before a device exists.
+    // Once the device does exist, the index-record probe asks the terrain's exact shape whether this
+    // driver draws it (see `probe_index_record_batching`) and narrows the answer to what the device
+    // demonstrated - a claim is what the driver says, a probe is what it does.
+    //
     // The game path keeps its own reason, unchanged: its per-draw channel is `first_instance`, which
     // D3D12 honours for instance-step fetches - but that answer is the probe's to give, below, and
     // the backend exclusion here is the conservative one for both readers.
@@ -1525,6 +1863,20 @@ fn try_create_renderer(
         && probe_first_instance_fetch(&device, &queue);
 
     wgpu_mc::render::graph::set_game_batching_possible(game_batching);
+
+    // **The terrain's own probe, of the terrain's own shape.** The batching the terrain pass draws
+    // with carries each record in its own indices and needs nothing per draw - which is why it was
+    // taken to be beyond the reach of the first-instance probe, and why a device could hollow a
+    // world through it while passing that probe. This one asks the exact shape: indices encoding
+    // their record, one storage table, one multi-draw, four records that must each draw once. The
+    // optimistic `set_terrain_batching_possible` above resolved the adapter's claims; this resolves
+    // the device's behaviour, and a driver that fails here draws one section at a time - correct
+    // and slow, the same fallback a refused capability gets. See `probe_index_record_batching`.
+    let terrain_batching = backend != GraphicsBackend::DirectX12
+        && can_multi_draw_indirect()
+        && probe_index_record_batching(&device, &queue);
+
+    wgpu_mc::render::graph::set_terrain_batching_possible(terrain_batching);
 
     // **The limits the device answered with, once per launch.** Alignment is the one limit a port
     // has to reason about on the JVM side - the per-draw ring's stride comes from
@@ -8535,5 +8887,41 @@ mod per_face_strip_tests {
 
         // Short reads and long ones are the copy going wrong, not the fetch.
         assert!(!the_probe_records_came_back(&[100, 101, 102]));
+    }
+
+    /// The index-record probe's index words have to be spelled exactly as a bake spells them - the
+    /// record slot above `RECORD_ID_SHIFT`, the local vertex below it - because the probe's whole
+    /// value is that it draws the terrain's shape. An encoder that drifted from the bake's would
+    /// probe one question while the terrain asks another.
+    #[test]
+    fn the_index_record_probe_encodes_the_way_a_bake_does() {
+        // The decode the shader does by hand, applied to the encoder's output: the slot above,
+        // the corner below, and neither bleeding into the other.
+        for record in [
+            0u32,
+            1,
+            2,
+            3,
+            16_383,
+            crate::wgpu_mc::mc::SECTION_DRAW_CAPACITY as u32 - 1,
+        ] {
+            for corner in [0u32, 1, 2, 3] {
+                let word = probe_index_word(record, corner);
+                assert_eq!(word >> crate::wgpu_mc::mc::RECORD_ID_SHIFT, record);
+                assert_eq!(word & crate::wgpu_mc::mc::LOCAL_VERTEX_MASK, corner);
+            }
+        }
+
+        // The largest index the format can hold - the last slot's last local vertex - is exactly
+        // u32::MAX, and it still divides: the two halves sum to one word with nothing left over.
+        let word = probe_index_word(
+            crate::wgpu_mc::mc::SECTION_DRAW_CAPACITY as u32 - 1,
+            crate::wgpu_mc::mc::LOCAL_VERTEX_MASK,
+        );
+        assert_eq!(word, u32::MAX);
+        assert_eq!(
+            word >> crate::wgpu_mc::mc::RECORD_ID_SHIFT,
+            crate::wgpu_mc::mc::SECTION_DRAW_CAPACITY as u32 - 1
+        );
     }
 }
