@@ -38,6 +38,20 @@ kotlin {
         }
 }
 
+loom {
+        // **The sourceset, declared as the mod it is.** Without this block loom has no reason to
+        // read this module's fabric.mod.json as *metadata about this build* - and the access
+        // widener that file names is discovered through exactly that read: the widener path stays
+        // empty, `validateAccessWidener` runs with no source, and every member the widener opens
+        // is unresolved at compile time. The example mod carries the same block for the same
+        // reason.
+        mods {
+                create(modId) {
+                        sourceSet(sourceSets.main.get())
+                }
+        }
+}
+
 // NOTE: the toolchain above is the whole Java story - 26.1 needs Java 25 and the toolchain pins
 // both the compiler and the loader's floor. (A second `java { sourceCompatibility }` block was
 // here and went: the toolchain is what counts, and the accessor `java` shadows the `java` package
