@@ -121,6 +121,18 @@ pub struct Settings {
     #[serde(default = "terrain_indirect_default")]
     pub terrain_indirect: BoolSetting,
 
+    /// Whether the terrain pass may fall back to drawing the frame's sections as **one draw over a
+    /// compacted index buffer**, where the batched call above cannot be carried. See
+    /// [`Settings::terrain_mega`].
+    ///
+    /// **On by default**, because the device that needs it is the device this port ships for: an
+    /// Adreno 640 whose driver advertises every feature the batched path asks for and then fails the
+    /// device's own probe of it, which without this draws one call per section - thousands a frame.
+    /// The compacted draw asks the driver for nothing the probe did not already prove: a plain
+    /// `draw_indexed` over a buffer the frame copies its visible sections' index ranges into.
+    #[serde(default = "terrain_mega_default")]
+    pub terrain_mega: BoolSetting,
+
     /// Whether **Minecraft's own** section layers are drawn with `multi_draw_indexed_indirect` rather
     /// than one call per section. See [`Settings::section_indirect`].
     ///
@@ -425,6 +437,13 @@ fn terrain_indirect_default() -> BoolSetting {
     BoolSetting::of(true)
 }
 
+/// The default of `terrain_mega`: **on**, because the frame it saves is the one the port's target
+/// devices live in - the batched call refused by their own driver, and thousands of per-section
+/// draws otherwise. See [`Settings::terrain_mega`].
+fn terrain_mega_default() -> BoolSetting {
+    BoolSetting::of(true)
+}
+
 /// The default of `frames_in_flight`: one frame recorded ahead of the one being presented.
 ///
 /// Written out rather than left to `IntSetting::default`, whose range is 0..100 - and a zero here
@@ -466,6 +485,7 @@ pub struct SettingsInfo {
     bind_group_cache: SettingInfo,
     dynamic_offsets: SettingInfo,
     terrain_indirect: SettingInfo,
+    terrain_mega: SettingInfo,
     section_indirect: SettingInfo,
     /// Under `Optimization` rather than `Debug` - see [`Settings::terrain_occlusion`], whose field
     /// order this matches.
@@ -648,6 +668,19 @@ lazy_static! {
             for the per-draw block: naga's HLSL backend turns `instance_index` into `SV_InstanceID`, \
             and D3D12 does not put `StartInstanceLocation` in it, so every section would be drawn at \
             one section's position.",
+            true,
+        ),
+        terrain_mega: SettingInfo::optimization(
+            "Draw the terrain as **one draw call per run of sections that share an arena, over a \
+            per-frame index buffer the frame copies its visible sections into** - the fallback \
+            batcher for a device whose driver fails the batched call's own probe (an advertised \
+            multi-draw that does not draw one record per record). The copies are blits and the draw \
+            is a plain `draw_indexed`, which is the shape the probe cannot catch lying about.
+
+\
+            On by default, and it only matters where the batching above is closed: with the multi-draw \
+            probe passed, this does nothing. Turn it off to see the per-section path a driver like \
+            that would otherwise draw - thousands of calls a frame.",
             true,
         ),
         section_indirect: SettingInfo::optimization(
@@ -1183,6 +1216,7 @@ impl Default for Settings {
             // runs on the hardware it was written on. Where it cannot be carried, the device half of the
             // answer says no and the per-section path draws - see [`Settings::terrain_indirect`].
             terrain_indirect: terrain_indirect_default(),
+            terrain_mega: terrain_mega_default(),
             section_indirect: BoolSetting::default(),
             pin_camera: BoolSetting::of(false),
             // Off, and by the same reasoning the switch above it is on: the walk is a stricter cull than
@@ -1260,6 +1294,11 @@ pub struct DebugSettings {
     /// `wgpu_mc::render::graph::set_terrain_indirect`, and what the device and the backend allow is
     /// recorded separately, in `device::try_create_renderer`.
     pub terrain_indirect: bool,
+    /// Whether the terrain pass may draw over the frame's compacted index buffer where the batched
+    /// call cannot be carried. See [`Settings::terrain_mega`] - and note that this is the *setting*:
+    /// what the device allows is a different half of the answer, resolved where the batched call
+    /// itself is.
+    pub terrain_mega: bool,
     /// Whether Minecraft's own section layers are batched. See [`Settings::section_indirect`].
     pub section_indirect: bool,
     /// Whether the player is held still for a frame comparison. See [`Settings::pin_camera`].
@@ -1304,6 +1343,7 @@ impl Settings {
             terrain_occlusion: self.terrain_occlusion.value,
             adv_culling: self.adv_culling.value.clamp(0, 16) as u8,
             terrain_indirect: self.terrain_indirect.value,
+            terrain_mega: self.terrain_mega.value,
             section_indirect: self.section_indirect.value,
             pin_camera: self.pin_camera.value,
             atlas_base_mip_only: self.atlas_base_mip_only.value,
@@ -1826,6 +1866,7 @@ mod tests {
             "bind_group_cache",
             "dynamic_offsets",
             "terrain_indirect",
+            "terrain_mega",
             "section_indirect",
             "terrain_occlusion",
         ];
@@ -1908,7 +1949,7 @@ mod tests {
 
     /// Every setting's name, which is the same in both documents. Kept as a list because the two
     /// documents' own key order is not readable through `serde_json::Value` - see the test above.
-    const NAME_LIST: [&str; 34] = [
+    const NAME_LIST: [&str; 35] = [
         "backend",
         "vsync",
         "fullscreen_mode",
@@ -1918,6 +1959,7 @@ mod tests {
         "bind_group_cache",
         "dynamic_offsets",
         "terrain_indirect",
+        "terrain_mega",
         "section_indirect",
         "terrain_occlusion",
         "pin_camera",

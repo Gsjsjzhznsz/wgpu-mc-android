@@ -27,16 +27,96 @@ private val NATIVE_RESOURCE_ROOTS = listOf("META-INF/natives/", "assets/wgpu_mc/
  * cannot have them all flat under one name. The device's own directory is tried first, then the
  * flat roots a desktop-populated jar uses, so a jar that carries exactly one Android library and
  * nothing else still loads on a device whose ABI string this build does not name.
+ *
+ * The Apple platforms are the same story with different names: an `ios-arm64/` directory and the
+ * two `macos-*/` ones under the same `natives/` root, each holding that build's
+ * `libwgpu_mc_jni.dylib`. A jar from the release pipeline carries all of them, and the probe order
+ * puts the platform this process looks like first - an iPhone before a Mac, an arm64 Mac before an
+ * Intel one - so a jar that carries every platform still loads the one that can actually run here.
+ * A wrong guess is not silent: the dylib that does not belong fails `System.load`, and the retry in
+ * [load] re-extracts and reports the failure by name.
  */
 private fun nativeResourceRoots(): List<String> {
-        if (!AndroidRuntime.isAndroid) return NATIVE_RESOURCE_ROOTS
+        if (AndroidRuntime.isAndroid) {
+                val abiRoot = AndroidRuntime.abiResourceDirectory("assets/wgpu_mc/natives")
+                return listOfNotNull(
+                        abiRoot,
+                        "assets/wgpu_mc/natives/",
+                        "META-INF/natives/",
+                )
+        }
 
-        val abiRoot = AndroidRuntime.abiResourceDirectory("assets/wgpu_mc/natives")
-        return listOfNotNull(
-                abiRoot,
-                "assets/wgpu_mc/natives/",
-                "META-INF/natives/",
-        )
+        return when {
+                runsOnIos() -> listOf(
+                        "assets/wgpu_mc/natives/ios-arm64/",
+                        // A jar built for both Apple platforms carries the Mac libraries too, and the
+                        // probe order below is the only thing that keeps an iPhone from extracting one.
+                        // The Mac's own dylib would load nowhere on iOS - `System.load` refuses a
+                        // Mach-O built for a different platform - so it costs one failed probe.
+                        "assets/wgpu_mc/natives/macos-arm64/",
+                        "assets/wgpu_mc/natives/macos-x86_64/",
+                        "assets/wgpu_mc/natives/",
+                        "META-INF/natives/",
+                )
+
+                runsOnMacos() -> listOfNotNull(
+                        if (isArm64Host) "assets/wgpu_mc/natives/macos-arm64/" else null,
+                        if (!isArm64Host) "assets/wgpu_mc/natives/macos-x86_64/" else null,
+                        "assets/wgpu_mc/natives/ios-arm64/",
+                        "assets/wgpu_mc/natives/",
+                        "META-INF/natives/",
+                )
+
+                else -> NATIVE_RESOURCE_ROOTS
+        }
+}
+
+/**
+ * Whether this process runs on **iOS or iPadOS** - the Apple side of this port's multi-platform
+ * story, where the natives are dylibs and the launcher renders the game into a view wgpu draws
+ * through Metal.
+ *
+ * `os.name` is the first answer, and the one a launcher that wants to be found sets: a JVM on iOS
+ * that reports `iPhone OS` or `iOS` names itself. The second is the system telling the truth where
+ * the property does not - the mobile launchers routinely pass `-Dos.name=Linux` down to the game,
+ * the same way the Android launchers do, and iOS is still iOS underneath: `/var/mobile` is the home
+ * of the mobile user in a way no Mac or Linux box has it. Both answers are cheap to ask and neither
+ * is true on a desktop Mac, which is what the third branch of [nativeResourceRoots] is for.
+ */
+private fun runsOnIos(): Boolean {
+        val osName = System.getProperty("os.name").orEmpty().lowercase()
+        if ("ios" in osName || "iphone" in osName || "ipad" in osName) return true
+        return java.io.File("/var/mobile").exists()
+}
+
+/**
+ * Whether this process runs on **macOS** - a desktop Mac, where the same dylib story holds as on
+ * iOS but the window contract is the AppKit one. See [runsOnIos] for why the property alone does
+ * not settle it: a Mac that says `Mac OS X` is named, and one that says `Linux` is recognised by
+ * the property that names the machine's own product line.
+ */
+private fun runsOnMacos(): Boolean {
+        val osName = System.getProperty("os.name").orEmpty().lowercase()
+        if ("mac os" in osName || "darwin" in osName) return true
+        return java.io.File("/System/Library/CoreServices/SystemVersion.plist").isFile
+}
+
+/** Whether this process runs on an arm64 machine, which is the dylib directory a Mac asks for. */
+private val isArm64Host: Boolean
+        get() = System.getProperty("os.arch").orEmpty().lowercase().let { arch ->
+                "aarch64" in arch || "arm64" in arch
+        }
+
+/**
+ * The human name of the platform this process runs on, for the error that says the jar does not
+ * carry this platform's library - which is the one message a player reads when the multi-platform
+ * jar did not reach their platform, and "an Android build" is what it said even on an iPhone.
+ */
+private fun platformName(): String = when {
+        AndroidRuntime.isAndroid -> "an Android"
+        runsOnIos() -> "an iOS"
+        runsOnMacos() -> "a macOS"
+        else -> System.getProperty("os.name").orEmpty().ifEmpty { "this" }.let { "a $it" }
 }
 
 /**
@@ -214,8 +294,8 @@ object WgpuNative {
                                 ?: throw FileNotFoundException(
                                         "Could not find lib $mappedName in jar (looked in " +
                                                 "$roots, then every entry of the mod jar itself; " +
-                                                "the jar in use does not carry an Android build of the " +
-                                                "native library for this device)"
+                                                "the jar in use does not carry ${platformName()} build " +
+                                                "of the native library for this device)"
                                 )
 
                         // The roots answer with a directory prefix that needs the file name appended;
@@ -385,6 +465,28 @@ object WgpuNative {
 
         @JvmStatic
         external fun sendRunDirectory(dir: String)
+
+        /**
+         * **Registers one channel pass**: the named pipeline - one the render graph compiled from
+         * `graph.yaml` - draws at the named point in the frame. This is the pre-embedded surface
+         * the Iris port (and any other renderer that wants to sit in the frame) drives; see
+         * `RenderChannels` for the slots a caller names, and `docs/iris-adaptation-research.md` for
+         * the road this is the first stone of.
+         *
+         * The answer is the registration's: `false` names a slot nothing answers to, a pipeline the
+         * graph never compiled, or a call that arrived before the world's first frame built the
+         * graph - each of which is the caller's to retry, and each of which is logged on this side
+         * with the reason.
+         */
+        @JvmStatic
+        external fun registerChannelPass(slot: String, pipeline: String): Boolean
+
+        /**
+         * **Unregisters every channel pass**, whatever slot they sat in. The frame is this
+         * renderer's own again - the shape a resource reload or a "shaders off" toggle asks for.
+         */
+        @JvmStatic
+        external fun clearChannelPasses()
 
         @JvmStatic
         external fun setPanicHook()

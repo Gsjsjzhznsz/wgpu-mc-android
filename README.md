@@ -37,6 +37,8 @@ java.io.FileNotFoundException: Could not find lib libwgpu_mc_jni.so in jar
 
 JDK 25 + NDK r28 + 钉定的 nightly 工具链，交叉编译 arm64-v8a 与 x86_64 两份 `libwgpu_mc_jni.so`（`-C strip=debuginfo` 控制体积），`./gradlew jarJar` 打出内置 native 库的 mod jar。push 到 main 即可拿到 artifact；推 `v*` tag 自动发 Release。
 
+android.35 起为多平台 jar：macOS job 先行交叉编译 `aarch64-apple-ios` / `aarch64-apple-darwin` 的 `libwgpu_mc_jni.dylib`（`ldid` ad-hoc 签名），Linux job 下载后与 Android ABI 一并打包，jar 内容断言四个库齐全。平台探测、加载契约与 iOS 启动器接入要求见 [docs/multiplatform.md](docs/multiplatform.md)。
+
 ## 在启动器里用
 
 1. 从 CI artifact / Release 下载 `wgpu_mc-2612.0.8-android.1-all.jar`；

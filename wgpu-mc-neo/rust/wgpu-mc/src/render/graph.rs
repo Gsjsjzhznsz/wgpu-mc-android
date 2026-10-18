@@ -17,6 +17,7 @@ use crate::mc::chunk::RenderLayer;
 use crate::mc::chunk::SectionStorage;
 use crate::mc::entity::InstanceVertex;
 use crate::mc::resource::ResourcePath;
+use crate::render::channels::ChannelSlot;
 use crate::render::entity::EntityVertex;
 use crate::render::pipeline::{BLOCK_ATLAS, QuadVertex};
 use crate::render::section_graph;
@@ -104,6 +105,104 @@ struct DrawCall {
     /// index buffer and the bind group are per arena and a `multi_draw` has one of each.
     arena: u32,
     index_range: std::ops::Range<u32>,
+    /// **Where this call's indices land in the compacted draw buffer**, in indices from the buffer's
+    /// start. Assigned in call order when the copies are planned, so a run of calls that share an
+    /// arena - the runs the batched path groups by - owns one contiguous span of it, and the run is
+    /// drawn as one `draw_indexed` over that span.
+    ///
+    /// Zero when this frame is not drawn over the compacted buffer; nothing on the other two paths
+    /// reads it.
+    mega_dst: u32,
+}
+
+/// **One blit the compacted draw needs**: a slice of one arena's index buffer, to its place in the
+/// frame's compacted index buffer.
+///
+/// Everything here is in bytes, because `copy_buffer_to_buffer` is asked in bytes, and every field is
+/// a multiple of four: indices are `u32`, so a range of them is 4-byte aligned however it starts or
+/// stops. The copies are encoded just before the render pass that draws from them, in the order of
+/// this list, which is the order of the calls - so a blending layer's far-to-near order is the
+/// compacted buffer's own order and the draw reads it back exactly as it went in.
+#[derive(Debug, Clone, Copy)]
+struct MegaCopy {
+    arena: u32,
+    src_offset: u64,
+    dst_offset: u64,
+    size: u64,
+}
+
+/// **The compacted draw's plan, in call order.**
+///
+/// One entry per call - the `mega_dst` each call's indices were given - and one per copy the frame
+/// has to encode. Kept together so the two cannot disagree about the order the calls were walked in:
+/// the destinations are assigned in the same walk that sizes the copies, and a draw that read them
+/// out of different walks would draw somebody else's indices.
+#[derive(Debug, Default)]
+struct MegaPlan {
+    copies: Vec<MegaCopy>,
+    /// **How many indices the plan copies in all**, which is what the ceiling and the buffer's size
+    /// are asked against.
+    total_indices: u64,
+}
+
+/// Plans the compacted draw's copies for one pass' calls, **in the order they are given**, writing
+/// each call's destination into the call as it goes.
+///
+/// The walk hands every call a destination at the running cursor and then advances the cursor by the
+/// call's own length - so the destinations come out in call order, which is what lets a blending
+/// layer's far-to-near order survive the round trip through the buffer. Two calls that sit next to
+/// each other in the list and next to each other in their arena's index buffer - the sections one
+/// bake wrote after the other - are one copy rather than two, which is most of them: the arena hands
+/// its ranges out in bake order, and a frame's visible sections stay neighbours in it long after the
+/// camera has moved on.
+///
+/// The caller sorts the calls first where their order is free (the layers that write depth), which is
+/// what makes the arena-neighbourhoods this merge feeds on; a layer whose order is the picture is
+/// passed through untouched and merges only what is already adjacent. Either way the picture the
+/// plan draws is the picture the calls describe.
+///
+/// **The invariant everything downstream leans on**: after the walk, a run of calls that are
+/// consecutive in the list - which is how the draw loop groups them, by arena - owns a *contiguous*
+/// span of destinations, `[first.mega_dst, last.mega_dst + last.index_range.len())`, and the copies
+/// fill exactly that span with exactly the run's indices in list order. It holds by construction:
+/// the cursor only ever moves forward, so consecutive calls get consecutive destinations whether
+/// their copy was a fresh push or a merge that grew.
+fn plan_mega_copies(calls: &mut [DrawCall]) -> MegaPlan {
+    let mut plan = MegaPlan::default();
+
+    for call in calls.iter_mut() {
+        let size = (call.index_range.len() as u64) * 4;
+
+        // **The merge**: the call before this one, in the list, ended exactly where this one begins,
+        // in the same arena. The copy that carries it grows over this one instead of a second blit
+        // starting - and this call's destination is where it would have started anyway, so nothing
+        // downstream can tell the difference.
+        let extends = match plan.copies.last_mut() {
+            Some(copy) => {
+                let extends = copy.arena == call.arena
+                    && copy.src_offset + copy.size == (call.index_range.start as u64) * 4;
+                if extends {
+                    copy.size += size;
+                }
+                extends
+            }
+            None => false,
+        };
+
+        if !extends {
+            plan.copies.push(MegaCopy {
+                arena: call.arena,
+                src_offset: (call.index_range.start as u64) * 4,
+                dst_offset: plan.total_indices * 4,
+                size,
+            });
+        }
+
+        call.mega_dst = plan.total_indices as u32;
+        plan.total_indices += call.index_range.len() as u64;
+    }
+
+    plan
 }
 
 /// `DrawIndexedIndirectArgs` in bytes: what an indirect draw's offset into its buffer is measured in.
@@ -238,6 +337,18 @@ struct PassDraws {
     /// are drawn. The switch behind it is a setting, and a setting that moved between the build and the
     /// draw would pick a different loop from the one the indirect arguments were written for.
     batched: bool,
+    /// **Whether this pass draws over the frame's compacted index buffer instead** - the shape that
+    /// needs none of what the batched call asks a driver to prove. Set when the build found the batched
+    /// path closed and [`terrain_mega_requested`] willing, alongside the [`MegaCopy`] list that says
+    /// what the frame copies into the buffer; the draw loop obeys both, exactly as it obeys
+    /// [`PassDraws::batched`]. The three are one decision for the same reason `batched` is: a setting
+    /// that moved between the build and the draw would have the draw read a buffer the copies never
+    /// filled.
+    mega: bool,
+    /// **The blits the compacted draw copies with**, in call order. Empty unless [`PassDraws::mega`]
+    /// went up, and encoded just before the render pass that draws from them - the copies and the
+    /// draws are one submission, so the buffer is full before the first draw reads it.
+    mega_copies: Vec<MegaCopy>,
     /// **Whether this pass has already drawn from these records.** It is what makes a rebuild in the
     /// middle of a frame safe rather than corrupting: a pass whose draws are recorded reads its records
     /// out of the buffer at submission time, so rewriting that buffer after the fact would leave the
@@ -738,6 +849,89 @@ pub fn set_terrain_batching_possible(possible: bool) {
     TERRAIN_BATCHING_POSSIBLE.store(possible, Ordering::Relaxed);
 }
 
+/// Whether the terrain pass may draw the frame's sections as **one draw over a compacted index
+/// buffer**, when the batched call above it is not available: **the setting asks**. See
+/// [`terrain_mega_requested`], which is the answer the draw path uses.
+///
+/// This is the third shape the terrain draw has had, and the reason for it is one device: the
+/// Adreno 640 this port targets advertises every feature the batched path asks for and then fails
+/// the device's own probe of it - four records whose indices carry their own record, drawn, do not
+/// come back one record per record. A driver that cannot be trusted with a `multi_draw` is still
+/// perfectly trustworthy with the plainest call there is, a `draw_indexed`, because that is the call
+/// every other pipeline in this renderer already goes through. So when the batched call is off the
+/// table, the frame's sections are gathered by *copying* their index ranges into one buffer - copies
+/// are blits, and a blit has no batched shape to get wrong - and the whole frame is drawn as one
+/// `draw_indexed` per run of sections that share an arena. One draw call where the fallback below
+/// submits thousands, without touching anything the probe did not already prove.
+static TERRAIN_MEGA: AtomicBool = AtomicBool::new(false);
+
+/// Sets whether the terrain pass may fall back to the compacted draw. See [`TERRAIN_MEGA`].
+pub fn set_terrain_mega(mega: bool) {
+    TERRAIN_MEGA.store(mega, Ordering::Relaxed);
+}
+
+/// Whether the terrain pass may draw the frame's sections as one draw over a compacted index buffer.
+///
+/// Read per pass when the batched path has been ruled out - by the setting, by the device, or by a
+/// pass over the indirect buffer's capacity - and it is the difference between the frame's thousands
+/// of per-section calls and a handful of draws. See [`TERRAIN_MEGA`] for the shape and
+/// [`PassDraws::mega`] for where the answer lands.
+pub fn terrain_mega_requested() -> bool {
+    TERRAIN_MEGA.load(Ordering::Relaxed)
+}
+
+/// **How many indices the compacted index buffer may hold before the pass gives up on it.**
+///
+/// The buffer is the frame's visible sections' index ranges copied end to end, so its worst case is
+/// the whole arena's indices - a size nobody should ever copy in a frame, and one that would mean the
+/// gather kept everything. The bound is a safety rail rather than a tuning knob, in the same spirit
+/// as [`the_indirect_path_holds`]: a frame under it is one draw, and a frame over it is the fallback
+/// the renderer has always had, with a line in the log saying which happened.
+///
+/// `1 << 25` indices is 128 MB of `u32`, and the frames this port is run in measure in the single
+/// digit megabytes - the rail is two orders of magnitude above the traffic it guards.
+const MEGA_INDEX_CEILING: u64 = 1 << 25;
+
+/// Whether a pass whose frame copies this many indices can still be drawn over the compacted buffer.
+///
+/// **The one place [`PassDraws::mega`]'s capacity is decided**, so the decision and the warning that
+/// reports it cannot come apart - the same shape as [`the_indirect_path_holds`] above it.
+fn the_mega_path_holds(total_indices: u64) -> bool {
+    total_indices <= MEGA_INDEX_CEILING
+}
+
+/// Says so, once a second, when a frame wanted more compacted indices than the ceiling holds.
+///
+/// The fallback here is per-section drawing, which is what the renderer did before any of this
+/// existed, and the picture is the same either way. Like [`report_the_indirect_cap`], this is **not**
+/// gated on the diagnostics switch: the step change in frame cost it reports is exactly the kind of
+/// thing a run nobody is profiling deserves a line about.
+fn report_the_mega_cap(total_indices: u64) {
+    let total = TERRAIN_MEGA_OVER_CAPACITY.fetch_add(1, Ordering::Relaxed) + 1;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+
+    if TERRAIN_MEGA_OVER_CAPACITY_REPORTED.swap(now, Ordering::Relaxed) == now {
+        return;
+    }
+
+    log::warn!(
+        "wgpu-mc: a terrain pass would copy {total_indices} indices into the compacted draw buffer, \
+         over the {MEGA_INDEX_CEILING} it holds, so this frame draws it one draw per section instead; \
+         {total} pass(es) over it so far this session"
+    );
+}
+
+static TERRAIN_MEGA_OVER_CAPACITY: AtomicU64 = AtomicU64::new(0);
+static TERRAIN_MEGA_OVER_CAPACITY_REPORTED: AtomicU64 = AtomicU64::new(0);
+
+/// **How many runs and bytes the compacted draw moved, for the one-second report.**
+static TERRAIN_MEGA_RUNS: AtomicU64 = AtomicU64::new(0);
+static TERRAIN_MEGA_BYTES: AtomicU64 = AtomicU64::new(0);
+
 /// Whether the `terrain_indirect` setting asks for batching: **the setting alone**, without the device.
 ///
 /// One caller, and it is a diagnostic: `device::report_device_capabilities` prints which of the reasons
@@ -873,9 +1067,11 @@ fn report_the_indirect_cap(calls: u64) {
     }
 
     log::warn!(
-        "wgpu-mc: a terrain pass has {calls} draw calls, over the {} the indirect path batches, so this \
-         frame draws it one draw per section instead; {total} pass(es) over it so far this session. Raise \
-         `INDIRECT_DRAW_CAPACITY`, or split the pass into several multi-draws",
+        "wgpu-mc: a terrain pass has {calls} draw calls, over the {} the indirect path batches, so the \
+         batched call is out for this frame; {total} pass(es) over it so far this session. The compacted \
+         draw covers it while `terrain_mega` is on - one draw over a per-frame index buffer - and \
+         otherwise it is one draw per section. Raise `INDIRECT_DRAW_CAPACITY`, or split the pass into \
+         several multi-draws",
         crate::mc::INDIRECT_DRAW_CAPACITY
     );
 }
@@ -989,6 +1185,8 @@ fn report_terrain_pass() {
     let records_nanos = TERRAIN_RECORDS_NANOS.swap(0, Ordering::Relaxed);
     let rebuilds = TERRAIN_REBUILDS.swap(0, Ordering::Relaxed);
     let frame_only = TERRAIN_REBUILDS_FRAME_ONLY.swap(0, Ordering::Relaxed);
+    let mega_runs = TERRAIN_MEGA_RUNS.swap(0, Ordering::Relaxed);
+    let mega_bytes = TERRAIN_MEGA_BYTES.swap(0, Ordering::Relaxed) / 1024;
 
     // A second with no gather in it is a second with no world drawn, and the arithmetic would be a panic
     // rather than a zero - which is the shape of a report taken while the world is being entered.
@@ -1004,7 +1202,8 @@ fn report_terrain_pass() {
          {uploaded} KB; {build_us} us building it, {build_per_frame} us a gather, {gather_us} us of it the \
          gather and {records_us} us the records and uploads; {rebuilds} rebuild(s), {frame_only} of them \
          because the submission counter moved and nothing else did; the most calls any pass has had is \
-         {peak} of the {} the indirect path batches, {over} pass(es) over it so far",
+         {peak} of the {} the indirect path batches, {over} pass(es) over it so far; the compacted draw \
+         moved {mega_runs} run(s) in {mega_bytes} KB where the batched call was closed",
         crate::mc::INDIRECT_DRAW_CAPACITY
     );
 }
@@ -1358,6 +1557,23 @@ pub struct RenderGraph {
     pub resources: HashMap<String, ResourceBacking>,
     /// The frame's terrain: the gather and the draws each pass will issue. See [`TerrainFrame`].
     terrain_frame: std::cell::RefCell<TerrainFrame>,
+    /// **The frame's compacted index buffer**, and its capacity in bytes: what the terrain pass draws
+    /// over when the batched call is closed and [`TERRAIN_MEGA`] asks for this instead of per-section
+    /// drawing. One buffer for the whole graph, because the passes that share it are recorded in
+    /// encoder order - each pass's copies are encoded immediately before the render pass that reads
+    /// them, so a later pass's copies cannot land under an earlier pass's draw.
+    ///
+    /// Grown on demand and never shrunk: a frame that needs more replaces the buffer outright, and the
+    /// passes already recorded against the old one are safe because the commands that reference it
+    /// keep it alive to the end of their submission - which is also why the draw loop draws with the
+    /// buffer its own pass encoded into, handed across as a value, and not with whatever sits in this
+    /// cell at draw time.
+    mega_index: std::cell::RefCell<Option<(wgpu::Buffer, u64)>>,
+    /// **The channel: where another renderer's passes sit in this frame.** Registering is a JNI call
+    /// from a thread this loop does not own, and the frame reads the registry on the render thread,
+    /// so the two meet behind a `parking_lot::Mutex` - one uncontended lock per pass slot, and an
+    /// honest answer about who may edit what. See [`crate::render::channels`].
+    channels: parking_lot::Mutex<crate::render::channels::ChannelRegistry>,
 }
 
 /// What a caught panic said, as one line.
@@ -1408,6 +1624,16 @@ fn device_call<T>(what: &str, build: impl FnOnce() -> T) -> Option<T> {
 
 /// The last second the plane hint reported itself, so a per-frame count is a per-second line.
 static PLANE_HINT_REPORTED: AtomicU64 = AtomicU64::new(0);
+
+/// **The channel registrations that outlive a graph rebuild.**
+///
+/// The graph is replaced wholesale at a shader reload, and a registry that lived only inside it
+/// would come back empty every time - the frame running on with the channel quietly gone. The
+/// registrations therefore live here, as the (slot, pipeline) pairs the JNI sent, and a new graph
+/// re-applies them at build time against the pipelines it actually holds: a pipeline the new graph
+/// dropped costs its pass a warning line rather than a silently empty slot.
+static CHANNEL_REGISTRATIONS: parking_lot::Mutex<Vec<(String, String)>> =
+    parking_lot::Mutex::new(Vec::new());
 
 impl RenderGraph {
     fn create_pipelines(
@@ -1915,6 +2141,10 @@ impl RenderGraph {
                     .collect(),
                 ..TerrainFrame::default()
             }),
+            // Created the first frame that needs it - see `ensure_mega_buffer`.
+            mega_index: std::cell::RefCell::new(None),
+            // Empty until someone registers - the frame runs exactly as it did, one lock per pass.
+            channels: parking_lot::Mutex::new(crate::render::channels::ChannelRegistry::default()),
         };
 
         // The sampler is always available; the atlas only once a resource reload has baked one. The
@@ -2150,7 +2380,229 @@ impl RenderGraph {
 
         graph.create_pipelines(wm, custom_bind_groups, custom_geometry);
 
+        // **The channel's registrations, re-applied against the pipelines this graph actually
+        // holds.** The registry the old graph carried is gone with it; what survives is the JNI's
+        // (slot, pipeline) pairs in the static, and this is where a rebuilt graph picks them back
+        // up - refusing the one whose pipeline the new graph dropped, with the reason in the log,
+        // rather than carrying a name nothing will ever draw.
+        {
+            let registrations = CHANNEL_REGISTRATIONS.lock();
+            if !registrations.is_empty() {
+                let known: Vec<String> = graph.pipelines.keys().cloned().collect();
+                for (slot, pipeline) in registrations.iter() {
+                    if let Err(reason) = graph.channels.lock().register(slot, pipeline, &known) {
+                        log::warn!(
+                            "wgpu-mc: a channel registration did not survive the graph rebuild: {reason}"
+                        );
+                    }
+                }
+            }
+        }
+
         graph
+    }
+
+    /// **The JNI's way into the channel**: registers one pass at a slot, and answers with the reason
+    /// it refused - a slot name nothing answers to, or a pipeline this graph never compiled. The
+    /// registration is also kept in the static that outlives this graph, because the graph is
+    /// replaced at a shader reload and a channel that died with it would be a channel nobody asked
+    /// to close. See [`crate::render::channels`].
+    pub fn register_channel_pass(&self, slot: &str, pipeline: &str) -> Result<(), String> {
+        let known: Vec<String> = self.pipelines.keys().cloned().collect();
+        let answer = self.channels.lock().register(slot, pipeline, &known);
+
+        match &answer {
+            Ok(()) => {
+                let mut registrations = CHANNEL_REGISTRATIONS.lock();
+                registrations.retain(|(kept_slot, kept_pipeline)| {
+                    !(kept_slot == slot && kept_pipeline == pipeline)
+                });
+                registrations.push((slot.to_string(), pipeline.to_string()));
+                log::info!(
+                    "wgpu-mc: channel pass \"{pipeline}\" registered at \"{slot}\" - the frame now \
+                     drives {} channel pass(es)",
+                    registrations.len()
+                );
+            }
+            Err(reason) => log::warn!("wgpu-mc: channel pass refused: {reason}"),
+        }
+
+        answer
+    }
+
+    /// **Every channel pass is unregistered**, whatever slot it sat in - the frame is this
+    /// renderer's own again, and the static that outlives a rebuild is emptied with it.
+    pub fn clear_channel_passes(&self) {
+        let before = {
+            let mut registry = self.channels.lock();
+            let before = registry.total();
+            registry.clear();
+            before
+        };
+
+        CHANNEL_REGISTRATIONS.lock().clear();
+
+        if before > 0 {
+            log::info!(
+                "wgpu-mc: {before} channel pass(es) unregistered - the frame is this renderer's own again"
+            );
+        }
+    }
+
+    /// **The channel slots a terrain pipeline owns**, `(before, after)` - the pass boundaries the
+    /// frame walks around it, which is where a registered pass is driven. Every other pipeline
+    /// carries no slots; the channel hangs from the terrain passes and the frame's ends.
+    fn channel_slots_for(pipeline_name: &str) -> (Option<ChannelSlot>, Option<ChannelSlot>) {
+        match pipeline_name {
+            "terrain_solid" => (
+                Some(ChannelSlot::BeforeTerrainSolid),
+                Some(ChannelSlot::AfterTerrainSolid),
+            ),
+            "terrain" => (
+                Some(ChannelSlot::BeforeTerrainCutout),
+                Some(ChannelSlot::AfterTerrainCutout),
+            ),
+            "translucent_terrain" | "@geo_terrain_translucent" => (
+                Some(ChannelSlot::BeforeTerrainTranslucent),
+                Some(ChannelSlot::AfterTerrainTranslucent),
+            ),
+            _ => (None, None),
+        }
+    }
+
+    /// **Drives one slot's registered passes**, each as its own render pass over the frame's colour
+    /// and depth - attached with `Load`, because a channel pass composes onto the frame rather than
+    /// starting it, and nothing here is allowed to claim or clear the frame's depth (that is the
+    /// terrain's decision, made in the main loop below).
+    ///
+    /// A pass draws six vertices with no vertex buffer bound - the `@geo_channel` shape, the same
+    /// vertex-pull the terrain shaders use, where the vertex stage positions itself from
+    /// `vertex_index`. That is the whole contract a shader pack's fullscreen work needs.
+    #[allow(clippy::too_many_arguments)]
+    fn record_channel_passes(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &Scene,
+        render_target: &wgpu::TextureView,
+        depth_override: Option<&wgpu::TextureView>,
+        slot: ChannelSlot,
+        arena: &WmArena,
+    ) {
+        let passes = {
+            let registry = self.channels.lock();
+            registry.passes(slot).to_vec()
+        };
+
+        for name in passes {
+            let Some(bound_pipeline) = self.pipelines.get(&name) else {
+                // Refused at registration and re-checked at every rebuild; reaching here means the
+                // graph changed underneath a registration the static kept. The pass is skipped,
+                // and the rebuild that dropped the pipeline already said so.
+                continue;
+            };
+            let Some(pipeline_config) = self.config.pipelines.pipelines.get(&name) else {
+                continue;
+            };
+
+            // **The pass's own render pass over the frame**, attached with `Load` on every
+            // attachment: a channel pass composes onto the frame rather than starting it, and
+            // nothing here is allowed to claim or clear the frame's depth - that is the terrain's
+            // decision, made in the main loop's `should_clear_depth`, which this never touches.
+            let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some(&format!("wgpu-mc: channel slot {}", slot.name())),
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                color_attachments: &pipeline_config
+                    .output
+                    .iter()
+                    .map(|texture_name| {
+                        Some(RenderPassColorAttachment {
+                            view: match &texture_name[..] {
+                                "@framebuffer_texture" => render_target,
+                                _ => unimplemented!("Unknown channel output {texture_name}"),
+                            },
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: Operations {
+                                load: LoadOp::Load,
+                                store: StoreOp::Store,
+                            },
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                depth_stencil_attachment: pipeline_config.depth.as_ref().map(|depth_texture| {
+                    let overridden = if depth_texture == "@texture_depth" {
+                        depth_override
+                    } else {
+                        None
+                    };
+
+                    let depth_view = match overridden {
+                        Some(view) => view,
+                        None if depth_texture == "@texture_depth" => {
+                            arena.alloc(scene.depth_texture.read().create_view(
+                                &wgpu::TextureViewDescriptor {
+                                    label: None,
+                                    format: Some(wgpu::TextureFormat::Depth32Float),
+                                    dimension: Some(wgpu::TextureViewDimension::D2),
+                                    usage: Some(wgpu::TextureUsages::RENDER_ATTACHMENT),
+                                    aspect: Default::default(),
+                                    base_mip_level: 0,
+                                    mip_level_count: None,
+                                    base_array_layer: 0,
+                                    array_layer_count: None,
+                                },
+                            ))
+                        }
+                        None => match self.resources.get(depth_texture) {
+                            Some(ResourceBacking::Texture2D(view)) => &view.view,
+                            _ => unimplemented!("Unknown depth target {depth_texture}"),
+                        },
+                    };
+
+                    RenderPassDepthStencilAttachment {
+                        view: depth_view,
+                        depth_ops: Some(Operations {
+                            load: LoadOp::Load,
+                            store: StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }
+                }),
+                multiview_mask: None,
+            });
+
+            render_pass.set_pipeline(&bound_pipeline.pipeline);
+
+            for (index, bind_group) in bound_pipeline.bind_groups.iter() {
+                match bind_group {
+                    WmBindGroup::Resource(name) => match &name[..] {
+                        // **The record table is the one terrain binding a channel pass can carry** -
+                        // one group, one set, for the whole pass, exactly as the terrain passes bind
+                        // it.
+                        "@bg_section_draws" => {
+                            render_pass.set_bind_group(
+                                *index,
+                                &scene.section_records.bind_group,
+                                &[],
+                            );
+                        }
+                        // The arena's own group is per-arena and the terrain passes' concern; a
+                        // channel pipeline that names it has nothing here to draw from.
+                        "@bg_ssbo_chunks" => {}
+                        _ => unimplemented!("Unknown channel binding {name}"),
+                    },
+                    WmBindGroup::Custom(bind_group) => {
+                        render_pass.set_bind_group(*index, bind_group, &[]);
+                    }
+                }
+            }
+
+            // **Six vertices, no buffer**: the `@geo_channel` shape. The vertex stage positions
+            // itself from `vertex_index`, which is how the terrain shaders already read their
+            // records and how a fullscreen pass wants to place itself.
+            render_pass.draw(0..6, 0..1);
+        }
     }
 
     /// The layers each terrain pass draws, in the order it draws them - keyed by the geometry name a
@@ -2653,6 +3105,11 @@ impl RenderGraph {
             draws.calls.clear();
             draws.spans.clear();
             draws.empty = [0u64; 3];
+            // The compacted draw's decisions from the frame before: a pass that does not go mega this
+            // frame must not be found holding last frame's copy list, which the encode step would
+            // happily replay into a buffer nobody draws from.
+            draws.mega = false;
+            draws.mega_copies.clear();
 
             // **Which order this pass draws in**, which is the one thing about the lists that is per pass:
             // a pass that draws a blending layer needs far to near, and a pass that does not needs the
@@ -2692,7 +3149,13 @@ impl RenderGraph {
                         continue;
                     }
 
-                    draws.calls.push(DrawCall { arena, index_range });
+                    draws.calls.push(DrawCall {
+                        arena,
+                        index_range,
+                        // Assigned by the compacted draw's planner when this pass takes that path; zero
+                        // until then, and unread by the other two paths.
+                        mega_dst: 0,
+                    });
                 }
 
                 draws.spans.push((layer_index, start, draws.calls.len()));
@@ -2709,6 +3172,45 @@ impl RenderGraph {
 
                 if !the_indirect_path_holds(draws.calls.len()) {
                     report_the_indirect_cap(calls);
+                }
+            }
+
+            // **The compacted draw, when the batched call is closed and the setting asks for it.**
+            //
+            // Everything that closes the batched path - the device's own probe failing it, the setting
+            // being off, a pass over the indirect buffer's capacity - lands here, and this is the
+            // difference between the frame's thousands of per-section calls and a handful of draws over
+            // one buffer. The plan is built here, where the calls are, because the copies and the
+            // destinations are one walk over one list: a draw that read destinations from a different
+            // walk than the copies were encoded from would draw somebody else's indices.
+            //
+            // The calls of a pass whose order is free are sorted into arena order first, which is what
+            // turns the planner's merge into most of the copies; a pass whose order is the picture
+            // (the translucent one, far to near) is left alone and merges only what is already
+            // adjacent. See [`plan_mega_copies`] for the walk and the invariant the draw leans on.
+            draws.mega = !draws.batched && terrain_mega_requested() && !draws.calls.is_empty();
+
+            if draws.mega {
+                if !blending {
+                    for (_, start, end) in &draws.spans {
+                        draws.calls[*start..*end]
+                            .sort_unstable_by_key(|call| (call.arena, call.index_range.start));
+                    }
+                }
+
+                let plan = plan_mega_copies(&mut draws.calls);
+
+                if the_mega_path_holds(plan.total_indices) {
+                    draws.mega_copies.extend_from_slice(&plan.copies);
+                    TERRAIN_MEGA_BYTES.fetch_add(plan.total_indices * 4, Ordering::Relaxed);
+                } else {
+                    // Over the rail, and honestly back to the per-section path: an empty copy list is
+                    // what makes the encode step below a no-op and the draw loop fall through to the
+                    // fallback arm, and the two must move together or a pass would draw from a buffer
+                    // the frame never filled.
+                    report_the_mega_cap(plan.total_indices);
+                    draws.mega = false;
+                    draws.mega_copies.clear();
                 }
             }
 
@@ -2817,6 +3319,135 @@ impl RenderGraph {
         );
     }
 
+    /// **The buffer this frame's compacted draw copies into, at least `needed_bytes` big.**
+    ///
+    /// Grown by replacement rather than by reallocation: the buffer is per-frame scratch that is
+    /// rewritten before every draw that reads it, so there is nothing in an old buffer worth carrying
+    /// over, and the passes already recorded against it are safe because a command buffer keeps every
+    /// resource it references alive to the end of its submission. The new size is the ask grown to the
+    /// next mebibyte, and at least doubled while growing - so a world that creeps up on its real
+    /// steady state does not replace the buffer once a frame on the way there.
+    fn ensure_mega_buffer(&self, wm: &WmRenderer, needed_bytes: u64) -> wgpu::Buffer {
+        let mut slot = self.mega_index.borrow_mut();
+
+        if let Some((buffer, capacity)) = slot.as_ref()
+            && *capacity >= needed_bytes
+        {
+            return buffer.clone();
+        }
+
+        let grown = needed_bytes
+            .max(slot.as_ref().map_or(0, |(_, capacity)| capacity * 2))
+            .next_multiple_of(1 << 20)
+            .max(1 << 20);
+
+        let buffer = wm.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wgpu-mc: the terrain pass' compacted frame index buffer"),
+            size: grown,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        log::info!(
+            "wgpu-mc: the compacted terrain draw buffer is now {grown} bytes ({} indices), for a frame \
+             that asked for {needed_bytes}",
+            grown / 4
+        );
+
+        *slot = Some((buffer.clone(), grown));
+        buffer
+    }
+
+    /// **Everything the compacted draw needs before its render pass opens**, for one terrain pipeline:
+    /// the frame built for this view, the buffer grown to the plan, and the plan's copies encoded - in
+    /// that order, and the buffer handed back so the pass draws from exactly what was filled.
+    ///
+    /// `None` when this pipeline does not draw the compacted way this frame: not a terrain pipeline, no
+    /// draw slot, the setting off, the batched path taken instead, or a pass with no calls. The copies
+    /// are the one part that *must* happen here - a `copy_buffer_to_buffer` is an encoder-level
+    /// command, and inside the render pass that draws from the buffer there is no encoder left to
+    /// encode it on.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_mega_draw(
+        &self,
+        wm: &WmRenderer,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &Scene,
+        frustum: &Frustum<f32>,
+        model_translation: [f32; 3],
+        geometry: &str,
+        draw_slot: Option<usize>,
+    ) -> Option<wgpu::Buffer> {
+        if draw_slot.is_none() || !matches!(geometry, "@geo_terrain" | "@geo_terrain_translucent") {
+            return None;
+        }
+
+        let draw_slot = draw_slot.expect("the arm above checked it");
+
+        // **The frame built for this view, before the pass opens.** The pass below would build it
+        // anyway - the same key, the same cache - and the copies cannot wait for it: they are planned
+        // out of the calls the build produces, and they have to be on the encoder before the render
+        // pass that draws from them begins. Built here, the pass below finds the key fresh and goes
+        // straight to drawing.
+        let camera_section = *scene.camera_section_pos.read();
+        let key = TerrainFrameKey {
+            frame: FRAME.load(Ordering::Relaxed),
+            frustum: frustum.planes.map(|plane| plane.into_array()),
+            camera_section,
+            visible: scene.visible_sections_revision(),
+            model_translation,
+        };
+
+        {
+            let mut frame = self.terrain_frame.borrow_mut();
+            if frame.key != Some(key) {
+                self.rebuild_terrain_frame(
+                    &mut frame,
+                    wm,
+                    scene,
+                    frustum,
+                    key,
+                    TERRAIN_OCCLUSION.load(Ordering::Relaxed),
+                );
+            }
+        }
+
+        // **The buffer, grown to the plan, and the plan copied in - under the same borrow of the
+        // frame**, so the pass below cannot read a list and draw over a buffer that disagree about
+        // what the frame holds. The two cells are distinct, so the borrows nest without a fight.
+        let buffer = {
+            let frame = self.terrain_frame.borrow();
+            let draws = &frame.passes[draw_slot];
+
+            if !draws.mega || draws.mega_copies.is_empty() {
+                return None;
+            }
+
+            let needed_bytes = draws
+                .mega_copies
+                .iter()
+                .map(|copy| copy.dst_offset + copy.size)
+                .max()
+                .unwrap_or(0);
+            let buffer = self.ensure_mega_buffer(wm, needed_bytes);
+
+            let chunk_buffers = scene.chunk_buffers.load_full();
+            for copy in &draws.mega_copies {
+                encoder.copy_buffer_to_buffer(
+                    &chunk_buffers[copy.arena as usize].buffer,
+                    copy.src_offset,
+                    &buffer,
+                    copy.dst_offset,
+                    copy.size,
+                );
+            }
+
+            buffer
+        };
+
+        Some(buffer)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &self,
@@ -2835,6 +3466,41 @@ impl RenderGraph {
 
         let mut should_clear_depth = true;
 
+        // **The channel's frame-level slots, and which invocation runs them.** The frame reaches
+        // this loop once per group - the opaque group's two pipelines first, the translucent one
+        // later - and a frame-level pass must run once per *frame*, not once per group, so each of
+        // the two ends is attached to the invocation that actually owns that end: the one that
+        // draws a solid-claiming pipeline opens the frame, the one that draws the blending layer
+        // closes it. A caller that draws the whole graph in one invocation is both, and gets both.
+        let frame_has_channels = !self.channels.lock().is_empty();
+        let runs_frame_start = frame_has_channels
+            && only.is_none_or(|list| {
+                list.iter().any(|name| {
+                    Self::terrain_layers(name)
+                        .iter()
+                        .any(|(layer, _)| *layer == RenderLayer::Solid)
+                })
+            });
+        let runs_frame_end = frame_has_channels
+            && only.is_none_or(|list| {
+                list.iter().any(|name| {
+                    Self::terrain_layers(name)
+                        .iter()
+                        .any(|(layer, _)| *layer == RenderLayer::Transparent)
+                })
+            });
+
+        if runs_frame_start {
+            self.record_channel_passes(
+                encoder,
+                scene,
+                render_target,
+                depth_override,
+                ChannelSlot::FrameStart,
+                &arena,
+            );
+        }
+
         for (pipeline_name, bound_pipeline) in &self.pipelines {
             // A name not in the list is skipped, and None means every pipeline is wanted.
             if only.is_some_and(|only| !only.contains(&pipeline_name.as_str())) {
@@ -2842,6 +3508,37 @@ impl RenderGraph {
             }
 
             let pipeline_config = self.config.pipelines.pipelines.get(pipeline_name).unwrap();
+
+            // **The compacted draw's copies, encoded before the pass opens.** A copy is an
+            // encoder-level command and the render pass below locks the encoder for its duration, so
+            // this is the one moment it can happen - and what comes back is the buffer the copies
+            // went into, which the pass below draws from. The pass that drew with whatever was in the
+            // cell at draw time would, on the frame the buffer was replaced mid-frame, read a buffer
+            // its own copies never filled.
+            let mega_for_this_pass = self.prepare_mega_draw(
+                wm,
+                encoder,
+                scene,
+                frustum,
+                model_translation,
+                pipeline_config.geometry.as_str(),
+                bound_pipeline.draw_slot,
+            );
+
+            // **The channel's before-pass slot**, driven after the compacted draw's copies are on
+            // the encoder and before the pipeline's own render pass opens - a pass registered here
+            // runs in the frame exactly where the terrain pass it hangs from is about to run.
+            let (channel_before, channel_after) = Self::channel_slots_for(pipeline_name);
+            if let Some(slot) = channel_before {
+                self.record_channel_passes(
+                    encoder,
+                    scene,
+                    render_target,
+                    depth_override,
+                    slot,
+                    &arena,
+                );
+            }
 
             let mut render_pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: None,
@@ -3281,6 +3978,105 @@ impl RenderGraph {
 
                                 index = stop;
                             }
+                        } else if let Some(mega) = mega_for_this_pass
+                            .as_ref()
+                            .filter(|_| draws.mega && !draws.mega_copies.is_empty())
+                        {
+                            // **One draw per run of sections that share an arena, over the frame's
+                            // compacted index buffer** - the path for the device whose batched call
+                            // cannot be trusted: the Adreno 640 that advertises every feature the
+                            // `multi_draw` asks for and then fails the probe of it. None of that is
+                            // asked here. A `draw_indexed` is the plainest call in the renderer, and
+                            // the copies that filled the buffer are blits, which have no batched shape
+                            // to get wrong - so the batching arrives on the back of the two commands
+                            // this driver was never caught lying about.
+                            //
+                            // The grouping is the batched path's own: consecutive calls of one arena
+                            // are one run, and the planner gave the run one contiguous span of
+                            // destinations, so the run draws as one `draw_indexed` over that span. The
+                            // picture is the calls' picture either way - the span holds exactly the
+                            // run's indices, in the order the calls listed them - which is what keeps
+                            // the translucent layer's far-to-near order through the round trip.
+                            static MEGA_ENGAGED: std::sync::atomic::AtomicBool =
+                                std::sync::atomic::AtomicBool::new(false);
+
+                            if !MEGA_ENGAGED.swap(true, Ordering::Relaxed) {
+                                log::info!(
+                                    "wgpu-mc: the terrain pass is drawing the frame's sections as one \
+                                     draw per arena run over a compacted index buffer - the shape that \
+                                     asks a driver for nothing the batched path was refused for"
+                                );
+                            }
+
+                            let mut index = *start;
+
+                            while index < *end {
+                                let arena = draws.calls[index].arena;
+                                let mut stop = index + 1;
+
+                                while stop < *end && draws.calls[stop].arena == arena {
+                                    stop += 1;
+                                }
+
+                                let first = &draws.calls[index];
+                                let last = &draws.calls[stop - 1];
+                                let first_index = first.mega_dst as u64;
+                                let last_end =
+                                    (last.mega_dst + last.index_range.len() as u32) as u64;
+
+                                if last_end * 4 <= mega.size() {
+                                    let buffer = &chunk_buffers[arena as usize];
+
+                                    render_pass.set_bind_group(1, &buffer.bind_group, &[]);
+                                    render_pass.set_index_buffer(
+                                        mega.slice(first_index * 4..last_end * 4),
+                                        wgpu::IndexFormat::Uint32,
+                                    );
+                                    render_pass.draw_indexed(
+                                        0..(last_end - first_index) as u32,
+                                        0,
+                                        0..1,
+                                    );
+
+                                    // The per-section arm's rebind test reads this; a run of the mega
+                                    // arm bound the arena itself, and leaving a stale answer here
+                                    // would let a later fallback span skip a rebind it needed.
+                                    bound_arena = Some(arena);
+                                } else {
+                                    // **The buffer this pass encoded into is not the one it drew
+                                    // with** - which the handoff above exists to make impossible, and
+                                    // which is guarded against here rather than trusted: the frame
+                                    // that hits it draws per section, the same picture at the
+                                    // fallback's own pace, instead of reading indices nobody wrote.
+                                    for call in &draws.calls[index..stop] {
+                                        if bound_arena != Some(call.arena) {
+                                            let buffer = &chunk_buffers[call.arena as usize];
+
+                                            render_pass.set_bind_group(1, &buffer.bind_group, &[]);
+                                            render_pass.set_index_buffer(
+                                                buffer.buffer.slice(..),
+                                                wgpu::IndexFormat::Uint32,
+                                            );
+                                            bound_arena = Some(call.arena);
+                                        }
+
+                                        render_pass.draw_indexed(call.index_range.clone(), 0, 0..1);
+                                    }
+                                }
+
+                                TERRAIN_MEGA_RUNS.fetch_add(1, Ordering::Relaxed);
+
+                                // The counters count **sections**, as they do on every other path - a
+                                // run of thirty is thirty sections drawn, not one draw - so the
+                                // one-second report reads the same against all three shapes.
+                                let count = (stop - index) as u64;
+                                drawn += count;
+                                drawn_total += count;
+                                layer_drawn[*layer_index] += count;
+                                layer_drawn_total[*layer_index] += count;
+
+                                index = stop;
+                            }
                         } else {
                             // **One call per draw**, which is the path this renderer has always had -
                             // and now the fallback: for a device without
@@ -3491,6 +4287,32 @@ impl RenderGraph {
                     }
                 },
             }
+
+            // **The channel's after-pass slot**, driven once the pipeline's own render pass is
+            // closed - a composite pass registered after the terrain it follows sees a frame that
+            // terrain has finished writing.
+            drop(render_pass);
+            if let Some(slot) = channel_after {
+                self.record_channel_passes(
+                    encoder,
+                    scene,
+                    render_target,
+                    depth_override,
+                    slot,
+                    &arena,
+                );
+            }
+        }
+
+        if runs_frame_end {
+            self.record_channel_passes(
+                encoder,
+                scene,
+                render_target,
+                depth_override,
+                ChannelSlot::FrameEnd,
+                &arena,
+            );
         }
     }
 }
@@ -5699,5 +6521,180 @@ mod indirect_capacity_tests {
         assert!(!the_indirect_path_holds(
             crate::mc::INDIRECT_DRAW_CAPACITY + 1
         ));
+    }
+}
+
+#[cfg(test)]
+mod mega_draw_tests {
+    use super::*;
+
+    fn call(arena: u32, start: u32, end: u32) -> DrawCall {
+        DrawCall {
+            arena,
+            index_range: start..end,
+            mega_dst: 0,
+        }
+    }
+
+    /// What the arena's index buffer would read at `(arena, index)`, so a test can tell whose index
+    /// it is looking at - the whole point of the compacted draw is that the buffer's contents are
+    /// somebody's indices, and a test that cannot name them proves nothing.
+    fn arena_index(arena: u32, index: u32) -> u32 {
+        arena * 100_000 + index
+    }
+
+    /// **The one contract everything downstream leans on**: after the plan, a run of calls that are
+    /// consecutive in the list - which is how the draw loop groups them, by arena - reads back, from
+    /// the span the planner gave it, exactly its own indices in exactly the order the calls listed
+    /// them.
+    ///
+    /// This is the test that would have caught a planner that assigned destinations out of a
+    /// different walk than the one that sized the copies, or a merge that grew a copy over a call
+    /// without carrying the call's destination with it: the buffer is simulated byte for byte, the
+    /// runs are sliced the way the draw arm slices them, and each slice has to be the run's picture.
+    #[test]
+    fn a_run_reads_back_its_own_indices_from_the_span_the_planner_gave_it() {
+        // Two arena gaps, one arena-internal gap, and one merge: every shape the walk has, in one
+        // list.
+        let mut calls = vec![
+            call(0, 10, 14),
+            call(0, 14, 20), // contiguous with the one before: one copy, two calls
+            call(1, 100, 104),
+            call(0, 40, 44), // arena 0 again, but a gap in it: a fresh copy
+        ];
+
+        let plan = plan_mega_copies(&mut calls);
+
+        assert_eq!(plan.total_indices, 18);
+        assert_eq!(
+            plan.copies.len(),
+            3,
+            "the contiguous pair merged into one copy"
+        );
+
+        // **The copies, simulated.** What they write is what the arena holds at their source range,
+        // laid into the destination the plan asked for.
+        let mut buffer = vec![0u32; plan.total_indices as usize];
+        for copy in &plan.copies {
+            for step in 0..copy.size / 4 {
+                let index = (copy.src_offset / 4 + step) as u32;
+                buffer[(copy.dst_offset / 4 + step) as usize] = arena_index(copy.arena, index);
+            }
+        }
+
+        // **The runs, exactly as the draw arm groups and slices them.**
+        let runs: Vec<(u32, usize, usize)> = {
+            let mut runs = Vec::new();
+            let mut index = 0;
+            while index < calls.len() {
+                let arena = calls[index].arena;
+                let mut stop = index + 1;
+                while stop < calls.len() && calls[stop].arena == arena {
+                    stop += 1;
+                }
+                runs.push((arena, index, stop));
+                index = stop;
+            }
+            runs
+        };
+
+        assert_eq!(runs.len(), 3, "the two arena-0 stretches are two runs");
+
+        for (arena, first, stop) in runs {
+            let first_call = &calls[first];
+            let last_call = &calls[stop - 1];
+            let span = first_call.mega_dst as usize
+                ..(last_call.mega_dst + last_call.index_range.len() as u32) as usize;
+
+            let drawn: Vec<u32> = buffer[span].to_vec();
+            let wanted: Vec<u32> = calls[first..stop]
+                .iter()
+                .flat_map(|call| {
+                    call.index_range
+                        .clone()
+                        .map(|index| arena_index(call.arena, index))
+                })
+                .collect();
+
+            assert_eq!(
+                drawn, wanted,
+                "run of arena {arena} (calls {first}..{stop}) read back somebody else's indices"
+            );
+        }
+    }
+
+    /// **The merge is about arena *and* adjacency**, and neither alone is enough: two calls in one
+    /// arena with a gap between their ranges are two blits, and two calls in different arenas whose
+    /// ranges happen to touch are two blits too - the second would copy out of a buffer the first's
+    /// arena does not own.
+    #[test]
+    fn contiguous_means_the_same_arena_and_touching_ranges() {
+        let mut merged = vec![call(0, 10, 14), call(0, 14, 20)];
+        let plan = plan_mega_copies(&mut merged);
+        assert_eq!(plan.copies.len(), 1);
+        assert_eq!(plan.copies[0].size, 40, "both calls' bytes, one blit");
+
+        let mut gapped = vec![call(0, 10, 14), call(0, 16, 20)];
+        let plan = plan_mega_copies(&mut gapped);
+        assert_eq!(plan.copies.len(), 2, "a gap in the arena is a second blit");
+
+        let mut crossed = vec![call(0, 10, 14), call(1, 14, 18)];
+        let plan = plan_mega_copies(&mut crossed);
+        assert_eq!(plan.copies.len(), 2, "a different arena is a second blit");
+    }
+
+    /// **A blending layer's order is the picture**, and the compacted buffer keeps it: destinations
+    /// are assigned in call order, so reading the buffer from the first call's destination to the
+    /// last call's end reads the calls far to near exactly as they were listed - which is what lets
+    /// the translucent pass take this path without re-sorting anything.
+    #[test]
+    fn the_order_the_calls_were_listed_in_is_the_order_the_buffer_holds() {
+        // Far to near, deliberately *not* arena order - the sort that arena order would want is the
+        // caller's to make, and only where the order is free.
+        let mut calls = vec![
+            call(1, 300, 304),
+            call(0, 10, 14),
+            call(1, 200, 204),
+            call(0, 20, 24),
+        ];
+
+        let plan = plan_mega_copies(&mut calls);
+        assert_eq!(
+            plan.copies.len(),
+            4,
+            "nothing here is adjacent, so four blits"
+        );
+
+        let mut buffer = vec![0u32; plan.total_indices as usize];
+        for copy in &plan.copies {
+            for step in 0..copy.size / 4 {
+                let index = (copy.src_offset / 4 + step) as u32;
+                buffer[(copy.dst_offset / 4 + step) as usize] = arena_index(copy.arena, index);
+            }
+        }
+
+        let wanted: Vec<u32> = calls
+            .iter()
+            .flat_map(|call| {
+                call.index_range
+                    .clone()
+                    .map(|index| arena_index(call.arena, index))
+            })
+            .collect();
+
+        assert_eq!(
+            buffer, wanted,
+            "the buffer does not hold the calls in the order they were listed"
+        );
+    }
+
+    /// **The rail, written down.** A frame at the ceiling still draws compacted, one index more falls
+    /// back to per-section - the same boundary shape the indirect path's own capacity test holds, and
+    /// for the same reason: the decision and the warning share this predicate, so they cannot
+    /// disagree.
+    #[test]
+    fn the_mega_ceiling_is_inclusive_and_the_next_index_is_the_cliff() {
+        assert!(the_mega_path_holds(MEGA_INDEX_CEILING));
+        assert!(!the_mega_path_holds(MEGA_INDEX_CEILING + 1));
     }
 }

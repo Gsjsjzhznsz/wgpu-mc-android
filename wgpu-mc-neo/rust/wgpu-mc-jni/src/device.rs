@@ -353,7 +353,65 @@ unsafe fn surface_target(display: u64, window: u64) -> wgpu::SurfaceTargetUnsafe
         }
     }
 
-    #[cfg(all(not(windows), not(target_os = "android")))]
+    // **iOS is the launcher handing over the game view itself**, and the contract matters enough to
+    // spell out: `window` is the `UIView` the launcher renders the game into, and the view's `layer`
+    // must be a `CAMetalLayer` (or must be set to one before this call) - wgpu asks the view for its
+    // layer and takes that as the render target. A `CAMetalLayer` handed over directly would not do:
+    // the fetch goes through `-[UIView layer]`, and a layer does not answer that selector.
+    //
+    // The view is also asked for on **the thread this runs on**, which wgpu's metal backend requires
+    // to be the process main thread - the one iOS UI objects live on. On the mobile launchers this
+    // port runs under, the game thread *is* the main thread, which is what makes the contract hold
+    // without a dispatch hop; a launcher that renders the game off the main thread has to call this
+    // from its main thread instead.
+    #[cfg(target_os = "ios")]
+    {
+        use raw_window_handle::{UiKitDisplayHandle, UiKitWindowHandle};
+
+        let _ = display;
+
+        let window_handle = UiKitWindowHandle::new(
+            std::ptr::NonNull::new(window as *mut core::ffi::c_void)
+                .expect("wgpu-mc: the launcher handed over a null game view"),
+        );
+
+        wgpu::SurfaceTargetUnsafe::RawHandle {
+            raw_display_handle: Some(RawDisplayHandle::UiKit(UiKitDisplayHandle::new())),
+            raw_window_handle: RawWindowHandle::UiKit(window_handle),
+        }
+    }
+
+    // **macOS is the desktop GLFW path**, and `window` is the `NSView` the game draws into - the
+    // same object GLFW's Cocoa backend fronts its windows with, handed over as a pointer rather
+    // than through `raw-window-handle` because the JVM side has no Objective-C types to speak of.
+    // wgpu asks the view for its layer exactly as it does on iOS, and the same main-thread rule
+    // applies to surface creation.
+    //
+    // The display half is unused the way it is on Android: an `AppKit` display handle is a name
+    // with no payload, and the view carries everything.
+    #[cfg(target_os = "macos")]
+    {
+        use raw_window_handle::{AppKitDisplayHandle, AppKitWindowHandle};
+
+        let _ = display;
+
+        let window_handle = AppKitWindowHandle::new(
+            std::ptr::NonNull::new(window as *mut core::ffi::c_void)
+                .expect("wgpu-mc: the launcher handed over a null game view"),
+        );
+
+        wgpu::SurfaceTargetUnsafe::RawHandle {
+            raw_display_handle: Some(RawDisplayHandle::AppKit(AppKitDisplayHandle::new())),
+            raw_window_handle: RawWindowHandle::AppKit(window_handle),
+        }
+    }
+
+    #[cfg(all(
+        not(windows),
+        not(target_os = "android"),
+        not(target_os = "ios"),
+        not(target_os = "macos")
+    ))]
     {
         use raw_window_handle::{XlibDisplayHandle, XlibWindowHandle};
 
@@ -1410,6 +1468,26 @@ fn report_device_capabilities() {
         }
     );
 
+    // What the compacted draw does about that answer, which is the rest of the story the line above
+    // leaves: the batched path closed is no longer the whole of the batching, because the frame's
+    // sections still gather into one draw per arena run over a per-frame index buffer - the shape
+    // that asks the driver for nothing the probe did not already prove. See `TERRAIN_MEGA` in the
+    // render graph, and the `terrain_mega` switch beside it.
+    if !wgpu_mc::render::graph::terrain_batches_draws() {
+        if wgpu_mc::render::graph::terrain_mega_requested() {
+            info!(
+                "wgpu-mc: the terrain pass also draws over the frame's compacted index buffer - one \
+                 draw per run of sections that share an arena, copies of just the frame's own index \
+                 ranges, drawn with a plain draw_indexed"
+            );
+        } else {
+            info!(
+                "wgpu-mc: the compacted draw is switched off (`terrain_mega`), so the closed batched \
+                 path leaves the terrain pass one draw per section"
+            );
+        }
+    }
+
     // What the probe itself said, which is a sentence about the **game path's** channel: the
     // game's batched draws carry their per-draw data through a record's `first_instance`, and the
     // probe is the driver demonstrating the fetch. The terrain's records travel in the indices, so
@@ -1444,7 +1522,8 @@ fn report_device_capabilities() {
         2 => info!(
             "wgpu-mc: the index-record probe did not read its sentinels back in order, so the batched \
              terrain path does not draw one record per record on this driver - the terrain pass falls \
-             back to one draw per section, which draws correctly"
+             back, and the compacted draw (`terrain_mega`) covers the frame from here: one draw per \
+             arena run over a per-frame index buffer, on a plain draw_indexed"
         ),
         _ => info!(
             "wgpu-mc: the index-record probe did not run, because the terrain's batching was already \

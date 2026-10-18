@@ -718,6 +718,44 @@ pub fn getSettingsStructure(env: JNIEnv, _class: JClass) -> jstring {
         .into_raw()
 }
 
+/// **Registers one channel pass** - a pipeline the graph compiled, driven at a named point in the
+/// frame. This is the pre-embedded surface the Iris port (and any other renderer that wants to sit
+/// in the frame) drives; see [`wgpu_mc::render::channels`] for the slots and the pass shape.
+///
+/// The answer names the refusal: an unknown slot and an unknown pipeline are both the caller's typo,
+/// and a typo that reached the frame as silence would be one nobody could fix.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn registerChannelPass(
+    mut env: JNIEnv,
+    _class: JClass,
+    slot: JString,
+    pipeline: JString,
+) -> bool {
+    let slot: String = env.get_string(&slot).unwrap().into();
+    let pipeline: String = env.get_string(&pipeline).unwrap().into();
+
+    // The graph is the registry, and it exists only once a renderer built it - so "no renderer yet"
+    // and "no graph yet" are the same gate, and the graph's own lock is the one this takes.
+    let Some(graph) = RENDER_GRAPH.get() else {
+        log::warn!(
+            "wgpu-mc: channel pass \"{pipeline}\" arrived before the render graph was built - a \
+             registration has to wait for the world's first frame"
+        );
+        return false;
+    };
+
+    graph.lock().register_channel_pass(&slot, &pipeline).is_ok()
+}
+
+/// **Unregisters every channel pass**, whatever slot they sat in. The frame is this renderer's own
+/// again - the shape a resource reload or a "shaders off" toggle asks for.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn clearChannelPasses(_env: JNIEnv, _class: JClass) {
+    if let Some(graph) = RENDER_GRAPH.get() {
+        graph.lock().clear_channel_passes();
+    }
+}
+
 #[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
 pub fn getSettings(env: JNIEnv, _class: JClass) -> jstring {
     let json = match SETTINGS.read().as_ref() {

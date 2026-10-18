@@ -1,4 +1,5 @@
 pub mod atlas;
+pub mod channels;
 pub mod entity;
 pub mod graph;
 pub mod pipeline;

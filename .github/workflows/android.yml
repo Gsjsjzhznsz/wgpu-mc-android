@@ -1,14 +1,23 @@
-# Builds the Android release: the Rust JNI bridge cross-compiled for the ABIs the port ships,
+# Builds the release jar: the Rust JNI bridge cross-compiled for the platforms the port ships,
 # then the mod jar with those libraries packaged inside it.
 #
 # The jar this produces is the one a launcher (FCL, Pojav and friends) takes: it carries
-# `assets/wgpu_mc/natives/android-<abi>/libwgpu_mc_jni.so`, which is what the mod's loader
-# extracts and `System.load`s on a device - the file a desktop-populated jar never had, and the
-# reason an Android launch died in `WgpuNative` with a `FileNotFoundException` before this
-# pipeline existed.
+# `assets/wgpu_mc/natives/android-<abi>/libwgpu_mc_jni.so` for Android and
+# `assets/wgpu_mc/natives/{ios-arm64,macos-arm64}/libwgpu_mc_jni.dylib` for the Apple platforms,
+# which is what the mod's loader extracts and `System.load`s on each device - the file a
+# desktop-populated jar never had, and the reason an Android launch (and later an iOS one) died in
+# `WgpuNative` with a `FileNotFoundException` before this pipeline existed.
 #
-# Both ABIs are built into one jar. arm64-v8a is what every real device speaks; x86_64 is what
-# an emulator speaks, and the two cost one CI job's worth of time more than one of them.
+# The Android ABIs are built into one jar here, on Linux: arm64-v8a is what every real device
+# speaks, x86_64 is what an emulator speaks, and the two cost one CI job's worth of time more than
+# one of them.
+#
+# The Apple platforms need a Mac - Xcode's linker and the iOS SDK are not things a Linux runner can
+# be handed - so the `natives-apple` job builds `aarch64-apple-ios` and `aarch64-apple-darwin` first
+# and uploads the dylibs as artifacts; the `build` job downloads them into the exact target paths the
+# engine's build would have put them at (`target/<triple>/release/`), and `copyNatives` packages them
+# like any other. A release therefore waits on both jobs: a jar whose Apple half is missing would put
+# the `FileNotFoundException` right back on the platforms it was built for.
 #
 # Pushing a tag `v*` publishes the jar as a GitHub release; every push keeps it available as a
 # workflow artifact.
@@ -19,9 +28,10 @@
 #     warn about, because its promos would name the old build as current and that is "up to date");
 #   - the Rust test suite (`cargo test`), which carries the packaging contract between
 #     `updates.json` and `gradle.properties`;
-#   - the jar content check, which is the step that can fail - `copyNatives` warns and skips when
-#     no native was built, and a natives-less jar released would be a `FileNotFoundException` on
-#     every device that installed it.
+#   - the jar content check, which is the step that can fail - `copyNatives` warns and skips when no
+#     native was built, and a natives-less jar released would be a `FileNotFoundException` on every
+#     device that installed it. Both Android ABIs and both Apple libraries are asserted, because all
+#     four are built two jobs above.
 name: android
 
 on:
@@ -41,9 +51,92 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
 
 jobs:
+  # **The Apple half of the jar, built where only a Mac can build it.** The dylibs are uploaded as
+  # artifacts laid out exactly as the engine's own `target/` tree would name them, so the Linux job
+  # below can drop them in and let `copyNatives` treat them like any other triple's output.
+  natives-apple:
+    name: Rust (iOS + macOS dylibs)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned Rust toolchain and the Apple targets
+        shell: bash
+        working-directory: wgpu-mc-neo/rust
+        run: |
+          rustup toolchain install "$(grep -m1 'channel' rust-toolchain.toml | cut -d'"' -f2)"
+          rustup target add aarch64-apple-ios aarch64-apple-darwin
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wgpu-mc-neo/rust
+          key: apple
+          cache-on-failure: true
+
+      - name: Build the JNI bridge for iOS
+        shell: bash
+        working-directory: wgpu-mc-neo/rust
+        # Line tables are what `debug = "line-tables-only"` puts in the binary, and on-device there
+        # is no sidecar dSYM for them to live in - they would ride into the jar. Symbol names stay
+        # (panics and profilers read those); the line tables, which nothing on a device reads, go.
+        env:
+          RUSTFLAGS: -C strip=debuginfo
+        run: cargo build --release -p wgpu-mc-jni --target aarch64-apple-ios
+
+      - name: Build the JNI bridge for macOS (arm64)
+        shell: bash
+        working-directory: wgpu-mc-neo/rust
+        env:
+          RUSTFLAGS: -C strip=debuginfo
+        run: cargo build --release -p wgpu-mc-jni --target aarch64-apple-darwin
+
+      - name: Ad-hoc sign the dylibs
+        shell: bash
+        working-directory: wgpu-mc-neo/rust
+        # The launchers that run this port on iOS load natives through their own sandbox, and an
+        # unsigned Mach-O is refused there before `System.load` ever sees it. `ldid -S` is the
+        # signer the iOS side of that ecosystem expects (it writes the iOS platform into the
+        # signature); `codesign --sign -` is the fallback that keeps a macOS-only jar working if
+        # brew cannot hand ldid over. Signed ad hoc, on purpose: the jar is not App Store freight.
+        run: |
+          set -e
+          brew list ldid >/dev/null 2>&1 || brew install ldid
+          for dylib in target/aarch64-apple-ios/release/libwgpu_mc_jni.dylib \
+                       target/aarch64-apple-darwin/release/libwgpu_mc_jni.dylib; do
+            if command -v ldid >/dev/null 2>&1; then
+              ldid -S "$dylib"
+              echo "signed with ldid: $dylib"
+            else
+              codesign --force --sign - "$dylib"
+              echo "signed with codesign (ad hoc): $dylib"
+            fi
+          done
+
+      - name: Lay the dylibs out as the engine's own target tree would
+        shell: bash
+        working-directory: wgpu-mc-neo/rust
+        run: |
+          set -e
+          mkdir -p staging/aarch64-apple-ios/release staging/aarch64-apple-darwin/release
+          cp target/aarch64-apple-ios/release/libwgpu_mc_jni.dylib staging/aarch64-apple-ios/release/
+          cp target/aarch64-apple-darwin/release/libwgpu_mc_jni.dylib staging/aarch64-apple-darwin/release/
+          ls -lh staging/aarch64-apple-ios/release staging/aarch64-apple-darwin/release
+
+      - name: Upload the Apple dylibs
+        uses: actions/upload-artifact@v4
+        with:
+          name: natives-apple
+          path: wgpu-mc-neo/rust/staging
+          if-no-files-found: error
+
   build:
     name: Rust (NDK) + mod jar
     runs-on: ubuntu-latest
+    # The Apple dylibs arrive from the job above, and the jar cannot be checked - or released -
+    # without them.
+    needs: natives-apple
     # The release step creates a release and uploads the jar to it; the job's default GITHUB_TOKEN
     # is read-only, and softprops/action-gh-release dies on the 403 that follows.
     permissions:
@@ -134,6 +227,15 @@ jobs:
           # zero every time.
           cache-on-failure: true
 
+      - name: Take the Apple dylibs the macOS job built
+        uses: actions/download-artifact@v4
+        with:
+          name: natives-apple
+          # The artifact is laid out as `target/<triple>/release/libwgpu_mc_jni.dylib`, so dropping
+          # it into the engine's target tree is the whole handoff: `copyNatives` looks for each
+          # triple exactly where the engine itself would have put it.
+          path: wgpu-mc-neo/rust/target
+
       - name: Build the JNI bridge for arm64-v8a
         shell: bash
         working-directory: wgpu-mc-neo/rust
@@ -167,8 +269,8 @@ jobs:
         shell: bash
         working-directory: Neolectrum
         # `jarJar` is the task whose output (`-all`, with the Kotlin runtime embedded) is the
-        # artifact a player installs; `copyNatives` runs inside it and lifts the two libraries
-        # the steps above built into the jar's resources. `check` gates the mixin class
+        # artifact a player installs; `copyNatives` runs inside it and lifts the four libraries
+        # the two jobs above built into the jar's resources. `check` gates the mixin class
         # initialisers and the rest of the verification the build carries.
         run: ./gradlew check jarJar --no-daemon --stacktrace
 
@@ -177,7 +279,8 @@ jobs:
         working-directory: Neolectrum
         # The one content check that can fail: `copyNatives` warns and skips when no native was
         # built, and a natives-less jar released would install everywhere and run nowhere. Both
-        # ABIs are asserted, because both are built two steps above.
+        # Android ABIs and both Apple libraries are asserted, because all four are built two jobs
+        # above.
         run: |
           jar=$(ls build/libs/*-all.jar | head -n 1)
           echo "== $jar =="
@@ -185,6 +288,12 @@ jobs:
           for abi in android-arm64-v8a android-x86_64; do
             if ! unzip -l "$jar" | grep -q "assets/wgpu_mc/natives/$abi/libwgpu_mc_jni.so"; then
               echo "::error::the jar is missing assets/wgpu_mc/natives/$abi/libwgpu_mc_jni.so"
+              exit 1
+            fi
+          done
+          for dir in ios-arm64 macos-arm64; do
+            if ! unzip -l "$jar" | grep -q "assets/wgpu_mc/natives/$dir/libwgpu_mc_jni.dylib"; then
+              echo "::error::the jar is missing assets/wgpu_mc/natives/$dir/libwgpu_mc_jni.dylib"
               exit 1
             fi
           done

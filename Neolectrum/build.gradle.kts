@@ -164,6 +164,18 @@ val androidTripleAbis = mapOf(
         "i686-linux-android" to "android-x86",
 )
 
+// The Apple cross-compiles, and the jar directory each one's library goes under - the same story as
+// the Android list above, with the loader probing `ios-arm64/` on an iPhone and the `macos-*/` one on
+// a desktop Mac. A triple the engine has not built simply has no file, and a Copy task with no
+// existing source for it copies nothing: on the Linux CI that builds the Android release, none of
+// these exist, and the jar then carries no Apple libraries - which is why the release workflow has a
+// macOS job that builds them and hands them over before this task runs.
+val appleTripleDirs = mapOf(
+        "aarch64-apple-ios" to "ios-arm64",
+        "aarch64-apple-darwin" to "macos-arm64",
+        "x86_64-apple-darwin" to "macos-x86_64",
+)
+
 /**
  * The triples whose libraries this build packages: every one the engine has built, or the
  * `wgpu_mc_android_abis` list (comma-separated, from a `-P` or the environment) when a build
@@ -183,6 +195,12 @@ val androidAbis: Map<String, String> = run {
 // own convention, and a Windows-hosted build must not go looking for a `.dll` that the NDK never
 // produced.
 val androidLibraryFileName = "libwgpu_mc_jni.so"
+
+// The Apple libraries keep the Mach-O name on every host, for the same reason: the macOS CI job
+// produces `libwgpu_mc_jni.dylib`, and a Linux-hosted build must not rename the file it never
+// produced. The loader's own name comes from `System.mapLibraryName`, which answers `.dylib` on
+// the Apple JVMs these are built for.
+val appleLibraryFileName = "libwgpu_mc_jni.dylib"
 
 // The PDB the release build writes beside the library, when the profile asks for one (`debug =
 // "line-tables-only"` in `rust/Cargo.toml`). It rides along into this module's resources, and into
@@ -207,6 +225,11 @@ val copyNatives = tasks.register<Copy>("copyNatives") {
                         into("assets/$modId/natives/$abi")
                 }
         }
+        appleTripleDirs.forEach { (triple, dir) ->
+                from(rustProjectDir.map { File(it, "target/$triple/release/$appleLibraryFileName") }) {
+                        into("assets/$modId/natives/$dir")
+                }
+        }
         into(layout.buildDirectory.dir("generated/natives"))
 
         onlyIf("the Rust engine has been built") {
@@ -214,25 +237,31 @@ val copyNatives = tasks.register<Copy>("copyNatives") {
                 val androidLibraries = androidAbis.keys
                         .map { triple -> File(rustProjectDir.get(), "target/$triple/release/$androidLibraryFileName") }
                         .filter { it.isFile }
+                val appleLibraries = appleTripleDirs.keys
+                        .map { triple -> File(rustProjectDir.get(), "target/$triple/release/$appleLibraryFileName") }
+                        .filter { it.isFile }
 
                 when {
                         library.isFile -> true
                         // An Android-only jar is a legitimate result of this task - the Android
                         // release is built on Linux CI that never produces a host library - so the
                         // desktop library being absent is a warning, not a skip, when the Android
-                        // half made it.
-                        androidLibraries.isNotEmpty() -> {
+                        // half made it. The Apple libraries travel the same road the other way: the
+                        // macOS job builds them and the Linux job packs them, and a jar whose Apple
+                        // half is missing still runs every Android device.
+                        androidLibraries.isNotEmpty() || appleLibraries.isNotEmpty() -> {
                                 logger.warn(
-                                        "wgpu-mc: no host native library at {}, but {} Android library(s) " +
-                                                "were packaged - this jar is an Android-only jar.",
+                                        "wgpu-mc: no host native library at {}, but {} Android and {} Apple " +
+                                                "libraries were packaged - this jar is a mobile/cross jar.",
                                         library.path,
                                         androidLibraries.size,
+                                        appleLibraries.size,
                                 )
                                 true
                         }
                         else -> {
                                 logger.warn(
-                                        "wgpu-mc: no native library at {} and no Android library under {} - " +
+                                        "wgpu-mc: no native library at {} and no Android or Apple library under {} - " +
                                                 "skipping copyNatives, so this jar carries no natives and cannot " +
                                                 "run the renderer. Build it with `cargo build --release` in {}, or " +
                                                 "point this build at the checkout that has it: -Pwgpu_mc_rust_dir=<path> " +

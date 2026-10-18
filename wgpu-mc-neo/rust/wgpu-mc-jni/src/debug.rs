@@ -325,6 +325,7 @@ pub fn apply(settings: &Settings) {
         terrain_occlusion,
         adv_culling,
         terrain_indirect,
+        terrain_mega,
         // Neither of these is applied here: both are read on the JVM side, which is where the switch
         // they belong to is - `section_indirect` in `WgpuRenderPass.batching`, `pin_camera` in
         // `DebugCamera`. They are named rather than left to `..` so that the next setting added cannot
@@ -393,6 +394,11 @@ pub fn apply(settings: &Settings) {
     // `env_logger` yet, so a line written here is dropped. `device::report_device_capabilities` writes
     // the answer once a world.
     wgpu_mc::render::graph::set_terrain_indirect(terrain_indirect);
+
+    // **Whether the terrain pass may fall back to the compacted draw where the batched call is
+    // closed.** The same shape of switch as the one above - it decides an arm of the draw loop, not
+    // any pipeline state - so it takes effect on the next frame and nothing is rebuilt for it.
+    wgpu_mc::render::graph::set_terrain_mega(terrain_mega);
 
     // The atlas mip clamp *is* built into the samplers, which are created with the graph - so moving it
     // invalidates the same thing `terrain_no_cull` does, and for the same reason.
