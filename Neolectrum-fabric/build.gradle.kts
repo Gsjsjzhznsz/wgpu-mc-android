@@ -1,4 +1,5 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.util.Properties
 
 plugins {
         id("java-library")
@@ -11,8 +12,8 @@ plugins {
 // against it, and the CI tag assert reads it) - this module reads the same value out of the same
 // file, so a release carries two jars that answer as one version and no bump can move one loader
 // and forget the other.
-val parentProperties = java.util.Properties().apply {
-        rootProject.file("../Neolectrum/gradle.properties").inputStream().use { load(it) }
+val parentProperties = Properties().apply {
+        rootProject.file("../Neolectrum/gradle.properties").inputStream().use { stream -> load(stream) }
 }
 val modVersion = parentProperties.getProperty("neoforge_mod_version")
 val modId = "wgpu_mc"
@@ -33,6 +34,12 @@ kotlin {
                 jvmTarget.set(JvmTarget.JVM_25)
         }
 }
+
+// NOTE: the toolchain above is the whole Java story - 26.1 needs Java 25 and the toolchain pins
+// both the compiler and the loader's floor. (A second `java { sourceCompatibility }` block was
+// here and went: the toolchain is what counts, and the accessor `java` shadows the `java` package
+// at the top level of a Gradle Kotlin script - `java.util.Properties` above has to come in
+// through an import for exactly that reason.)
 
 // ---------------------------------------------------------------------------
 // The shared sources, compiled against Fabric.
@@ -125,9 +132,4 @@ dependencies {
         // classpath before the first one loads. `include` is Fabric's jar-in-jar, the same shape
         // the NeoForge build's jarJar embeds.
         include(implementation("org.jetbrains.kotlin:kotlin-stdlib:2.3.20")!!)
-}
-
-java {
-        sourceCompatibility = JavaVersion.VERSION_25
-        targetCompatibility = JavaVersion.VERSION_25
 }
