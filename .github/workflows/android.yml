@@ -285,7 +285,9 @@ jobs:
         # blocking once the scaffold has survived a run: `continue-on-error` keeps a Fabric
         # compile break from holding the Android release hostage while it is being grown.
         continue-on-error: true
-        run: ../Neolectrum/gradlew -p . build --no-daemon --stacktrace
+        # This module's own wrapper: loom 1.19 asks for Gradle 9.8, and the NeoForge build's
+        # wrapper pins 9.4.1 - two loaders, two builds, two Gradle floors.
+        run: ./gradlew build --no-daemon --stacktrace
 
       - name: Check what the Fabric jar carries
         if: success()
