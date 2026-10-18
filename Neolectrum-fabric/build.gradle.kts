@@ -127,15 +127,18 @@ if (packagedNatives.isDirectory) {
 
 dependencies {
         minecraft("com.mojang:minecraft:26.1.2")
-        // **26.1 is unobfuscated, so there are no official mappings to find** - Mojang stopped
+        // **26.1 is unobfuscated, so there are no mappings to name at all** - Mojang stopped
         // shipping them, which is exactly what the NeoForge build's gradle.properties has said
-        // since 26.1 ("no mappings/parchment entries are needed anymore"), and what loom's
-        // `officialMojangMappings` answered with a hard failure on this version. The empty layered
-        // mapping is the identity on top, and `loom { noIntermediateMappings() }` below is the
-        // switch loom grew for exactly these versions - without it loom goes looking for an
-        // intermediary the Fabric maven stopped publishing the day the game stopped being
-        // obfuscated, and resolves it to a `0.0.0` placeholder it then rejects.
-        mappings(loom.layered { })
+        // since 26.1 ("no mappings/parchment entries are needed anymore"). The evidence chain on
+        // the loom side: `officialMojangMappings()` hard-fails looking for a download the version
+        // manifest no longer carries; the intermediary the layered path used to fall back on is
+        // gone from the maven (it resolves a `0.0.0` placeholder it then rejects); an *empty*
+        // layered spec hands loom's own setup a mapping set whose source namespace is null and it
+        // answers with a NullPointerException; and the extension's own javadoc for the mappings
+        // file says "the mappings file, **or null if in a non-obfuscated environment**" - which is
+        // what `loom { noIntermediateMappings() }` below declares. So there is no `mappings(...)`
+        // line here, deliberately: the game's own names are the compile-time names, on both
+        // loaders.
         modImplementation("net.fabricmc:fabric-loader:0.17.3")
         modImplementation("net.fabricmc.fabric-api:fabric-api:0.155.3+26.1.2")
 
