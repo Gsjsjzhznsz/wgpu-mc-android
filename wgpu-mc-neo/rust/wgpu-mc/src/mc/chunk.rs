@@ -1115,10 +1115,28 @@ impl SectionStorage {
     }
 
     /// Queues ranges to be freed once the frames that may still draw them are done. See [`Self::allocate`].
+    ///
+    /// **This call runs for every applied section, not only for replacements** - the drain calls it
+    /// with the allocation's `freed` list whatever it holds, and a fresh bake's list is empty. The
+    /// bucket is minted all the same, because a fresh bake's *ranges* still wait out the frames in
+    /// flight even when it has none to wait with, and because the minting keeps the two rings the
+    /// same length: `free_deferred` walks both with one head, and the records ring running one
+    /// bucket short was an index out of bounds at that head - through a JNI frame, which is the
+    /// game gone. See the note on [`Self::defer_free_records`], whose early return is what a
+    /// fresh bake used to slip past this function's mint.
     pub fn defer_free(&mut self, ranges: Vec<ReleasedRange>) {
         if self.deferred.is_empty() {
             self.deferred.push(Vec::new());
             self.deferred_head = 0;
+        }
+
+        // **The records ring is this ring's shadow, bucket for bucket.** Whichever call fills
+        // first mints the other's missing buckets, so the head that indexes one always indexes
+        // the other; the pairing of contents inside a bucket is coarser than one call (a slot
+        // freed a frame after its range is safe, a frame before it is the streak), but the
+        // bucket boundaries are what the rotation frees, and those are kept identical here.
+        while self.deferred_records.len() < self.deferred.len() {
+            self.deferred_records.push(Vec::new());
         }
 
         let head = self.deferred_head;
@@ -1130,6 +1148,11 @@ impl SectionStorage {
     ///
     /// A record slot's entry is read by the *indices*, so the slot dies when the index range dies -
     /// which is the same frame boundary the ranges wait out. See [`Self::defer_free`].
+    ///
+    /// The empty early return is what a fresh bake arrives with (no replacement, no slots), and it
+    /// used to leave the records ring a bucket short of the ranges ring - which `free_deferred`
+    /// then indexed past. The ring maintenance that call skipped lives in [`Self::defer_free`]
+    /// now, so an empty list here really does mean nothing to do.
     pub fn defer_free_records(&mut self, slots: Vec<u32>) {
         if slots.is_empty() {
             return;
@@ -1200,7 +1223,15 @@ impl SectionStorage {
             self.free_in(buffer, range);
         }
 
-        let records = std::mem::take(&mut self.deferred_records[self.deferred_head]);
+        // Belt and braces rather than trust: `defer_free` keeps this ring at least as long as
+        // the ranges ring, so the index below is in bounds by construction - but a panic here
+        // is a panic through a JNI frame, and that aborts the process rather than unwinding
+        // ("failed to initiate panic" is the shape that takes on the phones). A missing bucket
+        // costs nothing: no slots were parked in it, so there is nothing to hand back.
+        let records = match self.deferred_records.get_mut(self.deferred_head) {
+            Some(bucket) => std::mem::take(bucket),
+            None => Vec::new(),
+        };
 
         self.record_free.extend(records);
     }
@@ -6795,6 +6826,53 @@ mod arena_tests {
         assert!(
             storage.record_free.contains(&survivor_slot),
             "a replaced section's slot does come back"
+        );
+    }
+
+    /// **A fresh bake on a cleared pool must not arm the records ring's absence.**
+    ///
+    /// `free_deferred` walks the two rings with one head, and the rings clear together in
+    /// `set_pool_arenas` - the render-distance report, which every world's first frame runs
+    /// while the storage is still empty. The first fresh bake then arrives with no replacement,
+    /// so no slots are deferred and `defer_free_records` early-returns - while the drain's own
+    /// `defer_free` call runs for the section all the same and mints a ranges-ring bucket for
+    /// its empty list. The next rotation indexed the records ring at that head, found it one
+    /// bucket short, and the index-out-of-bounds panic went through the JNI frame as "failed
+    /// to initiate panic, error 5" - the game gone, six bakes into a world. `defer_free` mints
+    /// the shadow bucket now; this is the sequence that used to abort.
+    #[test]
+    fn a_fresh_bake_on_a_cleared_pool_survives_the_ring_rotation() {
+        let mut storage = SectionStorage::new(pool_for(4));
+
+        // The first render-distance report: the pool is empty, so the resize lands - and both
+        // rings clear with it, which is the state the first bakes of a world start from.
+        assert!(storage.set_pool(pool_for(4)));
+        assert!(storage.deferred.is_empty());
+        assert!(storage.deferred_records.is_empty());
+
+        // The first bake lands. No replacement, so `allocate` carries no records; the ring the
+        // drain sees is the `defer_free` call, with an empty list in it.
+        assert!(put(&mut storage, IVec3::new(0, 0, 0), 2));
+
+        // The rings stayed a pair, and the rotation that used to panic runs clean.
+        assert_eq!(storage.deferred.len(), storage.deferred_records.len());
+        storage.free_deferred();
+
+        // And the replacement path still pairs its contents bucket for bucket: the replaced
+        // section's slot comes back through the same rotation that frees its ranges.
+        let first_slot = storage.storage[&IVec3::new(0, 0, 0)].layers[0]
+            .as_ref()
+            .expect("the section was put with one layer")
+            .record_slot;
+
+        assert!(put(&mut storage, IVec3::new(0, 0, 0), 1));
+
+        assert_eq!(storage.deferred.len(), storage.deferred_records.len());
+        storage.free_deferred();
+
+        assert!(
+            storage.record_free.contains(&first_slot),
+            "the replaced section's slot came back with its ranges"
         );
     }
 

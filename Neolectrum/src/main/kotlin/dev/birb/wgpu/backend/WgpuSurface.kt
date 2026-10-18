@@ -3,6 +3,7 @@ package dev.birb.wgpu.backend
 import dev.birb.wgpu.WgpuMcMod
 import dev.birb.wgpu.rust.NativeNames
 import dev.birb.wgpu.rust.WmNative
+import dev.birb.wgpu.rust.runsOnIos
 import org.lwjgl.glfw.GLFW
 import org.lwjgl.glfw.GLFWNativeCocoa
 import org.lwjgl.glfw.GLFWNativeWayland
@@ -224,18 +225,68 @@ class WgpuSurface internal constructor(
          * Public because `WgpuBackend` needs it *before* the renderer exists: passing the handles
          * to `createWmRendererOnWindow` is what lets Rust pick an adapter that can actually
          * present to this window.
+         *
+         * **iOS never reaches the switch**: the launcher's GLFW shim answers X11 whatever runs
+         * underneath (Minecraft's GLX init asks for X11 by name, so the shim has no honest
+         * answer to give), which would send an iPhone into the X11 branch below - and that
+         * branch died before it could return, because `GLFWNativeX11` builds its function
+         * table from the native library and the launcher's GLFW has no `glfwGetX11Display`:
+         * the missing function is a class-initializer error, which is the crash the first iOS
+         * launch was. The pointer the renderer wants is not a GLFW accessor anyway - the
+         * launcher publishes the game's `UIView` as a system property at launch (see
+         * `iosGameView` and the contract in `docs/multiplatform.md`), and Rust's
+         * `surface_target` turns it into a UiKit handle.
          */
-        fun windowHandles(windowHandle: Long): Pair<Long, Long> = when (GLFW.glfwGetPlatform()) {
-            GLFW.GLFW_PLATFORM_WIN32 -> 0L to GLFWNativeWin32.glfwGetWin32Window(windowHandle)
-            GLFW.GLFW_PLATFORM_X11 ->
-                GLFWNativeX11.glfwGetX11Display() to GLFWNativeX11.glfwGetX11Window(windowHandle)
-            GLFW.GLFW_PLATFORM_COCOA ->
-                GLFWNativeCocoa.glfwGetCocoaWindow(windowHandle) to 0L
-            GLFW.GLFW_PLATFORM_WAYLAND ->
-                0L to GLFWNativeWayland.glfwGetWaylandWindow(windowHandle)
-            else -> throw IllegalStateException(
-                "wgpu-mc: unsupported GLFW platform ${GLFW.glfwGetPlatform()}"
-            )
+        fun windowHandles(windowHandle: Long): Pair<Long, Long> {
+            if (runsOnIos()) {
+                return 0L to iosGameView()
+            }
+            return when (GLFW.glfwGetPlatform()) {
+                GLFW.GLFW_PLATFORM_WIN32 -> 0L to GLFWNativeWin32.glfwGetWin32Window(windowHandle)
+                GLFW.GLFW_PLATFORM_X11 ->
+                    GLFWNativeX11.glfwGetX11Display() to GLFWNativeX11.glfwGetX11Window(windowHandle)
+                GLFW.GLFW_PLATFORM_COCOA ->
+                    GLFWNativeCocoa.glfwGetCocoaWindow(windowHandle) to 0L
+                GLFW.GLFW_PLATFORM_WAYLAND ->
+                    0L to GLFWNativeWayland.glfwGetWaylandWindow(windowHandle)
+                else -> throw IllegalStateException(
+                    "wgpu-mc: unsupported GLFW platform ${GLFW.glfwGetPlatform()}"
+                )
+            }
+        }
+
+        /**
+         * The property the iOS launchers start the JVM with, carrying the game view pointer:
+         * the same one the Metallum Metal path reads, because it is the launcher naming the
+         * view once for every renderer rather than each renderer finding it alone.
+         */
+        private const val IOS_GAME_VIEW_PROPERTY = "metallum.ios.view.pointer"
+
+        /**
+         * The game's `UIView` pointer on iOS, read from [IOS_GAME_VIEW_PROPERTY].
+         *
+         * The launcher publishes the pointer at launch (`%p`-formatted, so `0x`-prefixed hex);
+         * a plain decimal is accepted too, because a launcher that formats the number itself
+         * rather than through `%p` should still be understood. The view's `layer` is the
+         * launcher's own `CAMetalLayer` - that is the contract's other half, and the reason
+         * Rust's UiKit handle can go straight at the view. A `0` answer means the launcher is
+         * one without the contract: the caller turns the thrown state into the backend's
+         * "no supported graphics backend" error screen, which names what was missing.
+         */
+        private fun iosGameView(): Long {
+            val raw = System.getProperty(IOS_GAME_VIEW_PROPERTY).orEmpty().trim()
+            val view = raw.removePrefix("0x").removePrefix("0X").toLongOrNull(16)
+                ?: raw.toLongOrNull()
+                ?: 0L
+            if (view == 0L) {
+                throw IllegalStateException(
+                    "wgpu-mc: this iOS launcher published no game view to present through " +
+                        "(expected the $IOS_GAME_VIEW_PROPERTY system property, which the " +
+                        "launcher sets at launch) - update the launcher, or its author needs " +
+                        "to publish the game view pointer"
+                )
+            }
+            return view
         }
 
         /**

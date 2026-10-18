@@ -82,8 +82,12 @@ private fun nativeResourceRoots(): List<String> {
  * the same way the Android launchers do, and iOS is still iOS underneath: `/var/mobile` is the home
  * of the mobile user in a way no Mac or Linux box has it. Both answers are cheap to ask and neither
  * is true on a desktop Mac, which is what the third branch of [nativeResourceRoots] is for.
+ *
+ * Internal rather than private because the surface side asks it too: `WgpuSurface.windowHandles`
+ * must take its iOS branch before it trusts the GLFW platform, whose launcher shim answers X11 on
+ * an iPhone (see the note there).
  */
-private fun runsOnIos(): Boolean {
+internal fun runsOnIos(): Boolean {
         val osName = System.getProperty("os.name").orEmpty().lowercase()
         if ("ios" in osName || "iphone" in osName || "ipad" in osName) return true
         return java.io.File("/var/mobile").exists()
