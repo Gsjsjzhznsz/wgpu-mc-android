@@ -123,7 +123,12 @@ struct DrawCall {
 /// stops. The copies are encoded just before the render pass that draws from them, in the order of
 /// this list, which is the order of the calls - so a blending layer's far-to-near order is the
 /// compacted buffer's own order and the draw reads it back exactly as it went in.
-#[derive(Debug, Clone, Copy)]
+///
+/// `PartialEq` is the copy cache's equality: a frame whose plan equals the one a pass last encoded,
+/// over an arena whose epoch has not moved, would blit exactly the same bytes from exactly the same
+/// offsets - which is the comparison [`RenderGraph::prepare_mega_draw`] makes before it skips the
+/// blits altogether.
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct MegaCopy {
     arena: u32,
     src_offset: u64,
@@ -347,7 +352,10 @@ struct PassDraws {
     mega: bool,
     /// **The blits the compacted draw copies with**, in call order. Empty unless [`PassDraws::mega`]
     /// went up, and encoded just before the render pass that draws from them - the copies and the
-    /// draws are one submission, so the buffer is full before the first draw reads it.
+    /// draws are one submission, so the buffer is full before the first draw reads it. Whether they
+    /// are encoded *again* is the copy cache's decision, which lives beside the buffer it fills - see
+    /// [`RenderGraph::mega_slots`] - because "what this pass last put in the buffer" is a fact about
+    /// the buffer, and it survives a frame rebuild that the plan does not.
     mega_copies: Vec<MegaCopy>,
     /// **Whether this pass has already drawn from these records.** It is what makes a rebuild in the
     /// middle of a frame safe rather than corrupting: a pass whose draws are recorded reads its records
@@ -388,6 +396,24 @@ struct TerrainFrameKey {
     /// The model matrix's translation, which the culler is handed and warns about. In the key because it
     /// is an argument of the thing being cached.
     model_translation: [f32; 3],
+}
+
+/// **One terrain pass' compacted draw buffer, and the copy cache that guards it.**
+///
+/// The buffer is the pass' own scratch: its copies fill it, its draws read it, and nothing else
+/// writes it - which is what makes "the buffer already holds exactly these bytes" a decidable
+/// question rather than a hope. `encoded_copies` is the last plan this slot blitted in, and
+/// `encoded_epoch` is the arena's mutation counter as it stood then (see `chunk::arena_epoch`): a
+/// frame whose plan compares equal to `encoded_copies` while the epoch still matches would blit the
+/// same bytes from the same offsets, so [`RenderGraph::prepare_mega_draw`] skips the blits and the
+/// draw reads this buffer as it stands. A buffer replacement empties `encoded_copies`, because new
+/// memory holds nobody's bytes.
+#[derive(Debug, Clone)]
+struct MegaSlot {
+    buffer: wgpu::Buffer,
+    capacity: u64,
+    encoded_copies: Vec<MegaCopy>,
+    encoded_epoch: u64,
 }
 
 /// How many frames the renderer has begun. See [`begin_frame`].
@@ -1557,18 +1583,21 @@ pub struct RenderGraph {
     pub resources: HashMap<String, ResourceBacking>,
     /// The frame's terrain: the gather and the draws each pass will issue. See [`TerrainFrame`].
     terrain_frame: std::cell::RefCell<TerrainFrame>,
-    /// **The frame's compacted index buffer**, and its capacity in bytes: what the terrain pass draws
-    /// over when the batched call is closed and [`TERRAIN_MEGA`] asks for this instead of per-section
-    /// drawing. One buffer for the whole graph, because the passes that share it are recorded in
-    /// encoder order - each pass's copies are encoded immediately before the render pass that reads
-    /// them, so a later pass's copies cannot land under an earlier pass's draw.
+    /// **The terrain passes' compacted index buffers, one per draw slot** - what the terrain pass
+    /// draws over when the batched call is closed and [`TERRAIN_MEGA`] asks for this instead of
+    /// per-section drawing. One buffer **per pass** rather than one for the graph, and the reason is
+    /// the copy cache: a pass's buffer holds its own plan's bytes until that pass re-encodes, so a
+    /// frame that plans exactly what the pass encoded before can skip the blits and draw the buffer
+    /// as it stands - while a shared buffer would have been overwritten by the next pass within the
+    /// same frame, and a skip would read another pass's indices.
     ///
-    /// Grown on demand and never shrunk: a frame that needs more replaces the buffer outright, and the
-    /// passes already recorded against the old one are safe because the commands that reference it
-    /// keep it alive to the end of their submission - which is also why the draw loop draws with the
-    /// buffer its own pass encoded into, handed across as a value, and not with whatever sits in this
-    /// cell at draw time.
-    mega_index: std::cell::RefCell<Option<(wgpu::Buffer, u64)>>,
+    /// Grown on demand and never shrunk: a frame that needs more replaces the slot's buffer outright,
+    /// and the passes already recorded against the old one are safe because the commands that
+    /// reference it keep it alive to the end of their submission - which is also why the draw loop
+    /// draws with the buffer its own pass encoded into, handed across as a value, and not with
+    /// whatever sits in this cell at draw time. A replacement empties the slot's cached copies (see
+    /// [`MegaSlot`]), so the next frame re-encodes into the new memory.
+    mega_slots: std::cell::RefCell<Vec<Option<MegaSlot>>>,
     /// **The channel: where another renderer's passes sit in this frame.** Registering is a JNI call
     /// from a thread this loop does not own, and the frame reads the registry on the render thread,
     /// so the two meet behind a `parking_lot::Mutex` - one uncontended lock per pass slot, and an
@@ -2141,8 +2170,8 @@ impl RenderGraph {
                     .collect(),
                 ..TerrainFrame::default()
             }),
-            // Created the first frame that needs it - see `ensure_mega_buffer`.
-            mega_index: std::cell::RefCell::new(None),
+            // Created the first frame that needs them - see `ensure_mega_buffer`.
+            mega_slots: std::cell::RefCell::new(Vec::new()),
             // Empty until someone registers - the frame runs exactly as it did, one lock per pass.
             channels: parking_lot::Mutex::new(crate::render::channels::ChannelRegistry::default()),
         };
@@ -3202,7 +3231,8 @@ impl RenderGraph {
 
                 if the_mega_path_holds(plan.total_indices) {
                     draws.mega_copies.extend_from_slice(&plan.copies);
-                    TERRAIN_MEGA_BYTES.fetch_add(plan.total_indices * 4, Ordering::Relaxed);
+                    // The byte count moves at the encode, not here: a frame whose plan matches the
+                    // pass' copy cache is skipped without blitting, and the report says "moved".
                 } else {
                     // Over the rail, and honestly back to the per-section path: an empty copy list is
                     // what makes the encode step below a no-op and the draw loop fall through to the
@@ -3319,25 +3349,40 @@ impl RenderGraph {
         );
     }
 
-    /// **The buffer this frame's compacted draw copies into, at least `needed_bytes` big.**
+    /// **The draw slot's compacted index buffer, grown to at least `needed_bytes`**, with the slot's
+    /// cached copy list emptied when the growth replaced the memory.
     ///
-    /// Grown by replacement rather than by reallocation: the buffer is per-frame scratch that is
-    /// rewritten before every draw that reads it, so there is nothing in an old buffer worth carrying
-    /// over, and the passes already recorded against it are safe because a command buffer keeps every
-    /// resource it references alive to the end of its submission. The new size is the ask grown to the
-    /// next mebibyte, and at least doubled while growing - so a world that creeps up on its real
-    /// steady state does not replace the buffer once a frame on the way there.
-    fn ensure_mega_buffer(&self, wm: &WmRenderer, needed_bytes: u64) -> wgpu::Buffer {
-        let mut slot = self.mega_index.borrow_mut();
+    /// One slot per terrain pass rather than one buffer for the graph, which is what makes the copy
+    /// cache decidable: a pass' buffer holds its own plan's bytes until that pass re-encodes, so a
+    /// frame whose plan matches can skip the blits - see [`MegaSlot`]. Grown by replacement rather
+    /// than by reallocation: the buffer is per-pass scratch that is rewritten before every draw that
+    /// reads it, so there is nothing in an old buffer worth carrying over, and the passes already
+    /// recorded against it are safe because a command buffer keeps every resource it references alive
+    /// to the end of its submission. The new size is the ask grown to the next mebibyte, and at least
+    /// doubled while growing - so a world that creeps up on its real steady state does not replace the
+    /// buffer once a frame on the way there.
+    fn ensure_mega_buffer(
+        &self,
+        wm: &WmRenderer,
+        draw_slot: usize,
+        needed_bytes: u64,
+    ) -> wgpu::Buffer {
+        let mut slots = self.mega_slots.borrow_mut();
 
-        if let Some((buffer, capacity)) = slot.as_ref()
-            && *capacity >= needed_bytes
+        if slots.len() <= draw_slot {
+            slots.resize(draw_slot + 1, None);
+        }
+
+        let slot = &mut slots[draw_slot];
+
+        if let Some(existing) = slot
+            && existing.capacity >= needed_bytes
         {
-            return buffer.clone();
+            return existing.buffer.clone();
         }
 
         let grown = needed_bytes
-            .max(slot.as_ref().map_or(0, |(_, capacity)| capacity * 2))
+            .max(slot.as_ref().map_or(0, |existing| existing.capacity * 2))
             .next_multiple_of(1 << 20)
             .max(1 << 20);
 
@@ -3349,12 +3394,19 @@ impl RenderGraph {
         });
 
         log::info!(
-            "wgpu-mc: the compacted terrain draw buffer is now {grown} bytes ({} indices), for a frame \
+            "wgpu-mc: the compacted terrain draw buffer is now {grown} bytes ({} indices), for a pass \
              that asked for {needed_bytes}",
             grown / 4
         );
 
-        *slot = Some((buffer.clone(), grown));
+        // New memory holds nobody's bytes: whatever the slot cached about the old buffer is gone, and
+        // the next frame re-encodes into this one before drawing from it.
+        *slot = Some(MegaSlot {
+            buffer: buffer.clone(),
+            capacity: grown,
+            encoded_copies: Vec::new(),
+            encoded_epoch: u64::MAX,
+        });
         buffer
     }
 
@@ -3429,17 +3481,56 @@ impl RenderGraph {
                 .map(|copy| copy.dst_offset + copy.size)
                 .max()
                 .unwrap_or(0);
-            let buffer = self.ensure_mega_buffer(wm, needed_bytes);
+            let buffer = self.ensure_mega_buffer(wm, draw_slot, needed_bytes);
 
-            let chunk_buffers = scene.chunk_buffers.load_full();
-            for copy in &draws.mega_copies {
-                encoder.copy_buffer_to_buffer(
-                    &chunk_buffers[copy.arena as usize].buffer,
-                    copy.src_offset,
-                    &buffer,
-                    copy.dst_offset,
-                    copy.size,
+            // **The copy cache.** A frame whose plan equals the one this slot last blitted in, over
+            // an arena whose epoch has not moved since, would blit exactly the same bytes from
+            // exactly the same offsets - so the blits are skipped and the draw reads the buffer as
+            // it stands. This is the whole point of the per-pass buffers: nothing else writes this
+            // one, so "it already holds the plan" is a fact the two comparisons establish, where the
+            // shared buffer this replaced was overwritten by the next pass within its own frame.
+            // The epoch is the half that catches what an equal plan cannot: a bake that replaced a
+            // section's ranges behind an unchanged visible set, a trim, a pool reshape.
+            //
+            // Every epoch bump happens on the render thread (the drain, the trim, the pool paths),
+            // so there is no window between the check and the encode that a mutation could slip
+            // through; a *worker* thread bakes, but a bake reaches the arena only through the drain.
+            let unchanged = {
+                let mut slots = self.mega_slots.borrow_mut();
+                match slots.get_mut(draw_slot) {
+                    Some(Some(slot)) => {
+                        slot.encoded_copies == draws.mega_copies
+                            && slot.encoded_epoch == scene.section_storage.read().arena_epoch()
+                    }
+                    _ => false,
+                }
+            };
+
+            if !unchanged {
+                let chunk_buffers = scene.chunk_buffers.load_full();
+                for copy in &draws.mega_copies {
+                    encoder.copy_buffer_to_buffer(
+                        &chunk_buffers[copy.arena as usize].buffer,
+                        copy.src_offset,
+                        &buffer,
+                        copy.dst_offset,
+                        copy.size,
+                    );
+                }
+
+                // Counted at the encode rather than at the plan, because the report says "moved": a
+                // frame that skipped its blits moved no bytes, and the sum here is the plan's total
+                // either way - the copies cover every call's indices, merges included.
+                TERRAIN_MEGA_BYTES.fetch_add(
+                    draws.mega_copies.iter().map(|copy| copy.size).sum::<u64>(),
+                    Ordering::Relaxed,
                 );
+
+                let mut slots = self.mega_slots.borrow_mut();
+                if let Some(Some(slot)) = slots.get_mut(draw_slot) {
+                    slot.encoded_copies.clone_from(&draws.mega_copies);
+                    slot.encoded_epoch = scene.section_storage.read().arena_epoch();
+                }
             }
 
             buffer

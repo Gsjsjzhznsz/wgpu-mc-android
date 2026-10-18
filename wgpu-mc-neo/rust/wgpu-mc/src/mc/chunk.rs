@@ -421,6 +421,28 @@ pub struct SectionStorage {
     /// the camera check - one trim with the new radius, whether or not the camera moved. One-shot by
     /// construction (`take`), so a width that did not change costs nothing.
     trim_due: bool,
+    /// How many times this pool's live content has changed, since it was built.
+    ///
+    /// **The renderer's copy cache reads this**: the compacted terrain draw blits the frame's index
+    /// ranges out of the arena buffers every frame, and a frame whose plan is unchanged since the
+    /// pass last encoded would blit exactly the same bytes - so the graph skips the blits when this
+    /// counter says nothing moved underneath it. Every mutation of what a cached plan names has to
+    /// bump it, or a skipped blit redraws geometry that is no longer there; nothing that merely
+    /// recycles *free* slots may bump it, or the skip would never fire while the world loads.
+    ///
+    /// The mutations, and where they count here: a publish ([`Self::insert`], which covers every
+    /// successful allocate - the new ranges are not drawn from until the insert publishes them), a
+    /// trim ([`Self::trim`], which frees the ranges it drops), a level change ([`Self::forget`]),
+    /// and both pool reshapes ([`Self::set_pool_arenas`], [`Self::add_arena`], which change the
+    /// buffer list the copies read from). What does **not** count: the deferred frees
+    /// ([`Self::defer_free`]), which hand dead ranges back to the allocator without touching any
+    /// live one, and the parking queue, whose geometry never reached a buffer.
+    ///
+    /// A field rather than a process-wide counter because every mutation happens under this
+    /// storage's write lock - so a reader that takes the read lock gets a counter that agrees with
+    /// the ranges it sees, without an atomic to maintain, and a test that builds its own storage
+    /// gets a counter nobody else's test can move.
+    arena_epoch: u64,
 }
 
 /// One section's baked geometry, held until the arena has room for it.
@@ -476,6 +498,7 @@ impl SectionStorage {
             record_free: (0..crate::mc::SECTION_DRAW_CAPACITY as u32).rev().collect(),
             record_writes: std::collections::BTreeMap::new(),
             trim_due: false,
+            arena_epoch: 0,
         }
     }
     /// Narrows or widens the pool to a render distance, which is only possible while it is empty.
@@ -511,6 +534,10 @@ impl SectionStorage {
         self.record_free = (0..crate::mc::SECTION_DRAW_CAPACITY as u32).rev().collect();
         self.record_writes.clear();
 
+        // The buffer list the renderer's copies read from is about to be rebuilt beside this - see
+        // `split_arena_slots` and `WmRenderer`'s pool paths - so a cached copy plan has to go stale.
+        self.arena_epoch = self.arena_epoch.wrapping_add(1);
+
         true
     }
 
@@ -520,6 +547,11 @@ impl SectionStorage {
     /// here is buffer `i` in `Scene`, and `WmRenderer::grow_arena` is the only other half.
     pub fn add_arena(&mut self, slots: u32) {
         self.arenas.push(SectionArena::new(slots));
+
+        // A growth does not move any live range - the new buffer only takes future allocations - but
+        // it does rebuild `Scene::chunk_buffers`, and one stale plan after a growth costs one recopy
+        // of a frame, which is cheap next to the audit proving the old buffers identical.
+        self.arena_epoch = self.arena_epoch.wrapping_add(1);
     }
 
     /// How many arena buffers there are. See [`Self::add_arena`].
@@ -629,6 +661,11 @@ impl SectionStorage {
         self.at_capacity = at;
     }
 
+    /// Reads the storage's mutation counter for the renderer's copy cache. See [`Self::arena_epoch`].
+    pub fn arena_epoch(&self) -> u64 {
+        self.arena_epoch
+    }
+
     /// Whether a refusal is one growth cannot answer. See [`SectionStorage::at_capacity`].
     pub fn at_capacity(&self) -> bool {
         self.at_capacity
@@ -684,6 +721,9 @@ impl SectionStorage {
         self.record_writes.clear();
 
         self.storage.clear();
+
+        // Every range this held was live a moment ago; the new world starts from an empty cache.
+        self.arena_epoch = self.arena_epoch.wrapping_add(1);
 
         // The refusals described positions in the world that has just been left behind: the JVM is
         // clearing its own record of them at the same moment (`forgetAll`), and handing them over
@@ -805,6 +845,13 @@ impl SectionStorage {
         });
         self.defer_free(deferred);
         self.defer_free_records(deferred_records);
+
+        // The sections this trim dropped had live ranges; anything the renderer cached about them is
+        // stale. Counted only when something actually left, so a trim that found nothing to drop -
+        // the common one, once the width has settled - does not churn the copy cache.
+        if !to_remove.is_empty() {
+            self.arena_epoch = self.arena_epoch.wrapping_add(1);
+        }
 
         to_remove
     }
@@ -978,6 +1025,14 @@ impl SectionStorage {
     /// is what made the claim and the fact drift apart by exactly what the player flew past, and a
     /// section claimed but not held is drawn by neither renderer.
     pub fn forget_trimmed(&mut self, pos: IVec3) {
+        // **Counted, not just listed.** The hand-over below reports through the same counter a
+        // refusal does, and the JVM checks the channel as `refused = handed over + dropped` - so a
+        // section that arrives without having been counted first reads as `-N unaccounted for` and
+        // warns every second, which is exactly what android.37's first trim did: 324 sections handed
+        // over against a refusal count that had never moved. A trim drop is not a refusal - no range
+        // failed to fit - but from the JVM's side it is the same sentence, "this renderer stopped
+        // drawing this section", and the count is what the sentence is checked against.
+        REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.refused_pending.insert(pos);
     }
 
@@ -1245,6 +1300,12 @@ impl SectionStorage {
     pub fn insert(&mut self, pos: IVec3, section: Section) {
         self.storage.insert(pos, section);
         self.refused_pending.remove(&pos);
+
+        // **The publish.** Every successful allocate ends here, and this is the first moment the new
+        // ranges can be drawn from - the drain uploads the bytes before it calls this, so a cache
+        // that sees the insert sees the bytes too. A replace publishes over the old entry, which is
+        // why the bump is unconditional rather than gated on the slot being new.
+        self.arena_epoch = self.arena_epoch.wrapping_add(1);
     }
 
     fn allocate_ranges(&mut self, baked_layers: &[BakedLayer]) -> Section {
@@ -1413,10 +1474,15 @@ impl SectionStorage {
 /// The number that matters is how much of the view does not fit: a handful of sections is a world edge
 /// nobody notices, and thousands of them is a rendering-policy problem - the pool is fixed and the
 /// render distance is not.
-/// How many sections the arena has refused to hold, over the whole run.
+/// How many sections the arena has stopped drawing, over the whole run - most of them refused for
+/// want of arena space, and the rest dropped by a trim (see [`SectionStorage::forget_trimmed`],
+/// which counts here too).
 ///
 /// Read by the JVM side and printed on the terrain line: a run where this is not zero is a run whose
 /// sections were being dropped for want of arena space, which looks like ground that comes and goes.
+/// It is also the first term of the channel invariant the JVM checks - `refused = handed over +
+/// dropped` - so anything that feeds the pending set has to count here first, or the check reads the
+/// hand-over as a section that arrived from nowhere.
 static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// How many of those refusals the JVM has been *told* about - handed over by [`SectionStorage::refused`]
@@ -7199,6 +7265,147 @@ mod arena_tests {
         // because the report that grew the width may also have grown the ring the trim keeps.
         storage.set_width(12);
         assert!(storage.trim_due());
+    }
+
+    /// **The arena epoch moves exactly when the arena's live content does** - it is the renderer's
+    /// copy cache, so a mutation it misses is a skipped blit that redraws geometry which is no longer
+    /// there, and a mutation it counts too eagerly is a cache that never fires.
+    ///
+    /// The publishes count (an insert covers every successful allocate, and the bytes land before the
+    /// insert runs), the frees of *live* ranges count (a trim, a level change), and both pool reshapes
+    /// count (they rebuild the buffer list the copies read from). What must **not** count: the
+    /// deferred frees, which recycle slots of sections the storage has already stopped naming, and a
+    /// trim that found nothing to drop.
+    #[test]
+    fn the_arena_epoch_moves_when_its_ranges_do() {
+        let mut storage = SectionStorage::new(pool_for(4));
+
+        // The counter is the storage's own field, so nothing another test does can move it.
+        let epoch_at_rest = storage.arena_epoch();
+
+        // A publish moves it.
+        let mut layers = [layer(1)];
+        let (section, freed) = storage
+            .allocate(IVec3::new(0, 0, 0), &mut layers)
+            .expect("the pool holds one quad");
+        storage.insert(IVec3::new(0, 0, 0), section);
+        storage.defer_free(freed);
+
+        let epoch_after_publish = storage.arena_epoch();
+        assert_ne!(
+            epoch_at_rest, epoch_after_publish,
+            "a published section is live content, and the copy cache has to hear about it"
+        );
+
+        // And a second publish moves it again - the cache is a counter, not a flag.
+        let mut layers = [layer(1)];
+        let (section, freed) = storage
+            .allocate(IVec3::new(1, 0, 0), &mut layers)
+            .expect("the pool holds two quads");
+        storage.insert(IVec3::new(1, 0, 0), section);
+        storage.defer_free(freed);
+
+        assert_ne!(
+            epoch_after_publish,
+            storage.arena_epoch(),
+            "every publish is a new plan the renderer may have cached against"
+        );
+
+        // A pool reshape moves it, twice for the two of them.
+        let before = storage.arena_epoch();
+        storage.add_arena(pool_for(4));
+        assert_ne!(
+            before,
+            storage.arena_epoch(),
+            "a growth rebuilds chunk_buffers"
+        );
+
+        let mut slots = vec![pool_for(4); storage.arena_count()];
+        assert!(
+            !storage.set_pool_arenas(std::mem::take(&mut slots)),
+            "a pool with sections in it cannot be reshaped - and a refused reshape says nothing"
+        );
+        assert_eq!(
+            before + 1,
+            storage.arena_epoch(),
+            "the refused reshape did not move the counter"
+        );
+
+        let mut emptied = SectionStorage::new(pool_for(4));
+        let mut slots = vec![pool_for(4); emptied.arena_count()];
+        assert!(
+            emptied.set_pool_arenas(std::mem::take(&mut slots)),
+            "an empty pool reshapes freely"
+        );
+
+        // A level change moves it.
+        let before = storage.arena_epoch();
+        storage.forget();
+        assert_ne!(
+            before,
+            storage.arena_epoch(),
+            "a level change empties the cache"
+        );
+
+        // And a trim with nothing to drop does not - the common one, once the width has settled.
+        storage.set_width(4);
+        let before = storage.arena_epoch();
+        let dropped = storage.trim(IVec2::new(0, 0));
+        assert!(dropped.is_empty(), "nothing is held, so nothing is dropped");
+        assert_eq!(
+            before,
+            storage.arena_epoch(),
+            "an empty trim is not a mutation, and the cache survives it"
+        );
+    }
+
+    /// **A trim drop is counted with the refusals, because the JVM checks the channel by that sum.**
+    ///
+    /// `refused = handed over + dropped` is the invariant `RustChunkBake.checkRefusalChannel` reads,
+    /// and android.37's first trim handed 324 sections over against a refusal count that had never
+    /// moved - which read as `-324 unaccounted for` and warned once a second. The count belongs in
+    /// [`SectionStorage::forget_trimmed`]: a hand-over that is never counted first is a section that
+    /// arrives from nowhere.
+    ///
+    /// What this test deliberately does **not** hold is the sum over the *global* counters: a
+    /// refusal that was parked ([`Self::park`]) or accepted on a later bake ([`Self::insert`])
+    /// leaves the pending set without ever being reported or dropped, and the sum does not close for
+    /// it today - a formula gap, not this path's doing, and a run that parks makes the global sum
+    /// read short no matter what the trim does. The trim's own arithmetic is what is checked here.
+    #[test]
+    fn a_trim_drop_is_counted_with_the_refusals() {
+        let mut storage = SectionStorage::new(pool_for(1));
+
+        let refused_before = super::sections_refused();
+
+        let mut layers = [layer(1)];
+        let (section, freed) = storage
+            .allocate(IVec3::new(0, 0, 0), &mut layers)
+            .expect("the pool holds one quad");
+        storage.insert(IVec3::new(0, 0, 0), section);
+        storage.defer_free(freed);
+
+        // Off the edge, so the trim drops it and the hand-over runs.
+        let dropped = storage.trim(IVec2::new(64, 64));
+        assert_eq!(dropped, vec![IVec3::new(0, 0, 0)]);
+
+        for pos in dropped {
+            storage.forget_trimmed(pos);
+        }
+
+        assert_eq!(
+            storage.refused().len(),
+            1,
+            "the section reached the JVM through the refuse channel"
+        );
+
+        // Counted first, then reported: the two steps the JVM's sum needs, in the order it needs
+        // them. One-directional rather than `+1` because the counters are process-wide and the
+        // harness runs this file's tests in parallel - a concurrent test's refusal only ever adds.
+        assert!(
+            super::sections_refused() > refused_before,
+            "the trim drop was counted as a stopped section before it was handed over"
+        );
     }
 
     /// A refused section does not cost the pool the layers of itself that *did* fit.

@@ -359,11 +359,12 @@ unsafe fn surface_target(display: u64, window: u64) -> wgpu::SurfaceTargetUnsafe
     // layer and takes that as the render target. A `CAMetalLayer` handed over directly would not do:
     // the fetch goes through `-[UIView layer]`, and a layer does not answer that selector.
     //
-    // The view is also asked for on **the thread this runs on**, which wgpu's metal backend requires
-    // to be the process main thread - the one iOS UI objects live on. On the mobile launchers this
-    // port runs under, the game thread *is* the main thread, which is what makes the contract hold
-    // without a dispatch hop; a launcher that renders the game off the main thread has to call this
-    // from its main thread instead.
+    // The view is also asked for on **the thread this runs on**, and Apple's rule is that UI objects
+    // live on the process main thread - a rule raw-window-metal enforces with a panic. On the Android
+    // launchers this port grew up under the game thread *is* the main thread, but Prisma runs the JVM
+    // on a background thread and hit that panic on the first device creation - so [`build_surface`]
+    // dispatches this whole call onto the main queue on iOS. Keep the two of them together: a new
+    // caller that reaches for `surface_target` directly re-introduces the crash this hop fixed.
     #[cfg(target_os = "ios")]
     {
         use raw_window_handle::{UiKitDisplayHandle, UiKitWindowHandle};
@@ -431,7 +432,95 @@ unsafe fn build_surface(
     display: u64,
     window: u64,
 ) -> Result<wgpu::Surface<'static>, wgpu::CreateSurfaceError> {
-    unsafe { instance.create_surface_unsafe(surface_target(display, window)) }
+    // **iOS creates the surface on the process main thread, whatever thread asked for it.**
+    //
+    // The comment on the iOS arm of `surface_target` used to claim the game thread *is* the main
+    // thread on the launchers this port runs under, and Prisma proved it wrong on the first device
+    // creation: it runs the JVM on a background thread, and raw-window-metal - which wgpu's view
+    // handling goes through - answered with `panicked: can only access UIView on the main thread`.
+    // The panic is policy rather than a hard requirement of `[UIView layer]`, but the policy is
+    // Apple's, the check is in a crate this one does not own, and a message that ends a backend
+    // attempt is not a trade worth arguing with.
+    //
+    // So the one call that touches the view is dispatched onto the main queue and waited for. The
+    // hop is once per renderer, at a moment the main thread is idle in the launcher's run loop
+    // (device creation happens during `Minecraft.<init>`, on the render thread); everything after
+    // it - capabilities, configure, acquire - works on the `CAMetalLayer` the call captured, and
+    // `CAMetalLayer` is documented thread-safe, so no other step needs the main thread.
+    //
+    // `dispatch_sync_f` rather than `dispatch_async` because the caller needs the surface before it
+    // can go on, and rather than a block-based `dispatch_sync` because blocks are an
+    // Objective-C runtime type this crate has no bindings for - the function-and-context form is
+    // plain C and needs nothing but the two symbols.
+    #[cfg(target_os = "ios")]
+    {
+        #[repr(C)]
+        struct SurfaceJob<'a> {
+            instance: &'a wgpu::Instance,
+            display: u64,
+            window: u64,
+            result: Option<Result<wgpu::Surface<'static>, wgpu::CreateSurfaceError>>,
+        }
+
+        // The job is written on the main thread and read back on this one, after `dispatch_sync_f`
+        // has returned - which is the happens-before the dispatch itself provides, and the reason
+        // no `Surface` value is ever touched by two threads at once.
+        unsafe extern "C" fn create_surface_on_main(context: *mut core::ffi::c_void) {
+            // SAFETY: the context is the `SurfaceJob` this thread's caller pinned for the duration
+            // of the sync, and the main queue runs exactly one invocation of it before that returns.
+            let job = unsafe { &mut *(context as *mut SurfaceJob) };
+            // SAFETY: `surface_target` reads the pointers the launcher handed over and touches the
+            // view - which is the whole reason this runs on the main thread.
+            job.result = Some(unsafe {
+                job.instance
+                    .create_surface_unsafe(surface_target(job.display, job.window))
+            });
+        }
+
+        // `dispatch_get_main_queue()` is a macro over this object in C, not a function call, so the
+        // queue is reached as the static it is. Both symbols ship in libSystem, which every binary
+        // on the platform links against - there is nothing to add to the link line.
+        unsafe extern "C" {
+            static _dispatch_main_queue: u8;
+
+            fn dispatch_sync_f(
+                queue: *mut u8,
+                context: *mut core::ffi::c_void,
+                work: unsafe extern "C" fn(*mut core::ffi::c_void),
+            );
+        }
+
+        let mut job = SurfaceJob {
+            instance,
+            display,
+            window,
+            result: None,
+        };
+
+        // SAFETY: the queue is the main queue singleton, the context outlives the call (it is this
+        // function's own stack slot), and the work function reads only what the context carries.
+        unsafe {
+            dispatch_sync_f(
+                &raw const _dispatch_main_queue as *mut u8,
+                &raw mut job as *mut core::ffi::c_void,
+                create_surface_on_main,
+            );
+        }
+
+        // `dispatch_sync_f` only returns after the work has run - the queue cannot be gone while
+        // this process is creating renderers - so the arm below is unreachable outside a teardown
+        // race this port has never seen. A panic here says so, rather than unwrapping into
+        // something that blames the backend.
+        job.result.expect(
+            "wgpu-mc: the main queue returned without running the surface creation - the app is \
+             tearing down underneath the renderer",
+        )
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    unsafe {
+        instance.create_surface_unsafe(surface_target(display, window))
+    }
 }
 
 /// Applies a configuration to a surface that the caller already holds a reference to.
