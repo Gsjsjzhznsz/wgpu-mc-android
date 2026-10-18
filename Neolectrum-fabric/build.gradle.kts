@@ -39,6 +39,13 @@ kotlin {
 }
 
 loom {
+        // **The widener, named for the build the way it is named for the loader.** The
+        // fabric.mod.json field tells the *loader* to apply the widener at runtime; this is the
+        // same file named for *loom*, so the same entries reach the jar the Kotlin compiles
+        // against - without it the path stays empty, `validateAccessWidener` runs with no source,
+        // and every member the widener opens is unresolved at compile time.
+        accessWidenerPath = file("src/main/resources/wgpu_mc.accesswidener")
+
         // **The sourceset, declared as the mod it is.** Without this block loom has no reason to
         // read this module's fabric.mod.json as *metadata about this build* - and the access
         // widener that file names is discovered through exactly that read: the widener path stays
