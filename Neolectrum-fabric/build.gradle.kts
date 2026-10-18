@@ -121,7 +121,13 @@ if (packagedNatives.isDirectory) {
 
 dependencies {
         minecraft("com.mojang:minecraft:26.1.2")
-        mappings(loom.officialMojangMappings())
+        // **26.1 is unobfuscated, so there are no official mappings to find** - Mojang stopped
+        // shipping them, which is exactly what the NeoForge build's gradle.properties has said
+        // since 26.1 ("no mappings/parchment entries are needed anymore"), and what loom's
+        // `officialMojangMappings` answered with a hard failure on this version. The no-op
+        // mappings are the honest answer: no remapping pass, the jar's own names are the names
+        // both this build and the NeoForge build compile against.
+        mappings(loom.noopMappings())
         modImplementation("net.fabricmc:fabric-loader:0.17.3")
         modImplementation("net.fabricmc.fabric-api:fabric-api:0.134.0+26.1.2")
 
