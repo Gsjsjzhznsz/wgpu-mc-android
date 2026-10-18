@@ -77,6 +77,18 @@ sourceSets.main {
                 "dev/birb/wgpu/WgpuMcMod.kt",
                 "dev/birb/wgpu/WgpuMcModClient.kt",
                 "dev/birb/wgpu/backend/EarlyWindow.kt",
+                // **Four files whose job touches the game's NeoForge-patched surface**, each
+                // answered by this module's own copy under the same package: the GpuDevice
+                // implementation carries a `clearStencilTexture` override of a method only
+                // NeoForge's GpuDevice has, the format map names two stencil constants only
+                // NeoForge's TextureFormat enum has, and the two fluid-tint sites call
+                // `fluidTintSource()`, a channel only NeoForge's model classes carry. The copies
+                // in this module's own sources are the same files with those three seams answered
+                // the vanilla way - no override, no stencil constants, untinted fluids.
+                "dev/birb/wgpu/backend/WgpuCommandEncoder.kt",
+                "dev/birb/wgpu/backend/WgpuFormat.kt",
+                "dev/birb/wgpu/render/TintProfile.kt",
+                "dev/birb/wgpu/render/Wgpu.kt",
         )
         resources.exclude(
                 "META-INF/neoforge.mods.toml",
