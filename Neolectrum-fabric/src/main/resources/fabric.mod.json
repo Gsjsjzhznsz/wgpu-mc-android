@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "id": "${mod_id}",
+  "id": "wgpu_mc",
   "version": "${version}",
   "name": "Electrum",
   "description": "A renderer made to replace Blaze3D, written in Rust, using wgpu for cross-platform support. Supported backends: Vulkan, D3D12.",

@@ -406,7 +406,6 @@ object Wgpu {
 			return EMPTY_TINTS
 		}
 
-		val models = client.modelManager.fluidStateModelSet
 		var out = LongArray(0)
 		var count = 0
 
@@ -422,32 +421,11 @@ object Wgpu {
 			}
 
 			// The fluid tint is a NeoForge-added channel on the model class (`fluidTintSource`),
-			// which the vanilla jar this build compiles against does not carry - the fluid layers
-			// bake untinted here, and the game's own biome coloring (which is where most of the
-			// picture's fluid colour comes from) is unaffected.
-			val color = try {
-				continue
-				val at = tintPos.get().set(
-					(x shl 4) + (index and 15),
-					(y shl 4) + (index shr 8),
-					(z shl 4) + (index shr 4 and 15),
-				)
-
-				tintSource.colorInWorld(fluidState, state, level, at)
-			} catch (failure: Throwable) {
-				// Wrapped like every other read this mod makes of the game, and warned once for the life of
-				// the process: a fluid whose tint cannot be read keeps the default colour rather than
-				// stopping a client.
-				if (!warnedFluidTint) {
-					warnedFluidTint = true
-					WgpuMcMod.LOGGER.warn(
-						"wgpu: could not read a fluid's tint; water keeps the default colour",
-						failure,
-					)
-				}
-
-				continue
-			}
+			// which the vanilla jar this build compiles against does not carry - so every fluid
+			// block answers the game's own "no tint" here, which is white in the packing the
+			// native side reads. The game's own biome coloring, which is where most of the
+			// picture's fluid colour comes from, is the block tint and unaffected.
+			val color = -1
 
 			if (count == out.size) {
 				out = out.copyOf(if (count == 0) 64 else count * 2)
@@ -490,32 +468,11 @@ object Wgpu {
 		if (client == null || client.level == null) {
 			return 0xFFFFFFFF.toInt()
 		}
-		val level = client.level ?: return 0xFFFFFFFF.toInt()
-
-		val pos = BlockPos(x, y, z)
-
-		try {
-			// Same NeoForge-only channel, same answer: untinted, and the caller's fallback colour
-			// is what the bake sees.
-			return 0xFFFFFFFF.toInt()
-			@SuppressWarnings("unused")
-			val fluidState = level.getFluidState(pos)
-
-			return packTint(color)
-		} catch (failure: Throwable) {
-			// Wrapped like every other read this mod makes of the game: this runs on the bake thread
-			// while a world loads, and a failure here is water drawn with the default colour rather
-			// than a client that stops.
-			if (!warnedFluidTint) {
-				warnedFluidTint = true
-				WgpuMcMod.LOGGER.warn(
-					"wgpu: could not read a fluid's tint; water keeps the default colour",
-					failure,
-				)
-			}
-
-			return 0xFFFFFFFF.toInt()
-		}
+		// Same NeoForge-only channel, same answer: the vanilla jar carries no per-fluid model
+		// tint source, so this reads the game's own "no tint" (-1) and packs it like any other -
+		// white, the untinted answer the bake treats as "draw it plain". The parameters stay
+		// because the JNI signature is the contract.
+		return packTint(-1)
 	}
 
 	/** One warning for the fluid tint rather than one per fluid block, for the life of the process. */

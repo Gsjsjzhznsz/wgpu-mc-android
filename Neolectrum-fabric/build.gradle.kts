@@ -106,9 +106,12 @@ sourceSets.main {
 // what ships, so the shared one never wins the duplicate by accident either.
 tasks.processResources {
         duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+        // The id is spelled literally in fabric.mod.json, not expanded: loom reads the *source*
+        // metadata to find the access widener, and a placeholder where a mod id belongs is not a
+        // mod id as far as its validation is concerned - the widener then never loads, and every
+        // member it widens is unresolved at compile time.
         val properties = mapOf(
                 "version" to modVersion,
-                "mod_id" to modId,
         )
         inputs.properties(properties)
         filesMatching("fabric.mod.json") {
