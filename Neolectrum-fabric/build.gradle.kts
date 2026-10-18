@@ -1,7 +1,7 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
-        java-library
+        id("java-library")
         kotlin("jvm") version "2.3.20"
         id("fabric-loom") version "1.14.3"
 }
