@@ -663,6 +663,12 @@ impl WmRenderer {
                     let data_words = layers[i].vertices.len() as u32 / 4;
                     let ao_words = layers[i].ao.len() as u32 / 4;
 
+                    // **The indices' piece is the exact baked bytes**, and its range says so: the
+                    // allocation is rounded to the vec4 contract, and its slack is nobody's to write
+                    // - the draw names `index_len` indices, and the words between that and the
+                    // rounded end stay whatever they were. See `SectionRanges::index_len`.
+                    let index_words = layers[i].indices.len() as u32 / 4;
+
                     let mut pieces = [
                         (ranges.vertex_range.clone(), &layers[i].vertices),
                         (
@@ -670,7 +676,10 @@ impl WmRenderer {
                                 ..(ranges.vertex_range.start + data_words + ao_words),
                             &layers[i].ao,
                         ),
-                        (ranges.index_range.clone(), &layers[i].indices),
+                        (
+                            ranges.index_range.start..ranges.index_range.start + index_words,
+                            &layers[i].indices,
+                        ),
                     ];
 
                     pieces.sort_by_key(|(range, _)| range.start);

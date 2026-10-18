@@ -104,6 +104,9 @@ struct DrawCall {
     /// Which arena buffer the section lives in. A batched call may only span one arena, because the
     /// index buffer and the bind group are per arena and a `multi_draw` has one of each.
     arena: u32,
+    /// **The exact indices the bake wrote for this section, from the arena's start** - not the
+    /// rounded allocation the storage names, whose slack holds stale words the compacted draw would
+    /// shred the run with. See [`plan_mega_copies`] and `SectionRanges::index_len`.
     index_range: std::ops::Range<u32>,
     /// **Where this call's indices land in the compacted draw buffer**, in indices from the buffer's
     /// start. Assigned in call order when the copies are planned, so a run of calls that share an
@@ -172,10 +175,26 @@ struct MegaPlan {
 /// fill exactly that span with exactly the run's indices in list order. It holds by construction:
 /// the cursor only ever moves forward, so consecutive calls get consecutive destinations whether
 /// their copy was a fresh push or a merge that grew.
+///
+/// **Every length in that arithmetic is the exact baked count, and the triple boundary is why.** Six
+/// indices a quad is a whole number of triangles, so a section's real indices end where they begin -
+/// on a triple. The allocation the range was sized by is rounded to the vec4 contract, and its slack
+/// holds stale words: a run that measured itself by the allocation would copy those words into the
+/// buffer *between* two sections' real indices, and every triple after the first slack word would
+/// name the wrong vertices - a world of shredded triangles (android.40's). The gather hands this
+/// walk exact ranges (see `SectionRanges::index_len`), so a section's indices end in the buffer
+/// exactly where the next section's begin, and every triple the draw reads is a quad the bake wrote.
 fn plan_mega_copies(calls: &mut [DrawCall]) -> MegaPlan {
     let mut plan = MegaPlan::default();
 
     for call in calls.iter_mut() {
+        debug_assert!(
+            call.index_range.len() % 3 == 0,
+            "a draw call carries {} indices - not a whole number of triangles; the compacted \
+             buffer's triples would tear at its edges",
+            call.index_range.len()
+        );
+
         let size = (call.index_range.len() as u64) * 4;
 
         // **The merge**: the call before this one, in the list, ended exactly where this one begins,
@@ -3007,9 +3026,19 @@ impl RenderGraph {
                         // The arena the layer lives in travels with its ranges: the draw loop rebinds
                         // when it changes, and drawing a section against another arena is a section of
                         // somebody else's geometry.
+                        //
+                        // **The index range is the baked count, not the allocation.** `index_range`
+                        // names the rounded allocation the vec4 alignment contract hands out, and its
+                        // slack holds whoever held the words before - stale index values that decode
+                        // as somebody else's `(slot, vertex)`. Drawing one section on its own never
+                        // completes a triangle out of them, but the compacted draw packs sections
+                        // back to back, where two slack words between sections put every later triple
+                        // of the run on the wrong vertices - android.40's shredded world. Every
+                        // consumer downstream of this gather measures draws by the exact count; see
+                        // `SectionRanges::index_len` and `plan_mega_copies`.
                         ranges[layer_index] = Some((
                             layer.buffer,
-                            layer.index_range.clone(),
+                            layer.index_range.start..layer.index_range.start + layer.index_len,
                             layer.vertex_range.start..layer.vertex_range.start + 1,
                         ));
                         any = true;
@@ -6654,17 +6683,18 @@ mod mega_draw_tests {
     #[test]
     fn a_run_reads_back_its_own_indices_from_the_span_the_planner_gave_it() {
         // Two arena gaps, one arena-internal gap, and one merge: every shape the walk has, in one
-        // list.
+        // list. The lengths are whole quads (six indices), which is what every baked section is and
+        // what the plan's triple-alignment assert asks for.
         let mut calls = vec![
-            call(0, 10, 14),
-            call(0, 14, 20), // contiguous with the one before: one copy, two calls
-            call(1, 100, 104),
-            call(0, 40, 44), // arena 0 again, but a gap in it: a fresh copy
+            call(0, 10, 16),
+            call(0, 16, 22), // contiguous with the one before: one copy, two calls
+            call(1, 100, 106),
+            call(0, 40, 46), // arena 0 again, but a gap in it: a fresh copy
         ];
 
         let plan = plan_mega_copies(&mut calls);
 
-        assert_eq!(plan.total_indices, 18);
+        assert_eq!(plan.total_indices, 24);
         assert_eq!(
             plan.copies.len(),
             3,
@@ -6728,16 +6758,16 @@ mod mega_draw_tests {
     /// arena does not own.
     #[test]
     fn contiguous_means_the_same_arena_and_touching_ranges() {
-        let mut merged = vec![call(0, 10, 14), call(0, 14, 20)];
+        let mut merged = vec![call(0, 10, 16), call(0, 16, 22)];
         let plan = plan_mega_copies(&mut merged);
         assert_eq!(plan.copies.len(), 1);
-        assert_eq!(plan.copies[0].size, 40, "both calls' bytes, one blit");
+        assert_eq!(plan.copies[0].size, 48, "both calls' bytes, one blit");
 
-        let mut gapped = vec![call(0, 10, 14), call(0, 16, 20)];
+        let mut gapped = vec![call(0, 10, 16), call(0, 18, 24)];
         let plan = plan_mega_copies(&mut gapped);
         assert_eq!(plan.copies.len(), 2, "a gap in the arena is a second blit");
 
-        let mut crossed = vec![call(0, 10, 14), call(1, 14, 18)];
+        let mut crossed = vec![call(0, 10, 16), call(1, 16, 22)];
         let plan = plan_mega_copies(&mut crossed);
         assert_eq!(plan.copies.len(), 2, "a different arena is a second blit");
     }
@@ -6751,10 +6781,10 @@ mod mega_draw_tests {
         // Far to near, deliberately *not* arena order - the sort that arena order would want is the
         // caller's to make, and only where the order is free.
         let mut calls = vec![
-            call(1, 300, 304),
-            call(0, 10, 14),
-            call(1, 200, 204),
-            call(0, 20, 24),
+            call(1, 300, 306),
+            call(0, 10, 16),
+            call(1, 200, 206),
+            call(0, 20, 26),
         ];
 
         let plan = plan_mega_copies(&mut calls);
@@ -6784,6 +6814,50 @@ mod mega_draw_tests {
         assert_eq!(
             buffer, wanted,
             "the buffer does not hold the calls in the order they were listed"
+        );
+    }
+
+    /// **The compacted buffer's triples are the bakes' quads.** Six indices a quad end a section's
+    /// indices where they began - on a triangle - and the compacted draw leans on that: it packs
+    /// sections back to back, and the draw reads the run as one list of triangles. A run that
+    /// measured its sections by their *allocation* would copy two words of vec4-rounding slack in
+    /// between two sections' real indices (six a quad lands on a four-word boundary only every
+    /// second section), and every triple after the first slack word would name the wrong vertices -
+    /// the shredded world android.40 shipped. The gather hands this walk exact counts (see
+    /// `SectionRanges::index_len`), so each destination lands back on a triple boundary.
+    #[test]
+    fn the_compacted_buffer_keeps_every_section_on_a_triple_boundary() {
+        // One-quad and three-quad sections - the odd-quad ones are exactly the sections whose
+        // allocation is two words longer than their indices. Gapped ranges, so no merges: five
+        // copies, five destinations.
+        let lens = [6u32, 6, 18, 6, 6];
+        let mut cursor = 100u32;
+        let mut calls: Vec<DrawCall> = Vec::new();
+
+        for (step, len) in lens.iter().enumerate() {
+            calls.push(call((step % 2) as u32, cursor, cursor + *len));
+            cursor += *len * 7;
+        }
+
+        let plan = plan_mega_copies(&mut calls);
+
+        assert_eq!(
+            plan.total_indices, 42,
+            "the plan moves the baked indices and nothing else"
+        );
+
+        for call in &calls {
+            assert_eq!(
+                call.mega_dst % 3,
+                0,
+                "a section's indices start on a triangle boundary in the compacted buffer"
+            );
+        }
+
+        assert_eq!(
+            plan.total_indices % 3,
+            0,
+            "the run ends on a triangle boundary, wherever it stops"
         );
     }
 

@@ -262,12 +262,36 @@ pub type ReleasedRange = (u32, Range<u32>);
 /// Named rather than written out because it is built in the gather and consumed in the draw loop, and
 /// three positional fields of which two are `Range<u32>` is exactly the shape that gets passed in the
 /// wrong order - a mistake that draws a section out of another section's bytes rather than failing.
+///
+/// **The index range here is the exact baked count, not the allocation** - see
+/// [`SectionRanges::index_len`] for why the two have to be told apart: the compacted draw packs
+/// sections back to back, and a section's allocation slack read there shreds every triangle after it.
 pub type DrawnLayer = (u32, Range<u32>, Range<u32>);
 
 #[derive(Clone)]
 pub struct SectionRanges {
     pub vertex_range: Range<u32>,
     pub index_range: Range<u32>,
+    /// **How many indices the bake actually wrote — the count every draw names, and the one thing
+    /// `index_range` must not be read for.**
+    ///
+    /// `index_range` is the *allocation*: since the vec4 alignment contract every arena range is a
+    /// multiple of four words, and six indices a quad lands on one only for every second section —
+    /// the odd ones carry a slack of two words at the end. A draw that read the allocation would
+    /// read that slack, and the slack holds whoever held the words before: stale index values that
+    /// decode as somebody else's `(slot, vertex)`. A section drawing on its own draws nothing with
+    /// them — two trailing indices are an incomplete triangle — which is how the slack stayed
+    /// invisible for a generation. **The compacted draw is what made it loud**: it packs sections
+    /// back to back into one index buffer, where a section's two slack words sit between its own
+    /// last real triangle and the next section's first — and since six indices a quad is a whole
+    /// number of triangles, those two words put every later triple of the run on the wrong vertices.
+    /// A world drawn as shredded triangles is what that looks like, which is android.40's corruption.
+    ///
+    /// So the drawn length travels separately, exactly as baked. The allocation stays rounded — it
+    /// is the allocator's unit, and freeing it short would leak the slack — but nothing downstream
+    /// of `allocate_ranges` may measure a draw by it. See the gather in `RenderGraph`, which turns
+    /// this into the draw calls, and `plan_mega_copies`, whose whole arithmetic is in exact indices.
+    pub index_len: u32,
     /// **Which slot of the section-record table this layer's draw reads.**
     ///
     /// The record is the section's world position and the arena slot its vertices start at, written
@@ -1372,6 +1396,14 @@ impl SectionStorage {
             // packed quads (four words a vertex) plus the AO tail (one word a quad) plus the indices
             // (six words a quad) are each rounded up to the next four words, and the rounding's
             // slack - under three words a range - is allocated and never read.
+            //
+            // **"Never read" is a contract the drawn length keeps, not one the bytes keep.** The
+            // slack after the indices holds whoever held those words before, and a draw that measured
+            // its indices by the allocation would read them - harmless on its own (two trailing
+            // indices are an incomplete triangle) and world-shredding through the compacted draw,
+            // which packs sections back to back. So the exact count travels beside the allocation as
+            // `SectionRanges::index_len`, and every consumer downstream of this function measures
+            // draws with it.
             let vertex_words = (layer.vertices.len() + layer.ao.len()) as u32 / 4;
             let index_words = layer.indices.len() as u32 / 4;
 
@@ -1429,9 +1461,16 @@ impl SectionStorage {
                 indices.start
             );
 
+            debug_assert!(
+                index_words.is_multiple_of(3),
+                "a bake wrote {} indices - not a whole number of quads",
+                index_words
+            );
+
             layers.push(Some(SectionRanges {
                 vertex_range: vertices,
                 index_range: indices,
+                index_len: index_words,
                 record_slot,
                 buffer,
             }));
@@ -6742,6 +6781,51 @@ mod arena_tests {
             storage.largest_free_run(),
             layer_slots(1),
             "and the longest run is one section - nothing larger fits"
+        );
+    }
+
+    /// **The drawn index count is the baked one; the allocation is the allocator's business.** Six
+    /// indices a quad and a vec4-rounded allocation disagree on every odd-quad section: the range
+    /// the arena hands out carries two words of slack at its end, and the slack holds whoever held
+    /// those words before - stale index values that decode as somebody else's `(slot, vertex)`. A
+    /// section drawn on its own never completes a triangle out of them; the compacted draw packs
+    /// sections back to back, where two slack words between them put every later triple of the run
+    /// on the wrong vertices - the shredded world android.40 shipped. `index_len` is the count every
+    /// draw names, and this pins it against the allocation beside it.
+    #[test]
+    fn the_drawn_index_count_is_the_baked_one_not_the_rounded_allocation() {
+        let mut storage = SectionStorage::with_arenas(vec![pool_for(8)]);
+
+        // Three quads: eighteen real index words, allocated at twenty - and the vertices plus the
+        // AO tail at fifty-one words, allocated at fifty-two. The slack is the difference.
+        let mut layers = [layer(3)];
+
+        let (section, _) = storage
+            .allocate(IVec3::ZERO, &mut layers)
+            .expect("the pool was sized for it");
+
+        let ranges = section.layers[0]
+            .as_ref()
+            .expect("a layer with geometry was placed");
+
+        assert_eq!(ranges.index_len, 18, "the baked count, exactly");
+
+        assert_eq!(
+            ranges.index_range.len(),
+            20,
+            "the allocation stays on the vec4 contract"
+        );
+
+        assert_eq!(
+            ranges.index_range.start + ranges.index_len + 2,
+            ranges.index_range.end,
+            "the two words the draw must never read sit at the allocation's end"
+        );
+
+        assert_eq!(
+            ranges.vertex_range.len() % 4,
+            0,
+            "and the vertex side keeps its own alignment - the shaders read it as vec4s"
         );
     }
 
