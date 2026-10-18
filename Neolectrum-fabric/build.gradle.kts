@@ -4,7 +4,9 @@ import java.util.Properties
 plugins {
         id("java-library")
         kotlin("jvm") version "2.3.20"
-        id("fabric-loom") version "1.19.1"
+        // **The plugin's own id, as the Fabric example mod spells it** - the bare `fabric-loom`
+        // spelling is the old marker.
+        id("net.fabricmc.fabric-loom") version "1.19.1"
 }
 
 // **One version for both loaders.** `Neolectrum/gradle.properties` is the version of record for
@@ -33,12 +35,6 @@ kotlin {
         compilerOptions {
                 jvmTarget.set(JvmTarget.JVM_25)
         }
-}
-
-loom {
-        // See the mappings note in `dependencies`: 26.1 ships no intermediary, and this is the
-        // switch that stops loom from looking for one.
-        noIntermediateMappings()
 }
 
 // NOTE: the toolchain above is the whole Java story - 26.1 needs Java 25 and the toolchain pins
@@ -127,20 +123,16 @@ if (packagedNatives.isDirectory) {
 
 dependencies {
         minecraft("com.mojang:minecraft:26.1.2")
-        // **26.1 is unobfuscated, so there are no mappings to name at all** - Mojang stopped
+        // **26.1 is unobfuscated, so there is no mappings line here at all** - Mojang stopped
         // shipping them, which is exactly what the NeoForge build's gradle.properties has said
-        // since 26.1 ("no mappings/parchment entries are needed anymore"). The evidence chain on
-        // the loom side: `officialMojangMappings()` hard-fails looking for a download the version
-        // manifest no longer carries; the intermediary the layered path used to fall back on is
-        // gone from the maven (it resolves a `0.0.0` placeholder it then rejects); an *empty*
-        // layered spec hands loom's own setup a mapping set whose source namespace is null and it
-        // answers with a NullPointerException; and the extension's own javadoc for the mappings
-        // file says "the mappings file, **or null if in a non-obfuscated environment**" - which is
-        // what `loom { noIntermediateMappings() }` below declares. So there is no `mappings(...)`
-        // line here, deliberately: the game's own names are the compile-time names, on both
-        // loaders.
-        modImplementation("net.fabricmc:fabric-loader:0.17.3")
-        modImplementation("net.fabricmc.fabric-api:fabric-api:0.155.3+26.1.2")
+        // since 26.1 ("no mappings/parchment entries are needed anymore"). The same is true of
+        // the intermediary the old layered path used to fall back on: gone from the maven, a
+        // `0.0.0` placeholder where a build used to read one. This is also the recipe the Fabric
+        // example mod itself carries for these versions: no `mappings(...)`, and the loader and
+        // API arrive as plain `implementation`, because there is nothing left to remap - the
+        // game's own names are the compile-time names, on both loaders.
+        implementation("net.fabricmc:fabric-loader:0.19.5")
+        implementation("net.fabricmc.fabric-api:fabric-api:0.155.3+26.1.2")
 
         // The mod is written in Kotlin and nothing on a player's Fabric classpath brings the
         // runtime: fabric-language-kotlin is the language adapter for Kotlin *entrypoints*, which
@@ -148,5 +140,5 @@ dependencies {
         // Kotlin *classes* - every mixin and every call they make - need the stdlib on the
         // classpath before the first one loads. `include` is Fabric's jar-in-jar, the same shape
         // the NeoForge build's jarJar embeds.
-        include(implementation("org.jetbrains.kotlin:kotlin-stdlib:2.3.20")!!)
+        include("org.jetbrains.kotlin:kotlin-stdlib:2.3.20")
 }
