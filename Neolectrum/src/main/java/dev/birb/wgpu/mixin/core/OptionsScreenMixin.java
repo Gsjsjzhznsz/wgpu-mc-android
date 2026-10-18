@@ -24,7 +24,10 @@ public abstract class OptionsScreenMixin {
     private void wgpuMc$replaceVideoOptionsScreen(Component title, Supplier<Screen> supplier, CallbackInfoReturnable<Button> cir) {
         if (VIDEO.equals(title)) {
             Screen parent = (Screen) (Object) this;
-            cir.setReturnValue(Button.builder(VIDEO, btn -> parent.getMinecraft().setScreen(new OptionPageScreen(parent))).build());
+            // `Minecraft.getInstance()` and not `parent.getMinecraft()`: the accessor is a
+                        // NeoForge-added member of Screen, and the vanilla jar answers the same
+                        // question through the static.
+                        cir.setReturnValue(Button.builder(VIDEO, btn -> net.minecraft.client.Minecraft.getInstance().setScreen(new OptionPageScreen(parent))).build());
         }
     }
 }

@@ -1214,7 +1214,11 @@ public class WgpuRenderPass implements RenderPassBackend {
     private static final java.util.Set<String> UNIFORM_READBACK_FAILED =
             java.util.concurrent.ConcurrentHashMap.newKeySet();
 
-    @Override
+    // No @Override, deliberately: the method only exists on the RenderPassBackend the NeoForge
+    // jar carries - the vanilla jar this build's Fabric half compiles against has no such member,
+    // and an @Override that names no supertype method is a compile error there. Overriding is
+    // Java's business, not the annotation's: on NeoForge this still implements the interface
+    // method, and on vanilla it is an extra method nobody calls.
     public void setViewport(int x, int y, int width, int height) {
         if (Diagnostics.loggingEnabled() && VIEWPORTS.add(x + "," + y + "," + width + "," + height)) {
             dev.birb.wgpu.WgpuMcMod.LOGGER.info("wgpu: viewport {} {} {} {}", x, y, width, height);
