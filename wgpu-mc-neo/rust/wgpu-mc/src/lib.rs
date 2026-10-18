@@ -421,6 +421,54 @@ impl WmRenderer {
         }
     }
 
+    /// The section-record table's uploads, gathered into runs of **adjacent slots**.
+    ///
+    /// Returns `(runs, bytes)`: a run is `(table offset in bytes, length in bytes, position of this
+    /// run's payload inside `bytes`)`, and `bytes` is every run's payload concatenated in run order.
+    /// Adjacent slots are one `write_buffer` - the same batching the arena's own uploads got, applied
+    /// to a table a loading burst fills by thousands of sixteen-byte entries.
+    ///
+    /// **A run's position is recorded when the run opens, never assumed.** The first version of this
+    /// gathering pushed every run with a hardcoded `0` in the position field and read
+    /// `bytes[0..len]` back at write time - so the second and every later run wrote the *first*
+    /// run's records at its own slots. A world whose bakes land in scattered slots (which is every
+    /// world in motion: the free list hands slots back out of order the moment sections churn) then
+    /// drew whole runs of sections with **other sections' records** - a foreign `word_base` to fetch
+    /// vertices from and a foreign origin to place them at, which is geometry nobody baked: the
+    /// stretched shards and misplaced slabs the 32-chunk screenshots are full of. The arena's runs
+    /// carry their position the same way and always have (`PendingUpload::at` is
+    /// `scratch.len()` at push), which is what makes this divergence the bug it is rather than a
+    /// convention. `the_record_uploads_carry_each_runs_own_bytes` pins it.
+    fn record_upload_runs(
+        record_writes: &std::collections::BTreeMap<u32, crate::mc::SectionRecord>,
+    ) -> (Vec<(u64, usize, usize)>, Vec<u8>) {
+        let entry_size = std::mem::size_of::<crate::mc::SectionRecord>() as u64;
+        let mut runs: Vec<(u64, usize, usize)> = Vec::new();
+        let mut bytes: Vec<u8> = Vec::new();
+
+        for (slot, record) in record_writes {
+            let entry = bytemuck::bytes_of(record);
+            let offset = *slot as u64 * entry_size;
+            let joins = runs
+                .last()
+                .is_some_and(|(run_offset, run_len, _)| run_offset + *run_len as u64 == offset);
+
+            if !joins {
+                // **Where this run's bytes start**: wherever the previous runs' payload ends, which
+                // is exactly where the `extend` below is about to land.
+                runs.push((offset, 0, bytes.len()));
+            }
+
+            let run = runs
+                .last_mut()
+                .expect("a run is open whenever a record is added");
+            run.1 += entry.len();
+            bytes.extend_from_slice(entry);
+        }
+
+        (runs, bytes)
+    }
+
     pub fn submit_chunk_updates(&self, scene: &Scene) {
         // Growing the arena, if a section did not fit in it last frame, happens *here* - before the
         // buffer this drain writes into is loaded. The two cannot overlap: the ranges being written
@@ -666,28 +714,7 @@ impl WmRenderer {
             storage.drain_record_writes()
         };
 
-        let mut record_runs: Vec<(u64, usize, usize)> = Vec::new();
-        let mut record_bytes: Vec<u8> = Vec::new();
-
-        {
-            let entry_size = std::mem::size_of::<crate::mc::SectionRecord>() as u64;
-
-            for (slot, record) in &record_writes {
-                let bytes = bytemuck::bytes_of(record);
-                let offset = *slot as u64 * entry_size;
-                let joins = record_runs
-                    .last()
-                    .is_some_and(|(run_offset, run_len, _)| run_offset + *run_len as u64 == offset);
-
-                if !joins {
-                    record_runs.push((offset, 0, 0));
-                }
-
-                let run = record_runs.last_mut().expect("just pushed");
-                run.1 += bytes.len();
-                record_bytes.extend_from_slice(bytes);
-            }
-        }
+        let (record_runs, record_bytes) = Self::record_upload_runs(&record_writes);
 
         let mut record_written = 0usize;
 
@@ -1386,5 +1413,103 @@ mod arena_growth_tests {
             slots >= 77_132,
             "the request fell below one section: {slots}"
         );
+    }
+}
+
+/// The record table's upload runs, and the one way this gathering can go wrong.
+///
+/// A run's third field is **where its own payload starts in the concatenated bytes**, and the defect
+/// this pins is the version that pushed a hardcoded `0` there: every run after the first then wrote
+/// the first run's records at its own slots, and every section in those runs drew with another
+/// section's `word_base` and origin - the shards the 32-chunk screenshots are full of. See
+/// [`WmRenderer::record_upload_runs`] for the full story.
+#[cfg(test)]
+mod record_upload_tests {
+    use crate::WmRenderer;
+    use crate::mc::SectionRecord;
+    use std::collections::BTreeMap;
+
+    fn record(x: i32, word_base: u32) -> SectionRecord {
+        SectionRecord {
+            x,
+            y: x * 2,
+            z: x * 3,
+            word_base,
+        }
+    }
+
+    #[test]
+    fn the_runs_own_bytes_are_their_own_records() {
+        let mut writes = BTreeMap::new();
+
+        // Run 0: two adjacent slots. Run 1: a gap, so a new run. Run 2: another gap. A drain in a
+        // world in motion is exactly this shape - the free list hands slots back out of order, so
+        // the writes never stay one contiguous run for long.
+        writes.insert(3, record(1, 30));
+        writes.insert(4, record(2, 40));
+        writes.insert(7, record(3, 70));
+        writes.insert(11, record(4, 110));
+
+        let (runs, bytes) = WmRenderer::record_upload_runs(&writes);
+        let entry = std::mem::size_of::<SectionRecord>();
+
+        assert_eq!(runs.len(), 3, "three scattered runs, not one: {runs:?}");
+        assert_eq!(runs[0], (3 * entry as u64, 2 * entry, 0));
+        // **The positions are the runs' own**, not a zero every run shares: run 1's bytes start
+        // after run 0's two entries, run 2's after run 1's one.
+        assert_eq!(runs[1], (7 * entry as u64, entry, 2 * entry));
+        assert_eq!(runs[2], (11 * entry as u64, entry, 3 * entry));
+
+        // Every run's window is **its own records**, in slot order - the pre-fix code handed every
+        // run the first run's bytes, which is what wrote foreign records into the table.
+        let window = |run: usize| -> Vec<u8> {
+            let (_, len, at) = runs[run];
+
+            bytes[at..at + len].to_vec()
+        };
+
+        let joined = |records: &[SectionRecord]| -> Vec<u8> {
+            records
+                .iter()
+                .flat_map(|r| bytemuck::bytes_of(r).to_vec())
+                .collect()
+        };
+
+        assert_eq!(
+            window(0),
+            joined(&[record(1, 30), record(2, 40)]),
+            "run 0 carries its own two records"
+        );
+        assert_eq!(window(1), joined(&[record(3, 70)]));
+        assert_eq!(window(2), joined(&[record(4, 110)]));
+        assert_eq!(
+            bytes,
+            joined(&[record(1, 30), record(2, 40), record(3, 70), record(4, 110)])
+        );
+    }
+
+    /// A single run - the only shape the old code got right - stays a single run.
+    #[test]
+    fn adjacent_slots_are_one_write() {
+        let mut writes = BTreeMap::new();
+
+        for slot in 0..4u32 {
+            writes.insert(slot, record(slot as i32, slot * 10));
+        }
+
+        let (runs, bytes) = WmRenderer::record_upload_runs(&writes);
+        let entry = std::mem::size_of::<SectionRecord>();
+
+        assert_eq!(runs, vec![(0, 4 * entry, 0)]);
+        assert_eq!(bytes.len(), 4 * entry);
+    }
+
+    /// An empty drain makes no runs and no bytes, which is what a settled world drains.
+    #[test]
+    fn an_empty_drain_makes_nothing() {
+        let (runs, bytes) = WmRenderer::record_upload_runs(&BTreeMap::new());
+
+        assert!(runs.is_empty());
+        assert!(bytes.is_empty());
     }
 }

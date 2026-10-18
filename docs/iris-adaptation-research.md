@@ -1,10 +1,11 @@
 # wgpu-mc 适配 Iris 着色器包：可行性研究与路线图
 
-> 状态：研究文档（2026-10-18，android.32 会话产出；同日补充 Beryl 市场实证）。
-> 结论先行：**直接安装 Iris 不可行**；**复用 Iris 的 Java 前端 + wgpu 后端**是长期可行路线；
+> 状态：研究文档（2026-10-18，android.32 会话产出；同日补充 Beryl 市场实证；深夜补 §4.6
+> —— 用户提供 Iris 1.12.0-snapshot jar，实锤官方 Vulkan rewrite 存在，架构与路线判断据此修订）。
+> 结论先行：**直接安装已发布的 Iris 不可行**（发布版尚无 Vulkan）；**Iris 1.12 的
+> backend 抽象 + shaderc→SPIR-V 编译链是路线 B 的现成蓝本**；
+> **Vitrail 已证明"Vulkan 渲染器装 OptiFine 包"可交付**（见 §4.5/§4.6）；
 > 短期建议做 P0+P1 原型验证三件硬风险（GLSL 变换层、内存预算、Adreno 性能）后再决定投入。
-> **2026-10-18 市场实证**：VulkanMod 官方指路的光影方案 Beryl 也不加载 Iris 包，而是
-> 自带内置光影——"Vulkan 上能装 Iris 包"的成品至今不存在，见 §4.5。
 
 ## 1. 背景与用户诉求
 
@@ -116,6 +117,54 @@ Iris 的代码是分层的，其中**不碰 GL 的部分可以复用**（LGPL）
 
 行动调整：路线图不变，P0 之后**插入 P0.5：内置光影最小可见集**（复用 P0 的
 composite 框架，不走 pack 解析），作为路线 C 的第一块交付物。
+
+### §4.6 实锤：Iris 1.12.0-snapshot 的 Vulkan rewrite（2026-10-18 深夜补充，回应"Iris 是支持 Vulkan 的"）
+
+用户提供了一个 jar：`iris-fabric-1.12.0-snapshot+mc26.3-local (1).jar`，解包分析（对照
+官方发布版 1.11.7+26.3 逐项比对）确认：
+
+1. **这就是 Iris 官方 Vulkan rewrite 的未发布开发态**（`+mc26.3-local` 版本串、无 refmap、
+   BuildConfig 无版本常量 = 本地构建）。IMS 于 2026-01 前后启动 rewrite（@IrisShaders
+   2026-02-19 帖原话 "I just started on the Vulkan rewrite last month"）；截至 2026-09-30 的
+   最新发布版 1.11.7+26.3 **不含任何 Vulkan 代码**；issue #3357 证实发布版在 MC 的
+   `--graphicsBackend vulkan` 下崩溃。用户拿到的正是"支持 Vulkan 的 Iris"的实物。
+2. **架构 = backend 抽象 + 双实现**（验证了本档路线 B 的分层判断）：
+   - 新增 `backend` 包（RenderBackend/IrisRenderPass/GraphicsShader/ComputePipeline 等 18 类，
+     后端无关抽象）+ `opengl` 包（旧路径迁移成实现之一）+ **`vulkan` 包（67 类全新后端）**；
+   - **Iris 不自建 VkInstance**：骑在 MC 26.x 自带的 native Vulkan 渲染器
+     `com.mojang.renderpearl.*` 之上（mixin 扩其 FeatureSet、拿它的 VkDevice），在 open
+     render pass 期间拒绝录制（"Iris native work must be recorded outside a Minecraft render
+     pass"）——与 wgpu 的 pass 语义约束同形；
+   - **编译链**：pack GLSL → glsl-transformer AST patch（注入 `layout(set=,binding=)`、
+     sampler heap 降级为 `GL_EXT_nonuniform_qualifier` 非均匀数组）→ **shaderc 编成 SPIR-V**
+     （`shaderc_compile_into_spv`，target env 明确指定）→ SPIR-V 字节缓存 →
+     VK_EXT_graphics_pipeline_library 管线库。**即 Iris 选择的 GLSL→Vulkan 路是
+     "shaderc→SPIR-V"，不是逐条升格到 460 core 再翻译**——§5 风险 1 的"升格层"在官方实现里
+     被换成了"AST patch + shaderc"，难度判级应据此下修（patch 面仍大，但不再是语义级全量重写）。
+   - 资源侧：VulkanResourceSets（descriptor pool + 动态偏移）、VulkanSamplerHeap
+     （update-after-bind 采样器堆 + 分代快照）、VulkanSynchronization（barrier 规划器）、
+     帧级 VulkanFrameResources 回收。
+3. **第三方生态同步核实**（Vitrail/Sulkan 等，2026-04 起陆续出现）：**Vitrail**
+   （Modrinth `oSIKhgz3`，**Fabric+NeoForge 双支持**，59.4K 下载）在 MC 原生 Vulkan 渲染器上
+   加载 **OptiFine 格式包**（实测覆盖 Bliss/BSL/Complementary/Euphoria/Photon/Sildur/Solas），
+   架构 = "pack GLSL 只在加载时翻译一次 + 交给游戏内嵌编译器"，逐文件署名借用了 Iris 与
+   stareval 代码——**它证明"装 BSL 到 Vulkan 渲染器"已可交付**；Sulkan（Sodium 之上自有包
+   格式）、Vulkan PostFX/Vulcade/VulkanFlow 等小项目同在。§4.5 的"成品不存在"结论就此作废：
+   成品存在（Vitrail），且 Iris 官方 1.12 即将加入。
+4. **对本项目的修正**：
+   - 路线 B 的判断**被官方实现追认**（前后端分离、pack 语义层不碰 API）；借鉴来源从
+     "只能读 1.11.7 的 GL 路径"升级为"可对照 1.12 的 vulkan 包逐类抄结构"（jar 在手，
+     `net/irisshaders/iris/vulkan/` 67 类 + `backend/` 18 类是现成设计文档）；
+   - GLSL 路线新增**路线 B'**：shaderc→SPIR-V→naga spv-in→wgpu（Iris 同款；代价 = 引入
+     shaderc 原生依赖，NDK 可编译）。它与"naga glsl-in 直译"（路线 B 原案）二选一，建议
+     P1 用同一个目标包两条路各跑一次再裁决；
+   - **Vitrail 优先**：它支持 NeoForge、跑在 MC 26.x 原生 Vulkan 渲染器上——本 mod 的
+     MC 26.1.2 NeoForge 与其目标平台最接近，"装 Vitrail 能不能用"是一条**零开发成本的
+     实验线**（它假设原版渲染器接管地形，而本 mod 接管了地形——大概率不兼容，但值得
+     一测并把结论记档）；
+   - 版本错位仍在：Iris 1.12 目标 = MC 26.3 + Fabric + Sodium 0.9 + renderpearl；
+     本项目 = MC 26.1.2 + NeoForge + 自有渲染管线。pack 语义层可移植，mixin 挂点层不可。
+
 
 ## 5. 三大硬风险（决定要不要做）
 
