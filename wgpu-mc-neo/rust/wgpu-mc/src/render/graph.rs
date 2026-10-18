@@ -232,6 +232,112 @@ fn plan_mega_copies(calls: &mut [DrawCall]) -> MegaPlan {
 /// `DrawIndexedIndirectArgs` in bytes: what an indirect draw's offset into its buffer is measured in.
 const INDIRECT_RECORD_SIZE: u64 = std::mem::size_of::<wgpu::util::DrawIndexedIndirectArgs>() as u64;
 
+/// **One maximal stretch of calls whose indices are contiguous in their arena** - the shape that
+/// draws as one `draw_indexed` straight out of the arena, with no copy at all.
+///
+/// This is the compacted draw's own merge, minus the copy. The compacted draw gathers the frame's
+/// sections by *blitting* their index ranges into one buffer, because a single draw can only read one
+/// contiguous span - and then draws that buffer once per arena run. But the merge the planner applies
+/// has already found the stretches that *are* contiguous where they live: those need no blit at all,
+/// because each of them is a plain `draw_indexed` over its own slice of the arena's index buffer, the
+/// same call every other pipeline in this renderer makes. What the copy buys is only the folding of
+/// many such runs into one draw - worth something when the arena has fragmented into many runs, and
+/// pure overhead when it has not: the bytes move, the memory sits, and the picture is the same.
+///
+/// `first_index`/`count` are in indices from the arena index buffer's start - what `set_index_buffer`
+/// slices and `draw_indexed` draws. `sections` is how many calls merged into the run, which is what
+/// the per-second report counts (every path counts sections, so the shapes read against each other).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DrawRun {
+    arena: u32,
+    first_index: u32,
+    count: u32,
+    sections: u32,
+}
+
+/// Plans the **in-place runs** one span's calls draw as, **in the order they are given**.
+///
+/// The same walk [`plan_mega_copies`] applies, minus the destinations: a call extends the run before
+/// it when it lives in the same arena and starts exactly where that run ends - the merge condition the
+/// copies were built on - and otherwise opens a run of its own. A call the walk could not merge is a
+/// run the draw reads straight from where the bake wrote it, which is the picture either way: the runs
+/// cover exactly the calls' indices, in the order the calls listed them, so a blending layer's
+/// far-to-near order is the order the runs draw in.
+///
+/// Zero-length calls are skipped rather than run-shaped: a range of no indices draws nothing, and a
+/// run of no indices would be a `draw_indexed` that names no triangles - legal, and pure noise.
+fn plan_runs(calls: &[DrawCall]) -> Vec<DrawRun> {
+    let mut runs: Vec<DrawRun> = Vec::new();
+
+    for call in calls {
+        debug_assert!(
+            call.index_range.len() % 3 == 0,
+            "a draw call carries {} indices - not a whole number of triangles; the in-place runs \
+             would tear at its edges",
+            call.index_range.len()
+        );
+
+        if call.index_range.is_empty() {
+            continue;
+        }
+
+        match runs.last_mut() {
+            Some(run)
+                if run.arena == call.arena
+                    && run.first_index + run.count == call.index_range.start =>
+            {
+                run.count += call.index_range.len() as u32;
+                run.sections += 1;
+            }
+            _ => runs.push(DrawRun {
+                arena: call.arena,
+                first_index: call.index_range.start,
+                count: call.index_range.len() as u32,
+                sections: 1,
+            }),
+        }
+    }
+
+    runs
+}
+
+/// **How many in-place runs one pass may draw before the compacted draw takes over.**
+///
+/// Each run is a `set_index_buffer` and a `draw_indexed` - two commands and their driver cost - so a
+/// pass of many runs pays per run what the compacted draw pays once in blits. The line between them
+/// is a rail, not a tuning knob, in the same spirit as [`MEGA_INDEX_CEILING`]: a pass under it draws
+/// with no copy at all, and a pass over it gathers into the compacted buffer exactly as before. The
+/// once-a-second report names a pass that crossed it, so a world whose arenas fragment past the rail
+/// is visible in a log nobody is profiling.
+const IN_PLACE_RUN_LIMIT: u64 = 256;
+
+/// Says so, once a second, when a pass wanted more in-place runs than the limit holds.
+///
+/// The fallback here is the compacted draw, which is one draw per arena run at the cost of the
+/// frame's copies - the shape this limit exists to escape only when the runs would cost more than
+/// they save. Like [`report_the_mega_cap`], this is **not** gated on the diagnostics switch.
+fn report_the_run_limit(runs: u64) {
+    let total = TERRAIN_RUNS_OVER_LIMIT.fetch_add(1, Ordering::Relaxed) + 1;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+
+    if TERRAIN_RUNS_OVER_LIMIT_REPORTED.swap(now, Ordering::Relaxed) == now {
+        return;
+    }
+
+    log::warn!(
+        "wgpu-mc: a terrain pass would draw {runs} runs straight out of the arena, over the \
+         {IN_PLACE_RUN_LIMIT} that keep the per-run draw cost cheap, so this frame copies its \
+         indices into the compacted draw buffer instead; {total} pass(es) over it so far this session"
+    );
+}
+
+static TERRAIN_RUNS_OVER_LIMIT: AtomicU64 = AtomicU64::new(0);
+static TERRAIN_RUNS_OVER_LIMIT_REPORTED: AtomicU64 = AtomicU64::new(0);
+
 /// The terrain pass' immediate, **as a struct rather than as a run of byte offsets**.
 ///
 /// The same members in the same order as the shader's `SectionPosition`, which is the whole of the
@@ -376,6 +482,23 @@ struct PassDraws {
     /// [`RenderGraph::mega_slots`] - because "what this pass last put in the buffer" is a fact about
     /// the buffer, and it survives a frame rebuild that the plan does not.
     mega_copies: Vec<MegaCopy>,
+    /// **Whether this pass draws straight out of the arena instead of over the compacted buffer** -
+    /// the compacted draw's own merge with none of its copies, taken whenever the frame's runs are
+    /// few enough that folding them into one draw would cost more in blits than the extra draws cost.
+    /// Set when the build found the runs under [`IN_PLACE_RUN_LIMIT`]; the runs themselves and the
+    /// span table below are the draw loop's whole instruction sheet, and neither is read by any other
+    /// arm. The three-way rule is one decision like [`PassDraws::batched`] is: a setting that moved
+    /// between the build and the draw would have the draw read runs the build never planned.
+    in_place: bool,
+    /// **The runs this pass draws straight out of the arena**, in call order, when
+    /// [`PassDraws::in_place`] went up - planned once per span in the same walk the compacted
+    /// planner applies, and consumed by nothing else.
+    runs: Vec<DrawRun>,
+    /// **Where each span's runs sit in [`PassDraws::runs`]**, parallel to [`PassDraws::spans`] as
+    /// `(first, one past the last)`. The draw loop walks spans against the layers, so the runs have
+    /// to be findable per span - and a run of one layer must never merge with a run of the next,
+    /// because a span boundary is an immediate change the draws between them have to see.
+    span_runs: Vec<(usize, usize)>,
     /// **Whether this pass has already drawn from these records.** It is what makes a rebuild in the
     /// middle of a frame safe rather than corrupting: a pass whose draws are recorded reads its records
     /// out of the buffer at submission time, so rewriting that buffer after the fact would leave the
@@ -3163,10 +3286,14 @@ impl RenderGraph {
             draws.calls.clear();
             draws.spans.clear();
             draws.empty = [0u64; 3];
-            // The compacted draw's decisions from the frame before: a pass that does not go mega this
-            // frame must not be found holding last frame's copy list, which the encode step would
+            // The gathering shapes' decisions from the frame before: a pass that draws neither in
+            // place nor over the compacted buffer this frame must not be found holding last frame's
+            // runs or copy list, which the draw loop would happily consume and the encode step would
             // happily replay into a buffer nobody draws from.
             draws.mega = false;
+            draws.in_place = false;
+            draws.runs.clear();
+            draws.span_runs.clear();
             draws.mega_copies.clear();
 
             // **Which order this pass draws in**, which is the one thing about the lists that is per pass:
@@ -3233,22 +3360,36 @@ impl RenderGraph {
                 }
             }
 
-            // **The compacted draw, when the batched call is closed and the setting asks for it.**
+            // **The two shapes that gather the frame's sections into few draws, when the batched call
+            // is closed and the setting asks for the family.**
             //
             // Everything that closes the batched path - the device's own probe failing it, the setting
             // being off, a pass over the indirect buffer's capacity - lands here, and this is the
-            // difference between the frame's thousands of per-section calls and a handful of draws over
-            // one buffer. The plan is built here, where the calls are, because the copies and the
-            // destinations are one walk over one list: a draw that read destinations from a different
-            // walk than the copies were encoded from would draw somebody else's indices.
+            // difference between the frame's thousands of per-section calls and a handful of draws.
             //
-            // The calls of a pass whose order is free are sorted into arena order first, which is what
-            // turns the planner's merge into most of the copies; a pass whose order is the picture
-            // (the translucent one, far to near) is left alone and merges only what is already
-            // adjacent. See [`plan_mega_copies`] for the walk and the invariant the draw leans on.
-            draws.mega = !draws.batched && terrain_mega_requested() && !draws.calls.is_empty();
-
-            if draws.mega {
+            // **First choice: straight out of the arena.** The same merge the compacted planner
+            // applies, applied where the indices already live: each run is one `draw_indexed` over its
+            // own slice of the arena's index buffer, with no copy, no compacted buffer and no copy
+            // cache - the bytes the compacted draw moves are bytes this shape never touches. What it
+            // costs is per run: a `set_index_buffer` and a draw each, so a frame whose arenas have
+            // fragmented into many runs pays per run what the compacted draw pays once. When the runs
+            // stay under [`IN_PLACE_RUN_LIMIT`] - which they do while the allocator's bake order and
+            // the frame's visible sections agree, most of the time - this is the cheaper shape by the
+            // whole of the copy traffic.
+            //
+            // **The fallback: the compacted draw.** Over the run limit, the runs are folded into one
+            // draw per arena run over a buffer the frame's copies fill - the plan, the blits and the
+            // copy cache exactly as they were before the in-place shape existed. And over
+            // [`MEGA_INDEX_CEILING`], honestly back to the per-section path: an empty copy list and an
+            // empty run list are what make the draw loop fall through to the fallback arm, and the
+            // arms must move together or a pass would draw from data the frame never wrote.
+            //
+            // Both shapes feed on the same sort: the calls of a pass whose order is free are sorted
+            // into arena order first, which is what turns the merge into most of the runs (and the
+            // planner's copies); a pass whose order is the picture (the translucent one, far to near)
+            // is left alone and merges only what is already adjacent. See [`plan_runs`] and
+            // [`plan_mega_copies`] for the walks.
+            if !draws.batched && terrain_mega_requested() && !draws.calls.is_empty() {
                 if !blending {
                     for (_, start, end) in &draws.spans {
                         draws.calls[*start..*end]
@@ -3256,20 +3397,39 @@ impl RenderGraph {
                     }
                 }
 
-                let plan = plan_mega_copies(&mut draws.calls);
+                // **The runs, planned once per span.** Planned before the choice, because the choice
+                // needs their count - and thrown away whole if the answer sends the pass to the
+                // compacted buffer, so the two shapes can never be found half-planned.
+                for (_, start, end) in &draws.spans {
+                    let first = draws.runs.len();
+                    draws
+                        .runs
+                        .extend_from_slice(&plan_runs(&draws.calls[*start..*end]));
+                    draws.span_runs.push((first, draws.runs.len()));
+                }
 
-                if the_mega_path_holds(plan.total_indices) {
-                    draws.mega_copies.extend_from_slice(&plan.copies);
-                    // The byte count moves at the encode, not here: a frame whose plan matches the
-                    // pass' copy cache is skipped without blitting, and the report says "moved".
+                if (draws.runs.len() as u64) <= IN_PLACE_RUN_LIMIT {
+                    draws.in_place = true;
                 } else {
-                    // Over the rail, and honestly back to the per-section path: an empty copy list is
-                    // what makes the encode step below a no-op and the draw loop fall through to the
-                    // fallback arm, and the two must move together or a pass would draw from a buffer
-                    // the frame never filled.
-                    report_the_mega_cap(plan.total_indices);
-                    draws.mega = false;
-                    draws.mega_copies.clear();
+                    report_the_run_limit(draws.runs.len() as u64);
+                    draws.runs.clear();
+                    draws.span_runs.clear();
+
+                    let plan = plan_mega_copies(&mut draws.calls);
+
+                    if the_mega_path_holds(plan.total_indices) {
+                        draws.mega_copies.extend_from_slice(&plan.copies);
+                        draws.mega = true;
+                        // The byte count moves at the encode, not here: a frame whose plan matches
+                        // the pass' copy cache is skipped without blitting, and the report says
+                        // "moved".
+                    } else {
+                        // Over the rail, and honestly back to the per-section path: an empty copy
+                        // list is what makes the encode step below a no-op and the draw loop fall
+                        // through to the fallback arm, and the two must move together or a pass
+                        // would draw from a buffer the frame never filled.
+                        report_the_mega_cap(plan.total_indices);
+                    }
                 }
             }
 
@@ -4037,8 +4197,11 @@ impl RenderGraph {
                     // [`RenderGraph::rebuild_terrain_frame`] and this pass only obeys. See
                     // [`PassDraws::batched`].
 
-                    for ((layer_index, start, end), (_, alpha_cutout)) in
-                        draws.spans.iter().zip(Self::terrain_layers(pipeline_name))
+                    for (span_index, ((layer_index, start, end), (_, alpha_cutout))) in draws
+                        .spans
+                        .iter()
+                        .zip(Self::terrain_layers(pipeline_name))
+                        .enumerate()
                     {
                         // The immediate, **once for the layer**: the alpha cutoff is the one field of it
                         // a layer changes, and the rest is what every draw of the pass shares. Set
@@ -4097,6 +4260,62 @@ impl RenderGraph {
                                 layer_drawn_total[*layer_index] += count;
 
                                 index = stop;
+                            }
+                        } else if draws.in_place && !draws.runs.is_empty() {
+                            // **The frame's sections drawn straight out of the arena** - the
+                            // compacted draw's own merge with none of its copies. The runs the build
+                            // planned are stretches of the arena's index buffer that are already
+                            // contiguous where they live, so each draws as one `draw_indexed` over
+                            // its own slice, the same plain call the fallback arm makes per section -
+                            // the batching arrives on the back of a call no probe was ever needed for,
+                            // and the bytes the compacted draw would move stay where the bake wrote
+                            // them.
+                            //
+                            // The order is the calls' order, so a blending layer's far-to-near order
+                            // survives exactly as it does through the compacted buffer: the runs are
+                            // consumed in the order the planner wrote them, per span, and a span
+                            // boundary is an immediate change the draws between the runs see.
+                            static IN_PLACE_ENGAGED: std::sync::atomic::AtomicBool =
+                                std::sync::atomic::AtomicBool::new(false);
+
+                            if !IN_PLACE_ENGAGED.swap(true, Ordering::Relaxed) {
+                                log::info!(
+                                    "wgpu-mc: the terrain pass draws its sections straight out of \
+                                     the arena, one draw per contiguous run - the compacted draw's \
+                                     merge with none of its copies"
+                                );
+                            }
+
+                            let (first_run, one_past) = draws.span_runs[span_index];
+
+                            for run in &draws.runs[first_run..one_past] {
+                                let buffer = &chunk_buffers[run.arena as usize];
+
+                                // The bind group is the arena's storage, shared by every run of the
+                                // arena - rebound when the run names a different arena, exactly as the
+                                // per-section arm rebinds. The index buffer is the run's own slice,
+                                // set per run: a run is a stretch of the arena, not the whole of it.
+                                if bound_arena != Some(run.arena) {
+                                    render_pass.set_bind_group(1, &buffer.bind_group, &[]);
+                                    bound_arena = Some(run.arena);
+                                }
+
+                                let from = run.first_index as u64 * 4;
+                                let to = from + run.count as u64 * 4;
+                                render_pass.set_index_buffer(
+                                    buffer.buffer.slice(from..to),
+                                    wgpu::IndexFormat::Uint32,
+                                );
+                                render_pass.draw_indexed(0..run.count, 0, 0..1);
+
+                                // The counters count **sections**, as they do on every other path -
+                                // a run of thirty is thirty sections drawn, not one draw - so the
+                                // one-second report reads the same against all four shapes.
+                                let count = run.sections as u64;
+                                drawn += count;
+                                drawn_total += count;
+                                layer_drawn[*layer_index] += count;
+                                layer_drawn_total[*layer_index] += count;
                             }
                         } else if let Some(mega) = mega_for_this_pass
                             .as_ref()
@@ -6869,5 +7088,133 @@ mod mega_draw_tests {
     fn the_mega_ceiling_is_inclusive_and_the_next_index_is_the_cliff() {
         assert!(the_mega_path_holds(MEGA_INDEX_CEILING));
         assert!(!the_mega_path_holds(MEGA_INDEX_CEILING + 1));
+    }
+
+    /// **The in-place runs draw the same picture the compacted draw does**, on the same calls, with
+    /// no buffer in between: the runs' own slices of the arena read back exactly the indices the
+    /// compacted buffer would have been blitted into holding. This is the contract that lets the two
+    /// shapes swap behind the draw loop's back - a pass that crosses the run limit must not draw a
+    /// different world than the one it drew under the limit.
+    #[test]
+    fn the_in_place_runs_draw_the_picture_the_compacted_draw_would() {
+        // Every merge shape in one list: a contiguous pair, an arena-internal gap, an arena change,
+        // and a second contiguous pair the sort would have made neighbours.
+        let mut calls = vec![
+            call(0, 10, 16),
+            call(0, 16, 22),
+            call(0, 40, 46),
+            call(1, 100, 106),
+            call(1, 106, 112),
+        ];
+
+        let runs = plan_runs(&calls);
+
+        assert_eq!(
+            runs.len(),
+            3,
+            "two merges: the pair in arena 0 and the pair in arena 1"
+        );
+
+        // **What the draws would read**: each run's slice of its arena, simulated the way the
+        // compacted test simulates its copies.
+        for run in &runs {
+            let drawn: Vec<u32> = (run.first_index..run.first_index + run.count)
+                .map(|index| arena_index(run.arena, index))
+                .collect();
+            let wanted: Vec<u32> = calls
+                .iter()
+                .filter(|c| c.arena == run.arena)
+                .flat_map(|c| c.index_range.clone().map(|i| arena_index(c.arena, i)))
+                .filter(|index| {
+                    (*index / 100_000) == run.arena
+                        && (index % 100_000) >= run.first_index
+                        && (index % 100_000) < run.first_index + run.count
+                })
+                .collect();
+
+            assert_eq!(
+                drawn, wanted,
+                "run of arena {} drew somebody else's indices",
+                run.arena
+            );
+        }
+
+        // **The section counts read against the other shapes**: the runs cover every call, so the
+        // per-second report's section number is the same on both sides of the limit.
+        let sections: u32 = runs.iter().map(|run| run.sections).sum();
+        assert_eq!(sections, calls.len() as u32);
+
+        // **And the compacted plan moves the same indices** - the whole of both shapes is the calls'
+        // indices, whatever they are gathered into.
+        let plan = plan_mega_copies(&mut calls);
+        let moved: u64 = runs.iter().map(|run| run.count as u64).sum();
+        assert_eq!(plan.total_indices, moved);
+    }
+
+    /// **The merge is the same walk, and the spans are the caller's discipline**: a run stops where
+    /// the slice it was planned from stops, so two layers whose calls happen to touch in the arena
+    /// still draw as two runs - a span boundary is an immediate change the draws between them see.
+    #[test]
+    fn a_run_never_crosses_the_slice_it_was_planned_from() {
+        // Two spans whose calls are contiguous in the arena: planned together they would be one run,
+        // planned per span they are two.
+        let span_a = vec![call(0, 10, 16)];
+        let span_b = vec![call(0, 16, 22)];
+
+        let runs_a = plan_runs(&span_a);
+        let runs_b = plan_runs(&span_b);
+
+        assert_eq!(runs_a.len(), 1);
+        assert_eq!(runs_b.len(), 1);
+        assert_ne!(
+            runs_a, runs_b,
+            "two spans planned apart are two runs, whatever the arena says"
+        );
+
+        // Planned together - which the record step deliberately does not do - they would merge.
+        let mut together = span_a;
+        together.extend(span_b);
+        assert_eq!(plan_runs(&together).len(), 1);
+    }
+
+    /// **A call with no indices is skipped, not run-shaped**: a range of no indices draws nothing,
+    /// and a run of no indices would be a `draw_indexed` that names no triangles - legal, and pure
+    /// noise in the command stream. The sections it cannot draw are the gather's `empty` count's
+    /// business, not the runs'.
+    #[test]
+    fn a_call_with_no_indices_makes_no_run() {
+        let calls = vec![call(0, 10, 10), call(0, 10, 16), call(1, 100, 100)];
+
+        let runs = plan_runs(&calls);
+
+        assert_eq!(runs.len(), 1, "only the call with indices survives");
+        assert_eq!(runs[0].arena, 0);
+        assert_eq!(runs[0].count, 6);
+        assert_eq!(runs[0].sections, 1, "the empty call is not a section drawn");
+    }
+
+    /// **The in-place rail, written down** like the compacted one: the decision and the warning share
+    /// this predicate's neighbourhood, so a pass at the limit draws in place and one over it gathers
+    /// into the compacted buffer.
+    #[test]
+    fn the_run_limit_is_where_the_compacted_draw_takes_over() {
+        // A pass of `IN_PLACE_RUN_LIMIT` single-call runs draws in place; one more run is the
+        // compacted draw's. The count the record step compares is the runs' own, so the rail is
+        // exact - the same inclusive shape the mega ceiling test holds.
+        let one_per_run = |count: u32| -> Vec<DrawCall> {
+            (0..count)
+                .map(|step| call(step % 2, step * 100, step * 100 + 6))
+                .collect()
+        };
+
+        assert_eq!(
+            plan_runs(&one_per_run(IN_PLACE_RUN_LIMIT as u32)).len() as u64,
+            IN_PLACE_RUN_LIMIT
+        );
+        assert!(
+            plan_runs(&one_per_run(IN_PLACE_RUN_LIMIT as u32 + 1)).len() as u64
+                > IN_PLACE_RUN_LIMIT,
+            "a pass one run over the limit is the compacted draw's"
+        );
     }
 }

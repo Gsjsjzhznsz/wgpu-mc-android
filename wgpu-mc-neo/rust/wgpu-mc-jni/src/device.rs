@@ -1190,6 +1190,8 @@ pub fn probe_first_instance_fetch(device: &wgpu::Device, queue: &wgpu::Queue) ->
     let words: &[u32] = bytemuck::cast_slice(&data[..16]);
     let answer = the_probe_records_came_back(words);
 
+    record_probe_readback(&FIRST_INSTANCE_PROBE_READBACK, words);
+
     drop(data);
     readback.unmap();
 
@@ -1205,6 +1207,36 @@ pub fn probe_first_instance_fetch(device: &wgpu::Device, queue: &wgpu::Queue) ->
 ///
 /// The terrain's own answer, beside [`FIRST_INSTANCE_PROBE`], which is the game path's.
 static INDEX_RECORD_PROBE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The four words each probe read back from its target, whatever they were.
+///
+/// **Why they are kept**: "the probe did not read its sentinels back in order" is a verdict, and a
+/// verdict without its evidence names no fix. The three failure modes the probe's design separates -
+/// a collapsed call (every pixel carrying record 0's number), a dead fetch (every pixel zero) and an
+/// unrun one (the clear colour) - read differently in these four words, and so does a fourth thing
+/// nobody has a name for yet. A driver mystery that fails on two vendors at once is exactly the kind
+/// of question a next log should be able to answer, so the per-world report prints what the probe
+/// saw. Taken always, failure or not, because a passing probe's words are the shape a failing one is
+/// compared against.
+static FIRST_INSTANCE_PROBE_READBACK: std::sync::Mutex<[u32; 4]> = std::sync::Mutex::new([0; 4]);
+static INDEX_RECORD_PROBE_READBACK: std::sync::Mutex<[u32; 4]> = std::sync::Mutex::new([0; 4]);
+
+/// Copies a probe's four readback words into its slot for the per-world report to carry.
+fn record_probe_readback(slot: &std::sync::Mutex<[u32; 4]>, words: &[u32]) {
+    if let Ok(mut slot) = slot.lock() {
+        for (taken, read) in slot
+            .iter_mut()
+            .zip(words.iter().chain(std::iter::repeat(&0)))
+        {
+            *taken = *read;
+        }
+    }
+}
+
+/// The four words a probe read back, for the report line that names them.
+fn probe_readback(slot: &std::sync::Mutex<[u32; 4]>) -> [u32; 4] {
+    slot.lock().map(|words| *words).unwrap_or([0; 4])
+}
 
 /// One baked index of the probe's index buffer, spelled the way a bake spells every index it
 /// writes: the record slot above [`crate::mc::RECORD_ID_SHIFT`], the local vertex below it.
@@ -1499,6 +1531,8 @@ pub fn probe_index_record_batching(device: &wgpu::Device, queue: &wgpu::Queue) -
     let words: &[u32] = bytemuck::cast_slice(&data[..16]);
     let answer = the_probe_records_came_back(words);
 
+    record_probe_readback(&INDEX_RECORD_PROBE_READBACK, words);
+
     drop(data);
     readback.unmap();
 
@@ -1562,15 +1596,18 @@ fn report_device_capabilities() {
 
     // What the compacted draw does about that answer, which is the rest of the story the line above
     // leaves: the batched path closed is no longer the whole of the batching, because the frame's
-    // sections still gather into one draw per arena run over a per-frame index buffer - the shape
-    // that asks the driver for nothing the probe did not already prove. See `TERRAIN_MEGA` in the
-    // render graph, and the `terrain_mega` switch beside it.
+    // sections still gather into few draws - straight out of the arena where the runs allow, and over
+    // a per-frame index buffer where they do not - the shapes that ask the driver for nothing the
+    // probe did not already prove. See `TERRAIN_MEGA` in the render graph, and the `terrain_mega`
+    // switch beside it.
     if !wgpu_mc::render::graph::terrain_batches_draws() {
         if wgpu_mc::render::graph::terrain_mega_requested() {
             info!(
-                "wgpu-mc: the terrain pass also draws over the frame's compacted index buffer - one \
-                 draw per run of sections that share an arena, copies of just the frame's own index \
-                 ranges, drawn with a plain draw_indexed"
+                "wgpu-mc: the terrain pass also gathers its sections when it draws them - \
+                 straight out of the arena where the runs allow (one draw per contiguous run, no \
+                 copy at all), and over the frame's compacted index buffer where they do not (one \
+                 draw per arena run, over copies of just the frame's own index ranges) - both on a \
+                 plain draw_indexed"
             );
         } else {
             info!(
@@ -1592,9 +1629,11 @@ fn report_device_capabilities() {
              order: the game path's batched draws work on this driver"
         ),
         2 => info!(
-            "wgpu-mc: the first-instance probe did not read its sentinels back in order, so the \
-             game's own draws will not batch on this driver - the terrain pass has its own probe \
-             of its own record channel, reported below"
+            "wgpu-mc: the first-instance probe did not read its sentinels back in order (it read \
+             back {:?}, where order is 100, 101, 102, 103), so the game's own draws will not batch \
+             on this driver - the terrain pass has its own probe of its own record channel, \
+             reported below",
+            probe_readback(&FIRST_INSTANCE_PROBE_READBACK)
         ),
         _ => info!(
             "wgpu-mc: the first-instance probe did not run, because the game path's batching was \
@@ -1612,10 +1651,12 @@ fn report_device_capabilities() {
              four sentinels back in order: the batched terrain path works on this driver"
         ),
         2 => info!(
-            "wgpu-mc: the index-record probe did not read its sentinels back in order, so the batched \
-             terrain path does not draw one record per record on this driver - the terrain pass falls \
-             back, and the compacted draw (`terrain_mega`) covers the frame from here: one draw per \
-             arena run over a per-frame index buffer, on a plain draw_indexed"
+            "wgpu-mc: the index-record probe did not read its sentinels back in order (it read \
+             back {:?}, where order is 100, 101, 102, 103), so the batched terrain path does not \
+             draw one record per record on this driver - the terrain pass falls back to the \
+             gathering shapes, reported above: straight out of the arena where the runs allow, and \
+             over the compacted draw (`terrain_mega`) where they do not",
+            probe_readback(&INDEX_RECORD_PROBE_READBACK)
         ),
         _ => info!(
             "wgpu-mc: the index-record probe did not run, because the terrain's batching was already \

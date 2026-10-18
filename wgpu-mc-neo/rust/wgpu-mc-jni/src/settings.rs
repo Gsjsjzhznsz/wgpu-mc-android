@@ -369,11 +369,25 @@ fn no_adv_culling() -> IntSetting {
 /// folder gets the current defaults either way.
 ///
 /// **One revision, one migration.** Revision 1 moves a `terrain_indirect` that still answers the
-/// observation-era `false` to the default the renderer draws now. After it has run, a player who
-/// turns the batching off - the "did the batching break something" question the setting exists for
-/// - keeps that answer: the marker says the config is current, and a current config is read as it
-/// stands.
-const CURRENT_DEFAULTS_REVISION: u32 = 1;
+/// observation-era `false` to the default the renderer draws now. Revision 2 moves a `vsync` that
+/// still answers the desktop-era `true` to the default the phones this port runs on draw well: a
+/// fresh install's `true` was the config file's answer, not the player's, and on a phone whose GPU
+/// cannot hold the display's refresh it is the difference between half-rate stutter and the frames
+/// the GPU actually makes. After it has run, a player who turns vsync back on keeps that answer:
+/// the marker says the config is current, and a current config is read as it stands.
+const CURRENT_DEFAULTS_REVISION: u32 = 2;
+
+/// Whether a fresh install syncs its framerate to the display. **Off**, and for one reason: the
+/// `Fifo` present mode vsync asks for is a double-buffered queue, and a frame that misses the
+/// display's refresh falls all the way to the next - a GPU that renders at 45 fps presents at 30,
+/// and the player reads that as "half the framerate the hardware should manage". The modes vsync-off
+/// resolves to are ordered `Mailbox` first, which is tear-free wherever the driver offers it - so
+/// the tearing the setting's description warns about is not what a phone gains by turning it off;
+/// it gains the frames it was owed. The desktop keeps the same default for the same reason, with
+/// the compositor absorbing most of what `Fifo` used to smooth over.
+fn vsync_default() -> bool {
+    false
+}
 
 /// Where the defaults revision lives: beside the config, in its own file.
 fn defaults_revision_path(config_path: &Path) -> PathBuf {
@@ -542,8 +556,11 @@ lazy_static! {
             true,
         ),
         vsync: SettingInfo {
-            desc: "Sync the framerate to the display's refresh rate. Fewer torn frames, at the cost \
-            of input latency. Takes effect the moment it is applied.",
+            desc: "Sync the framerate to the display's refresh rate (Fifo). A frame that misses the \
+            refresh waits for the next one, so a GPU that cannot hold the refresh rate loses half its \
+            frames. Off presents every frame as it finishes (Mailbox), which is still tear-free \
+            wherever the driver offers it, at the cost of some input-latency smoothness. Takes effect \
+            the moment it is applied.",
             // Unlike `backend`, this is not a property of the wgpu instance: it only picks the
             // swapchain's present mode, and a surface can be reconfigured at any time. `sendSettings`
             // does exactly that, which is why this one is applied without a restart.
@@ -1024,6 +1041,14 @@ impl Settings {
     ///   config that *omits* the key already takes the new default through serde; only the carried
     ///   answer needs moving. Once the marker says revision 1, an explicit `false` - the switch
     ///   answering "did the batching break something" - is read as the player's answer and held.
+    ///
+    /// * `2` - `vsync`. The default was written as `true` by every build before this one, and a
+    ///   config that has never been touched carries it the same way revision 1's configs carried the
+    ///   batching's `false` - the file's answer, not the player's. On the phones this port runs on,
+    ///   `Fifo` collapses a GPU that cannot hold the display's refresh to half the framerate, which
+    ///   is exactly the "performance below what the hardware should manage" the port keeps hearing
+    ///   about; the default moves to off, and a player who turns it back on - it is a real preference
+    ///   on a desktop that tears - keeps that answer once the marker says revision 2.
     fn migrate_defaults(&mut self, config_revision: u32) -> bool {
         if config_revision >= CURRENT_DEFAULTS_REVISION {
             return false;
@@ -1036,6 +1061,16 @@ impl Settings {
                  switch moves with it - turning it off on the options screen holds from here"
             );
             self.terrain_indirect = terrain_indirect_default();
+        }
+
+        if config_revision < 2 && self.vsync.value {
+            log::info!(
+                "wgpu-mc: this config carries vsync on from the builds that defaulted it on; the \
+                 phones this port runs on lose half their frames to Fifo when the GPU cannot hold \
+                 the display's refresh, so the default is off now - turning it back on holds from \
+                 here"
+            );
+            self.vsync = BoolSetting::of(vsync_default());
         }
 
         true
@@ -1175,7 +1210,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             backend: EnumSetting::from_variant(GraphicsBackend::default()),
-            vsync: BoolSetting::default(),
+            vsync: BoolSetting::of(vsync_default()),
             fullscreen_mode: EnumSetting::from_variant(FullscreenMode::default()),
             // **Off, because the path is experimental.** It is what this renderer is being built towards, but
             // it is not yet the same picture as the game's own meshes, and the differences are measured rather
@@ -2896,7 +2931,7 @@ mod tests {
     #[test]
     fn the_defaults_migration_leaves_an_agreeing_config_alone() {
         let mut settings: Settings = serde_json::from_str(
-            r#"{ "vsync": { "type": "bool", "value": true },
+            r#"{ "vsync": { "type": "bool", "value": false },
                   "terrain_indirect": { "type": "bool", "value": true } }"#,
         )
         .expect("a config that already agrees with the current defaults");
@@ -2905,6 +2940,67 @@ mod tests {
         // every launch - and the values are what they were.
         assert!(settings.migrate_defaults(0));
         assert!(settings.terrain_indirect.value);
-        assert!(settings.vsync.value);
+        assert!(!settings.vsync.value);
+    }
+
+    /// The revision-2 migration, which is what carries vsync-off onto the installs whose config has
+    /// been answering the desktop-era `true` since the first build wrote it. The same shape as the
+    /// batching migration beside it, and the same hold afterwards: once the marker says the config
+    /// is current, a `true` is the player's own answer - on a desktop that tears, a real one - and
+    /// the migration leaves it standing.
+    #[test]
+    fn the_defaults_migration_moves_a_carried_vsync_switch() {
+        let mut carried: Settings =
+            serde_json::from_str(r#"{ "vsync": { "type": "bool", "value": true } }"#)
+                .expect("a config carrying the desktop-era answer");
+
+        assert!(
+            carried.migrate_defaults(0),
+            "a config without a revision marker is due the migration"
+        );
+        assert!(
+            !carried.vsync.value,
+            "the default the renderer presents with now is what the config asks for after the \
+             migration"
+        );
+
+        // A config already marked revision 1 is still due revision 2 - the revisions are a ladder,
+        // and a config written between the two migrations carries the batching answer but not this
+        // one.
+        let mut between: Settings =
+            serde_json::from_str(r#"{ "vsync": { "type": "bool", "value": true } }"#)
+                .expect("a config written under revision 1");
+
+        assert!(between.migrate_defaults(1), "revision 1 is due revision 2");
+        assert!(!between.vsync.value);
+
+        // The same wish once the marker says the config is current: that answer is the player's
+        // own, and the migration holds off - or the switch would be a constant.
+        let mut wanted: Settings =
+            serde_json::from_str(r#"{ "vsync": { "type": "bool", "value": true } }"#)
+                .expect("the same wish, under the current revision");
+
+        assert!(!wanted.migrate_defaults(CURRENT_DEFAULTS_REVISION));
+        assert!(
+            wanted.vsync.value,
+            "after the migration an explicit on is the player's answer"
+        );
+    }
+
+    /// The fresh-install defaults, named so a flip shows up here rather than on a phone: vsync is
+    /// **off** because Fifo halves a GPU that misses the refresh, and the batching is on because the
+    /// devices that proved it can run it outnumber the ones that cannot.
+    #[test]
+    fn the_fresh_install_defaults_are_the_ones_the_phones_draw_well() {
+        let settings = Settings::default();
+
+        assert!(
+            !settings.vsync.value,
+            "a fresh install presents with Mailbox, not Fifo"
+        );
+        assert!(
+            settings.terrain_indirect.value,
+            "a fresh install batches what its device can prove"
+        );
     }
 }
