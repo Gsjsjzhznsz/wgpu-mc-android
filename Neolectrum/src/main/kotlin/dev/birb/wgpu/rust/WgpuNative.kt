@@ -29,7 +29,7 @@ private val NATIVE_RESOURCE_ROOTS = listOf("META-INF/natives/", "assets/wgpu_mc/
  * nothing else still loads on a device whose ABI string this build does not name.
  *
  * The Apple platforms are the same story with different names: an `ios-arm64/` directory and the
- * two `macos-*/` ones under the same `natives/` root, each holding that build's
+ * two `macos-*` ones under the same `natives/` root, each holding that build's
  * `libwgpu_mc_jni.dylib`. A jar from the release pipeline carries all of them, and the probe order
  * puts the platform this process looks like first - an iPhone before a Mac, an arm64 Mac before an
  * Intel one - so a jar that carries every platform still loads the one that can actually run here.
