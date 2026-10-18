@@ -286,17 +286,21 @@ jobs:
         # compile break from holding the Android release hostage while it is being grown.
         continue-on-error: true
         # This module's own wrapper: loom 1.19 asks for Gradle 9.8, and the NeoForge build's
-        # wrapper pins 9.4.1 - two loaders, two builds, two Gradle floors.
-        run: ./gradlew build --no-daemon --stacktrace
+        # wrapper pins 9.4.1 - two loaders, two builds, two Gradle floors. `bash gradlew`, not
+        # `./gradlew`: the repo keeps core.fileMode off (the Windows half of it), so a checked-out
+        # gradlew carries no execute bit and the launcher is read as an argument instead.
+        run: bash gradlew build --no-daemon --stacktrace
 
       - name: Check what the Fabric jar carries
         if: success()
         shell: bash
         working-directory: Neolectrum-fabric
         run: |
-          jar=$(ls build/libs/*-all.jar 2>/dev/null | head -n 1 || true)
+          # Loom's remapJar names its output without the `-all` the NeoForge jarJar task uses:
+          # `wgpu_mc-fabric-<version>.jar`, sources beside it.
+          jar=$(ls build/libs/*.jar 2>/dev/null | grep -v -- '-sources' | head -n 1 || true)
           if [ -z "$jar" ]; then
-            echo "::warning::no Fabric -all.jar was built (the Fabric job is still graduating); skipping the content check"
+            echo "::warning::no Fabric jar was built (the Fabric job is still graduating); skipping the content check"
             exit 0
           fi
           echo "== $jar =="
