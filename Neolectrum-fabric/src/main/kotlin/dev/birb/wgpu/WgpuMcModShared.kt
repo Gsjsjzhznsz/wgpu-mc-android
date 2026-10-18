@@ -5,7 +5,10 @@ import java.util.concurrent.atomic.LongAdder
 import org.slf4j.Logger
 
 /**
- * **The shared constants, under their NeoForge twin's name.**
+ * **The shared constants, under their NeoForge twin's name.** (The file is named
+ * `WgpuMcModShared` rather than `WgpuMcMod` for one mechanical reason: the shared sources'
+ * exclude patterns name the NeoForge `WgpuMcMod.kt` by path, and a file of the same name here
+ * would be caught by the same pattern - the class inside is the one every reference resolves.)
  *
  * The mod's code reads `WgpuMcMod.LOGGER`, `WgpuMcMod.MOD_ID` and the timing counters from
  * everywhere - Kotlin objects, Java mixins - and on NeoForge those live on the `@Mod` class. On

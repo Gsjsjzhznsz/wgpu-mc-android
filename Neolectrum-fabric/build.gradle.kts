@@ -27,8 +27,9 @@ base { archivesName.set("$modId-fabric") }
 
 java {
         // Minecraft 26.1 moved to Java 25 - the same floor the NeoForge build sets.
+        // (No sources jar: the module's resources live in two trees, and a sources jar is a
+        // second place to answer the same duplicate the jar itself answers.)
         toolchain { languageVersion.set(JavaLanguageVersion.of(25)) }
-        withSourcesJar()
 }
 
 kotlin {

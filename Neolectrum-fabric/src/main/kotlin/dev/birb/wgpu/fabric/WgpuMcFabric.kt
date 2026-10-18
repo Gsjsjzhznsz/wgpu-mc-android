@@ -8,8 +8,7 @@ import dev.birb.wgpu.render.ShaderReloadListener
 import dev.birb.wgpu.rust.WgpuNative
 import net.fabricmc.api.ClientModInitializer
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents
-import net.fabricmc.fabric.api.resource.ResourceManagerHelper
-import net.fabricmc.fabric.api.resource.IdentifiableResourceReloadListener
+import net.fabricmc.fabric.api.resource.v1.ResourceLoader
 import net.fabricmc.loader.api.FabricLoader
 import net.minecraft.resources.Identifier
 import net.minecraft.server.packs.PackType
@@ -61,16 +60,13 @@ object WgpuMcFabric : ClientModInitializer {
                         DebugReload.onClientTick()
                 }
 
-                // The shader reload listener, under the same id the NeoForge event names it with.
-                // Fabric's resource-loader wants an identifiable listener, and the game's own
-                // listener interface the mod implements is the one it delegates through.
-                ResourceManagerHelper.get(PackType.CLIENT_RESOURCES)
-                        .registerReloadListener(FabricShaderReloadListener)
+                // The shader reload listener, under the same id the NeoForge event names it
+                // with. resource-loader-v1's register takes the id and the game's own listener
+                // interface the mod implements, one call and no adapter.
+                ResourceLoader.get(PackType.CLIENT_RESOURCES)
+                        .registerReloadListener(
+                                Identifier.fromNamespaceAndPath(WgpuMcMod.MOD_ID, "shaders"),
+                                ShaderReloadListener,
+                        )
         }
-}
-
-/** The mod's shader reload listener, named the way Fabric's resource-loader registers it. */
-object FabricShaderReloadListener : IdentifiableResourceReloadListener by ShaderReloadListener {
-        override val fabricId: Identifier
-                get() = Identifier.fromNamespaceAndPath(WgpuMcMod.MOD_ID, "shaders")
 }
