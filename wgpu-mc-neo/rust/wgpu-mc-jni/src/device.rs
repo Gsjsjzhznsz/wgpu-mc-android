@@ -477,11 +477,14 @@ unsafe fn build_surface(
             });
         }
 
-        // `dispatch_get_main_queue()` is a macro over this object in C, not a function call, so the
-        // queue is reached as the static it is. Both symbols ship in libSystem, which every binary
-        // on the platform links against - there is nothing to add to the link line.
+        // `dispatch_get_main_queue()` is a macro over this object in C - `&_dispatch_main_q`, one
+        // q, on every Apple platform - so the queue is reached as the static it is. Both symbols
+        // ship in libSystem, which every binary on the platform links against; the name is the
+        // header's, not the Linux swift-corelibs one (`_dispatch_main_queue`), and a dylib that
+        // spelled it the long way links clean on macOS and dies on iOS with an undefined symbol -
+        // which is the release that taught this comment.
         unsafe extern "C" {
-            static _dispatch_main_queue: u8;
+            static _dispatch_main_q: u8;
 
             fn dispatch_sync_f(
                 queue: *mut u8,
@@ -501,7 +504,7 @@ unsafe fn build_surface(
         // function's own stack slot), and the work function reads only what the context carries.
         unsafe {
             dispatch_sync_f(
-                &raw const _dispatch_main_queue as *mut u8,
+                &raw const _dispatch_main_q as *mut u8,
                 &raw mut job as *mut core::ffi::c_void,
                 create_surface_on_main,
             );
