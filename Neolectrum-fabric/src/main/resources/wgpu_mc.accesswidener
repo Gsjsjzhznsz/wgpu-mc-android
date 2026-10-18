@@ -1,0 +1,50 @@
+# The NeoForge build widens these members with META-INF/accesstransformer.cfg, applied by the
+# loader at runtime; Fabric's equivalent is the access widener, applied at build time by loom -
+# so the shared sources compile here exactly as they compile there. Every entry below is the
+# translation of an entry there (the ones marked already-public there were dropped), with the
+# field descriptors spelled from the 26.1 sources the AT file was verified against; the ones
+# whose 26.1 types this file guesses at are marked GUESS, and a loom build error naming one is
+# the file being told the real descriptor.
+
+# ---------- Class accessibility ----------
+accessible class net/minecraft/client/renderer/chunk/SectionRenderDispatcher$RenderSection$CompileTask
+accessible class net/minecraft/world/level/chunk/PaletteResize
+accessible class net/minecraft/world/level/chunk/PalettedContainer$Data
+accessible class net/minecraft/world/level/chunk/Configuration
+accessible class net/minecraft/world/level/lighting/SkyLightSectionStorage$SkyDataLayerStorageMap
+
+# ---------- Field accessibility ----------
+# The Rust palette/light paths read these out of the container's internals.
+accessible field net/minecraft/world/level/chunk/PalettedContainer data Lnet/minecraft/world/level/chunk/PalettedContainer$Data;
+accessible field net/minecraft/world/level/chunk/PalettedContainer$Data palette Lnet/minecraft/world/level/chunk/Palette; # GUESS
+accessible field net/minecraft/world/level/chunk/PalettedContainer$Data storage Lnet/minecraft/world/level/chunk/BitStorage; # GUESS
+accessible field net/minecraft/world/level/chunk/PalettedContainer$Data configuration Lnet/minecraft/world/level/chunk/Configuration;
+
+# 26.1 leaves renderThread non-public; the render-thread checks read it.
+accessible field com/mojang/blaze3d/systems/RenderSystem renderThread Ljava/lang/Thread;
+
+# ---------- Chunk / light storage state ----------
+accessible field net/minecraft/client/multiplayer/ClientChunkCache storage Lnet/minecraft/client/multiplayer/ClientChunkCache$Storage;
+accessible field net/minecraft/client/multiplayer/ClientChunkCache$Storage viewCenterX I
+accessible field net/minecraft/client/multiplayer/ClientChunkCache$Storage viewCenterZ I
+
+# SimpleBitStorage internals, read by the palette packer.
+accessible field net/minecraft/util/SimpleBitStorage valuesPerLong I
+accessible field net/minecraft/util/SimpleBitStorage divideAdd I
+accessible field net/minecraft/util/SimpleBitStorage divideMul I
+accessible field net/minecraft/util/SimpleBitStorage divideShift I
+accessible field net/minecraft/util/SimpleBitStorage mask I
+
+accessible field net/minecraft/world/level/lighting/LevelLightEngine blockEngine Lnet/minecraft/world/level/lighting/LightEngine; # GUESS
+accessible field net/minecraft/world/level/lighting/LevelLightEngine skyEngine Lnet/minecraft/world/level/lighting/LightEngine; # GUESS
+accessible field net/minecraft/world/level/lighting/LayerLightSectionStorage updatingSectionData Lnet/minecraft/world/level/lighting/SkyLightSectionStorage$SkyDataLayerStorageMap; # GUESS
+accessible field net/minecraft/world/level/lighting/LayerLightSectionStorage visibleSectionData Lnet/minecraft/world/level/lighting/SkyLightSectionStorage$SkyDataLayerStorageMap; # GUESS
+
+# ---------- Method accessibility ----------
+# onMove/onButton/onScroll remain package-private in 26.1; the input mixins invoke them.
+accessible method net/minecraft/client/MouseHandler onMove (JDD)V
+accessible method net/minecraft/client/MouseHandler onButton (JLnet/minecraft/client/input/MouseButtonInfo;I)V
+accessible method net/minecraft/client/MouseHandler onScroll (JDD)V
+accessible method net/minecraft/client/renderer/chunk/SectionRenderDispatcher$RenderSection createCompileTask (Lnet/minecraft/client/renderer/chunk/RenderRegionCache;)Lnet/minecraft/client/renderer/chunk/SectionRenderDispatcher$RenderSection$CompileTask;
+# 26.1 takes a CameraRenderState; still private.
+accessible method net/minecraft/client/renderer/GameRenderer bobView (Lnet/minecraft/client/renderer/state/level/CameraRenderState;Lcom/mojang/blaze3d/vertex/PoseStack;)V

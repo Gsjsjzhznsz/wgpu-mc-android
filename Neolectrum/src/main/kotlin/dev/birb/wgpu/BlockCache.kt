@@ -8,9 +8,6 @@ import dev.birb.wgpu.render.Wgpu
 import dev.birb.wgpu.rust.WgpuNative
 import net.minecraft.client.Minecraft
 import net.minecraft.data.AtlasIds
-import net.neoforged.bus.api.SubscribeEvent
-import net.neoforged.fml.common.EventBusSubscriber
-import net.neoforged.neoforge.client.event.ClientTickEvent
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -48,7 +45,6 @@ import java.util.concurrent.atomic.AtomicInteger
  * session while the game's own textures, models and atlases all reloaded around it. See
  * [cacheAndRebuild] for the sequence and `WgpuNative.beginBlockReload` for what is forgotten first.
  */
-@EventBusSubscriber(modid = WgpuMcMod.MOD_ID)
 object BlockCache {
 	/**
 	 * The atlas texture the cache has already baked against, which is what says a new stitch has landed.
@@ -645,12 +641,7 @@ object BlockCache {
 		return previous != null && previous != cutout
 	}
 
-	@SubscribeEvent
-	// No @JvmStatic here, ever. KFF 6.3.0's AutoKotlinEventBusSubscriber registers this whole
-	// object via `gameBus.register(instance)`, and the new NeoForge event bus throws
-	// IllegalArgumentException when it finds a *static* @SubscribeEvent method on an instance
-	// registration - which is exactly what @JvmStatic generates (with the annotation copied).
-	fun onClientTick(event: ClientTickEvent.Post) {
+	fun onClientTick() {
 		val ticks = sinceReload
 		if (ticks >= 0) {
 			sinceReload = ticks + 1

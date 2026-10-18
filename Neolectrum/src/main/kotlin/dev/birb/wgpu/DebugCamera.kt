@@ -2,9 +2,6 @@ package dev.birb.wgpu
 
 import dev.birb.wgpu.rust.RendererSettings
 import net.minecraft.client.Minecraft
-import net.neoforged.bus.api.SubscribeEvent
-import net.neoforged.fml.common.EventBusSubscriber
-import net.neoforged.neoforge.client.event.ClientTickEvent
 
 /**
  * Holds the camera still while the renderer's `pin_camera` setting is on.
@@ -28,16 +25,12 @@ import net.neoforged.neoforge.client.event.ClientTickEvent
  * Client ticks rather than frames, like [DebugReload]: a tick is where a position can be held, and the
  * render thread reads whatever the last tick left.
  */
-@EventBusSubscriber(modid = WgpuMcMod.MOD_ID)
 object DebugCamera {
 	private const val PIN_CAMERA = "pin_camera"
 
 	private var reported = false
 
-	// No @JvmStatic here, ever. See the note in BlockCache.onClientTick: the static delegate
-	// it generates makes NeoForge's bus reject the KFF auto-registration of this object.
-	@SubscribeEvent
-	fun onClientTick(event: ClientTickEvent.Post) {
+	fun onClientTick() {
 		if (RendererSettings.bool(PIN_CAMERA) != true) {
 			return
 		}

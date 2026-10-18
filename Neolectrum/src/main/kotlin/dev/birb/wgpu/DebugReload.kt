@@ -1,9 +1,6 @@
 package dev.birb.wgpu
 
 import net.minecraft.client.Minecraft
-import net.neoforged.bus.api.SubscribeEvent
-import net.neoforged.fml.common.EventBusSubscriber
-import net.neoforged.neoforge.client.event.ClientTickEvent
 import java.nio.file.Files
 import java.nio.file.Path
 
@@ -20,7 +17,6 @@ import java.nio.file.Path
  * Client ticks rather than frames, so the reload lands after the world has settled and the first
  * frame dump of the run is a "before" picture. Marker-gated, and fired once.
  */
-@EventBusSubscriber(modid = WgpuMcMod.MOD_ID)
 object DebugReload {
 	private const val MARKER = "wgpu-reload-resources"
 
@@ -34,10 +30,7 @@ object DebugReload {
 		Files.exists(Path.of(MARKER)) || Files.exists(Path.of("..", MARKER))
 	}
 
-	// No @JvmStatic here, ever. See the note in BlockCache.onClientTick: the static delegate
-	// it generates makes NeoForge's bus reject the KFF auto-registration of this object.
-	@SubscribeEvent
-	fun onClientTick(event: ClientTickEvent.Post) {
+	fun onClientTick() {
 		if (!marker || done) {
 			return
 		}
