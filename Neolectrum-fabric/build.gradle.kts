@@ -4,7 +4,7 @@ import java.util.Properties
 plugins {
         id("java-library")
         kotlin("jvm") version "2.3.20"
-        id("fabric-loom") version "1.14.3"
+        id("fabric-loom") version "1.19.1"
 }
 
 // **One version for both loaders.** `Neolectrum/gradle.properties` is the version of record for
@@ -33,6 +33,12 @@ kotlin {
         compilerOptions {
                 jvmTarget.set(JvmTarget.JVM_25)
         }
+}
+
+loom {
+        // See the mappings note in `dependencies`: 26.1 ships no intermediary, and this is the
+        // switch that stops loom from looking for one.
+        noIntermediateMappings()
 }
 
 // NOTE: the toolchain above is the whole Java story - 26.1 needs Java 25 and the toolchain pins
@@ -124,13 +130,14 @@ dependencies {
         // **26.1 is unobfuscated, so there are no official mappings to find** - Mojang stopped
         // shipping them, which is exactly what the NeoForge build's gradle.properties has said
         // since 26.1 ("no mappings/parchment entries are needed anymore"), and what loom's
-        // `officialMojangMappings` answered with a hard failure on this version (and loom has no
-        // named no-op helper on this release). An **empty layered** mapping is the identity: no
-        // remapping pass, the jar's own names are the names both this build and the NeoForge
-        // build compile against.
+        // `officialMojangMappings` answered with a hard failure on this version. The empty layered
+        // mapping is the identity on top, and `loom { noIntermediateMappings() }` below is the
+        // switch loom grew for exactly these versions - without it loom goes looking for an
+        // intermediary the Fabric maven stopped publishing the day the game stopped being
+        // obfuscated, and resolves it to a `0.0.0` placeholder it then rejects.
         mappings(loom.layered { })
         modImplementation("net.fabricmc:fabric-loader:0.17.3")
-        modImplementation("net.fabricmc.fabric-api:fabric-api:0.134.0+26.1.2")
+        modImplementation("net.fabricmc.fabric-api:fabric-api:0.155.3+26.1.2")
 
         // The mod is written in Kotlin and nothing on a player's Fabric classpath brings the
         // runtime: fabric-language-kotlin is the language adapter for Kotlin *entrypoints*, which
