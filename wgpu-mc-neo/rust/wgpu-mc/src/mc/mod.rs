@@ -254,16 +254,23 @@ pub struct RenderEffectsData {
 }
 
 /// What the arena's buffer is used for: written by the section feed, read as vertices and indices by
-/// the graph's draws, and bound as a storage buffer by the shader that fetches a section's quads.
+/// the graph's draws, bound as a storage buffer by the shader that fetches a section's quads, and -
+/// since the compacted draw (`terrain_mega`) - **a copy source**: the frame's own index ranges are
+/// blitted out of an arena into the frame's compacted index buffer before the terrain pass opens,
+/// and a `copy_buffer_to_buffer` asks its source for `COPY_SRC`. Without the flag every one of those
+/// copies fails the encoder's validation, the frame's submission is refused whole, and the world
+/// draws nothing while the game's own encoder keeps the menus up - the shape the android.35 report
+/// captured as two validation errors a frame and a black screen.
 ///
 /// One constant rather than the same flags at every creation site - the pool and the buffers are made
 /// together by [`Scene::set_arena_slots`] and `WmRenderer::grow_arena`, and a flag missing from one of
 /// those sites is a validation error at the first draw.
 ///
-/// **No `COPY_SRC`.** It was there because a full arena used to grow by allocating a bigger buffer and
-/// copying the old one into it; growth appends another buffer now, so nothing copies an arena and the
-/// flag would be permission for a thing that does not happen. See [`ARENA_BUFFERS`].
+/// Growth appends another buffer rather than allocating a bigger one and copying the old contents
+/// over, so nothing copies an arena *whole* - the compacted draw's per-frame slices are the only
+/// copies out of it. See [`ARENA_BUFFERS`].
 pub(crate) const ARENA_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::COPY_DST
+    .union(wgpu::BufferUsages::COPY_SRC)
     .union(wgpu::BufferUsages::VERTEX)
     .union(wgpu::BufferUsages::STORAGE)
     .union(wgpu::BufferUsages::INDEX);
@@ -1303,5 +1310,37 @@ mod variant_pick_tests {
 
         // And a key no state selected has no model, which is the same answer as before this existed.
         assert!(block.get_model(4, 0).is_none());
+    }
+}
+
+/// The arena's mask has to stay a superset of what every reader asks of it. The compacted terrain
+/// draw reads it as a copy source; the shaders read it as storage; the draws read it as vertices and
+/// indices. Each of those failed differently when a flag went missing - the copy source one took the
+/// whole frame's submission with it - so the mask carries its contract as a test.
+#[cfg(test)]
+mod arena_usage_tests {
+    use super::*;
+
+    #[test]
+    fn the_arena_can_be_a_copy_source() {
+        // The compacted draw (`terrain_mega`) blits the frame's index ranges out of an arena every
+        // frame, before the terrain pass opens. A missing `COPY_SRC` made every one of those copies
+        // a validation error, invalidated the frame's encoder, and had `Queue::submit` refuse the
+        // whole submission - the world went black while the game's own encoder kept the menus up.
+        assert!(
+            ARENA_USAGE.contains(wgpu::BufferUsages::COPY_SRC),
+            "the compacted terrain draw copies index ranges out of the arena every frame"
+        );
+    }
+
+    #[test]
+    fn the_arena_still_carries_every_reader_it_always_had() {
+        let expected = wgpu::BufferUsages::COPY_DST
+            .union(wgpu::BufferUsages::COPY_SRC)
+            .union(wgpu::BufferUsages::VERTEX)
+            .union(wgpu::BufferUsages::STORAGE)
+            .union(wgpu::BufferUsages::INDEX);
+
+        assert_eq!(ARENA_USAGE, expected);
     }
 }
