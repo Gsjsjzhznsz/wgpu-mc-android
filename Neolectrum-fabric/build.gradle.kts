@@ -118,10 +118,14 @@ sourceSets.main {
                 // by either name, and the answer is this module's own copy.
                 "dev/birb/wgpu/BlockCache.kt",
         )
+        // **/ prefixes, and not bare paths: an exclude pattern without one matches the file at
+        // the root of the FIRST source directory it is declared against, and these files live in
+        // the shared tree the default srcDir reaches - the double star is what actually filters.
         resources.exclude(
-                "META-INF/neoforge.mods.toml",
-                "META-INF/accesstransformer.cfg",
-                "assets/electrum/**",
+                "**/META-INF/neoforge.mods.toml",
+                "**/META-INF/accesstransformer.cfg",
+                "**/wgpu_mc.mixins.json.bak",
+                "**/assets/electrum/**",
                 "**/*.bbmodel",
                 "**/.cache",
         )
