@@ -341,34 +341,38 @@ impl WmRenderer {
 
         let camera = *scene.camera_section_pos.read();
 
+        // **A width change makes the trim due on its own.** See `SectionStorage::set_width`: the
+        // common way to change the render distance is from the video settings, and the camera those
+        // are opened from does not move - without this, the old radius kept every section it held
+        // until the player crossed a section boundary, and the view the settings screen had just
+        // shrunk kept drawing past its new edge. Read before the lock below and dropped with the
+        // statement, so the two locks are never held together.
+        let width_changed = scene.section_storage.read().trim_due();
+
         {
             let mut last = scene.trimmed_section_pos.write();
             // The trim is horizontal: see `Scene::camera_section_pos` for why the camera's section
             // carries a height this does not use.
             let horizontal = ivec2(camera.x, camera.z);
 
-            if *last == horizontal {
+            if *last == horizontal && !width_changed {
                 return;
             }
 
             *last = horizontal;
         }
 
-        // **What the trim dropped, into the same channel a refusal goes down.** Both mean one thing to
-        // the other side: a section this renderer is no longer drawing, which Minecraft's mesh has to
-        // come back for - `rustHas` is a claim, and this is where the claim stops being true. It costs
-        // nothing when the trim removed nothing, which is most frames.
-        let trimmed = scene
-            .section_storage
-            .write()
-            .trim(ivec2(camera.x, camera.z));
+        // One storage guard for both halves: a due width change is consumed here, where the trim
+        // that answers it runs, and the positions the trim dropped go into the same set a refusal
+        // does. `forget_trimmed` is the whole of that hand-off, so there is nothing to order between
+        // the two calls beyond sharing the lock.
+        let mut storage = scene.section_storage.write();
+        storage.take_trim_due();
 
-        if !trimmed.is_empty() {
-            let mut storage = scene.section_storage.write();
+        let trimmed = storage.trim(ivec2(camera.x, camera.z));
 
-            for pos in trimmed {
-                storage.forget_trimmed(pos);
-            }
+        for pos in trimmed {
+            storage.forget_trimmed(pos);
         }
     }
 
@@ -901,18 +905,25 @@ impl WmRenderer {
         // produces. The refusals in that window are sections Minecraft's mesh was already dropped for,
         // which is the hole this file has spent several rounds on.
         //
-        // `pending_arena_growth` is a marker rather than a size - the refusal that sets it only knows
-        // that something did not fit - so the target is read from the pool the world actually wants:
-        // `arena_slots` at the current width, under the policy ceiling (`arena_slots_for_view`). The
-        // ceiling is what stands between a render-distance change and the phone run that asked it for
-        // 285,660,000 slots - 1,216 MB, 6% held, a device at a frame a second - because the growth
-        // here is the path a *change* takes: the pool is not empty, `set_arena_slots` refuses it, and
-        // this target is the size the change reaches by.
-        let raw_view_ask =
-            mc::chunk::arena_slots(scene.section_storage.read().width().max(0) as u32);
-        let target = raw_view_ask.min(mc::ARENA_SLOTS_CEILING);
+        // **The marker is a `1` or a size, and the two answer differently.** A *refusal* stores `1`: it
+        // only knows that a section did not fit, so the target stays the view's own ask - `arena_slots`
+        // at the current width, under the policy ceiling - and the loop below appends until the pool
+        // covers it. A *render-distance report* stores the size the view asked for, pool clamp included
+        // (`setRenderDistance`), and its answer is bounded by that ask: a pool that already covers it
+        // has nothing to grow toward, and the loop below stops before its first allocation.
+        //
+        // That bound is what stands between a render-distance change and the phone run that measured
+        // this file: three reports of a view the first of them already covered walked the arena
+        // 512 -> 640 -> 768 -> 896 MB, every step a 128 MiB buffer the view never needed, and the third
+        // toggle left the whole system crawling under the swap those buffers caused. The ask a report
+        // stores is the *view's* size, so the growth a change still drives happens - it just stops at
+        // the view instead of at twice whatever the pool happened to hold.
+        //
+        // The mapping itself is `mc::growth_target` - pure, and tested against both marker kinds.
+        let target = mc::growth_target(asked, scene.section_storage.read().width());
         let budget = scene.arena_memory_budget;
         let mut at_limit = false;
+        let mut appended = 0u64;
 
         loop {
             // **Sized by what the view asks for, not by the device's ceiling.** See
@@ -920,6 +931,16 @@ impl WmRenderer {
             // are written down. The short version: the ceiling is a *cap*, and asking for it is what
             // killed a run in `create_buffer`.
             let pool_slots = scene.section_storage.read().pool_slots();
+
+            // **A view-driven ask stops at the view.** The refusal ask cannot take this exit - it does
+            // not know where the view ends, only that a section did not fit, and a pool whose free
+            // ranges are scattered under the largest section this session has meshed is exactly the
+            // state an append answers. A report ask does know, and a pool past its ask is room rather
+            // than shortage: the toggles that measured this file asked for 50,460,000 slots over a pool
+            // of 134,217,728, and every one of them used to append a buffer anyway.
+            if asked != 1 && pool_slots >= target {
+                break;
+            }
 
             let slots = mc::arena_growth_slots(
                 target,
@@ -1048,6 +1069,7 @@ impl WmRenderer {
             let mut buffers = scene.chunk_buffers.load().as_ref().clone();
             buffers.push(buffer);
             scene.chunk_buffers.store(Arc::new(buffers));
+            appended += 1;
 
             // Enough room for what the view asks for, or as many arenas as there may be.
             if scene.section_storage.read().pool_slots() >= target {
@@ -1062,19 +1084,27 @@ impl WmRenderer {
 
         let stored = scene.section_storage.read();
 
-        // The ask the log names is the one growth obeyed - and when the policy ceiling clipped the
-        // view's own number, the difference is the memory the device did *not* have to die of, which
-        // is the one fact a "why is the arena smaller than my view" question is really asking for.
-        let view_ask = if raw_view_ask != target {
-            format!("{raw_view_ask} asked, {target} after the record table's ceiling")
-        } else {
-            format!("{target}")
-        };
+        // **A report ask the pool already covered stops before its first allocation**, and the log
+        // has to say that rather than repeat the growth line with no growth behind it - the three
+        // toggles that measured this file would otherwise have read as three growths. The refusals
+        // keep the growth line: their answer is always an append, even when the pool's own total
+        // looks like room, because what they know is a section that did not fit in it.
+        if appended == 0 {
+            log::info!(
+                "wgpu-mc: the arena already covers the view's ask; {} arena(s) holding {} slot(s), \
+                 {} MB, against a target of {target}",
+                stored.arena_count(),
+                stored.pool_slots(),
+                stored.pool_slots() as u64 * 4 / (1024 * 1024),
+            );
+
+            return;
+        }
 
         log::warn!(
             "wgpu-mc: the section arena was full, so it grew to {} arena(s) holding {} slot(s), {} MB \
              total ({} slot(s) handed out, the largest section meshed so far {} slot(s), and the view \
-             asked for {view_ask} slot(s))",
+             asked for {target} slot(s))",
             stored.arena_count(),
             stored.pool_slots(),
             stored.pool_slots() as u64 * 4 / (1024 * 1024),

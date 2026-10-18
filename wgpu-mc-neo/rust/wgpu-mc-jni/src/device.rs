@@ -7872,11 +7872,21 @@ pub fn setRenderDistance(_env: JNIEnv, _class: JClass, chunks: jint) {
         // sections it is holding. It can still be *grown*, which is the same change made without moving
         // anything: every range keeps its offset, so the report is honoured by the next frame's growth
         // instead of being dropped - and without this, a session whose first report arrived a frame late
-        // ran at the arena's placeholder size and grew to the right one by doubling, one buffer copy at
-        // a time. Only upwards: a report that asks for less than the pool already has is not a reason to
-        // move it.
+        // ran at the arena's placeholder size and never reached the one the world needed. Only upwards:
+        // a report that asks for less than the pool already has is not a reason to move it.
+        //
+        // **The ask travels as the target, and that is the whole of the anti-ratchet.** This used to
+        // store `wanted.max(pool * 2)`, which set a growth ask on *every* report - `pool * 2` is past
+        // `pool` by construction - and `grow_arena_if_asked` answered each with one more 128 MiB arena.
+        // The run that measured it: three render-distance toggles of a 12-chunk view over a pool the
+        // first report had already covered walked the arena 512 -> 640 -> 768 -> 896 MB, and the device
+        // spent the rest of the session crawling in swap under buffers the view never asked for. The
+        // marker `grow_arena_if_asked` reads now carries the view's own ask (a refusal stores `1`
+        // there, which is how the two asks stay distinguishable), so a covered report stores nothing
+        // at all - the branch below is the only writer, and it is guarded by the same comparison the
+        // log line makes.
         let pool = scene.section_storage.read().pool_slots();
-        let target = wanted.max(pool.saturating_mul(2)).min(pool_cap_slots);
+        let target = wanted.min(pool_cap_slots);
 
         if target > pool {
             scene

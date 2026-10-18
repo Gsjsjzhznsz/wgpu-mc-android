@@ -400,6 +400,31 @@ pub fn arena_growth_slots(
         .min(ARENA_SLOTS_CEILING)
 }
 
+/// **The target a growth ask is answered to**, from the marker and the width it arrived with.
+///
+/// `pending_arena_growth` carries two kinds of ask, and they answer differently. A **refusal**
+/// stores `1` - it only knows that a section did not fit, so its target is the view's own ask:
+/// [`chunk::arena_slots`](crate::mc::chunk::arena_slots) at the width the arena is trimmed by,
+/// under the policy ceiling. A **render-distance report** stores the size the view asked for,
+/// pool clamp included (`setRenderDistance`), and is answered to that number as it stands.
+///
+/// The distinction is what retired the ratchet: the report used to store `pool * 2`, which set a
+/// growth ask on every report and answered each with another 128 MiB arena - three toggles of a
+/// 12-chunk view over a pool the first report had already covered walked the arena 512 -> 640 ->
+/// 768 -> 896 MB on the phone that measured it. A covered report now stores nothing at all, and
+/// the size it does store is bounded by the view rather than by whatever the pool held.
+///
+/// Returns the target in slots; `grow_arena_if_asked` appends until the pool reaches it, and stops
+/// before its first allocation when the pool already has - for report asks only, because a refusal
+/// with scattered free ranges is exactly the state an append answers.
+pub fn growth_target(asked: u32, width: i32) -> u32 {
+    if asked == 1 {
+        crate::mc::chunk::arena_slots(width.max(0) as u32).min(ARENA_SLOTS_CEILING)
+    } else {
+        asked.min(ARENA_SLOTS_CEILING)
+    }
+}
+
 /// The most u32 slots **one** arena buffer may hold, from the two limits its two uses have to satisfy.
 ///
 /// The two limits are not the same limit. `max_buffer_size` is what `create_buffer` may make; a bind
@@ -1342,5 +1367,58 @@ mod arena_usage_tests {
             .union(wgpu::BufferUsages::INDEX);
 
         assert_eq!(ARENA_USAGE, expected);
+    }
+}
+
+#[cfg(test)]
+mod growth_marker_tests {
+    use super::*;
+
+    /// **A report ask is answered to itself; a refusal ask to the view.**
+    ///
+    /// The ratchet this replaced stored `pool * 2` on every render-distance report, and the growth
+    /// loop answered every one of them with another 128 MiB arena - the toggles that measured it
+    /// asked 50,460,000 slots of a pool already holding 134,217,728 and still walked the arena up a
+    /// buffer per toggle. The marker now carries the view's own ask, so a report's target is the
+    /// view, and a refusal's - which knows nothing but "a section did not fit" - stays the view's
+    /// own arithmetic at the width the arena is trimmed by.
+    #[test]
+    fn a_report_ask_is_its_own_target_and_a_refusal_asks_for_the_view() {
+        // The report for a 12-chunk view on the phone that measured this: the ask itself, whatever
+        // the pool holds - the clamp to the pool's ceiling already happened on the report's side.
+        assert_eq!(growth_target(50_460_000, 12), 50_460_000);
+
+        // And the refusal marker: the view's own ask at the current width, under the ceiling.
+        assert_eq!(
+            growth_target(1, 12),
+            crate::mc::chunk::arena_slots(12).min(ARENA_SLOTS_CEILING)
+        );
+    }
+
+    /// **The policy ceiling holds for both ask kinds.**
+    ///
+    /// A report whose stored ask is past the record table's reach is clipped here as well as on the
+    /// report's side - the two clamps are one policy, and a caller that forgot the report-side one
+    /// inherits the ceiling rather than the memory bill. The refusal branch is the same clamp the
+    /// growth loop always applied to its own arithmetic.
+    #[test]
+    fn both_ask_kinds_stop_at_the_record_tables_ceiling() {
+        assert_eq!(growth_target(u32::MAX, 12), ARENA_SLOTS_CEILING);
+        // `i32::MAX` chunks caps at the 64 the ring arithmetic tops out at, and the ceiling above
+        // that is the record table's.
+        assert_eq!(growth_target(1, i32::MAX), ARENA_SLOTS_CEILING);
+    }
+
+    /// **A width that was never reported still produces a refusal target.**
+    ///
+    /// `width` arrives as zero from a storage nothing was meshed into yet; `arena_slots(0)` is the
+    /// ring's own arithmetic, and the refusal ask is answered with it rather than with a zero that
+    /// would read as "nothing to grow to".
+    #[test]
+    fn a_refusal_at_an_unreported_width_still_asks_for_the_ring() {
+        assert_eq!(
+            growth_target(1, 0),
+            crate::mc::chunk::arena_slots(0).min(ARENA_SLOTS_CEILING)
+        );
     }
 }

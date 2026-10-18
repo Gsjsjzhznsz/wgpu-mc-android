@@ -407,6 +407,20 @@ pub struct SectionStorage {
     /// compared with itself, and a clock would make the order depend on how long a frame took.
     parked_seq: u64,
     width: i32,
+    /// **Set when the width changed under live sections, and taken by the next frame's trim.**
+    ///
+    /// `tick_scene` trims only when the camera has crossed into a new section since the last trim,
+    /// which is most frames the right answer: the radius only matters relative to where the camera
+    /// is, and a camera that has not moved needs no second trim. A render-distance change is the
+    /// exception, and the common way to make one is from the video settings while standing still -
+    /// the camera never crosses a section, so the old radius kept every section it held until the
+    /// player walked somewhere: the view the settings screen had just shrunk kept drawing past its
+    /// new edge, and the sections out there kept their arena ranges and their claims.
+    ///
+    /// [`Self::set_width`] sets this when the width actually moves, and `tick_scene` takes it beside
+    /// the camera check - one trim with the new radius, whether or not the camera moved. One-shot by
+    /// construction (`take`), so a width that did not change costs nothing.
+    trim_due: bool,
 }
 
 /// One section's baked geometry, held until the arena has room for it.
@@ -461,6 +475,7 @@ impl SectionStorage {
             parked_seq: 0,
             record_free: (0..crate::mc::SECTION_DRAW_CAPACITY as u32).rev().collect(),
             record_writes: std::collections::BTreeMap::new(),
+            trim_due: false,
         }
     }
     /// Narrows or widens the pool to a render distance, which is only possible while it is empty.
@@ -695,8 +710,31 @@ impl SectionStorage {
         self.width
     }
 
+    /// **Whether the last [`Self::set_width`] changed the width**, and so made a trim due.
+    ///
+    /// Read by `tick_scene` beside its camera check; taken (and cleared) by the trim that answers
+    /// it. See [`Self::set_width`] for why a width change has to make the trim happen on its own.
+    pub fn trim_due(&self) -> bool {
+        self.trim_due
+    }
+
+    /// Clears and returns [`Self::trim_due`]. One trim per width change.
+    pub fn take_trim_due(&mut self) -> bool {
+        std::mem::take(&mut self.trim_due)
+    }
+
+    /// Sets how far the arena reaches from the camera, in chunks.
+    ///
+    /// Called from the render-distance report. The width is what [`Self::trim`] measures its radius
+    /// with, so this is the call that makes a distance change take effect - and because the trim
+    /// itself is driven by the camera crossing a section, the change also marks a trim due: a player
+    /// who opens the video settings and shrinks the view while standing still would otherwise keep
+    /// drawing every section the old radius held until they walked across a section boundary.
     pub fn set_width(&mut self, w: i32) {
-        self.width = w;
+        if self.width != w {
+            self.width = w;
+            self.trim_due = true;
+        }
     }
     /// Drops the sections beyond the view, and **hands their positions back to the caller**.
     ///
@@ -7039,6 +7077,50 @@ mod arena_tests {
             1,
             "and the near section is still held - the trim removed exactly the one it reported"
         );
+    }
+
+    /// **A width change makes the trim due, and the flag is one-shot.**
+    ///
+    /// The trim's own driver is the camera crossing a section, and a render-distance change made from
+    /// the video settings does not move the camera: without a flag, the old radius kept every section
+    /// it held until the player walked somewhere, and the view the settings screen had just shrunk
+    /// kept drawing past its new edge - the run that measured this drew 749 sections a frame at a
+    /// camera whose first 12-chunk view had drawn 475 of them. `set_width` marks the change,
+    /// `tick_scene` takes it beside the camera check, and a width that did not change marks nothing.
+    #[test]
+    fn a_width_change_makes_the_trim_due_once() {
+        let mut storage = SectionStorage::new(pool_for(1));
+
+        assert!(
+            !storage.trim_due(),
+            "a storage that was never sized has no trim due"
+        );
+
+        // The same width again is not a change, and so is not a trim.
+        storage.set_width(0);
+        assert!(!storage.trim_due());
+
+        storage.set_width(12);
+        assert!(
+            storage.trim_due(),
+            "the width moved, so the next frame's trim is due"
+        );
+
+        // One-shot: the trim that answers the change consumes it, and nothing after it re-trims for
+        // the same change.
+        assert!(storage.take_trim_due());
+        assert!(!storage.trim_due());
+        assert!(!storage.take_trim_due());
+
+        // And a change back is its own trim again, which is the toggle the video settings make.
+        storage.set_width(32);
+        assert!(storage.take_trim_due());
+
+        // Shrinking is where the flag earns its keep - a smaller radius is the only direction a
+        // change can leave sections outside the view - but growing marks one too, for symmetry and
+        // because the report that grew the width may also have grown the ring the trim keeps.
+        storage.set_width(12);
+        assert!(storage.trim_due());
     }
 
     /// A refused section does not cost the pool the layers of itself that *did* fit.
