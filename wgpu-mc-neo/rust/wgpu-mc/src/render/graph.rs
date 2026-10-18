@@ -5380,13 +5380,15 @@ mod binding_visibility_tests {
             return;
         };
 
-        // The record the drain writes, and the size every shader fetch walks past: four words, no
-        // padding, which is what `array<SectionRecord>` in the shader assumes a stride of.
+        // The record the drain writes, and the shape every shader fetch walks: **two whole
+        // `vec4<u32>`s** - origin and base in the first, the packed-corner base and padding in the
+        // second - which is what the shader's `array<vec4<u32>>` reads them as, two one-operation
+        // loads a record where a four-scalar struct read was four.
         assert_eq!(
             std::mem::size_of::<crate::mc::SectionRecord>(),
-            16,
-            "the record the drain writes is sixteen bytes, and the shader's `array<SectionRecord>` \
-             strides exactly that"
+            32,
+            "the record the drain writes is two vec4<u32>s, and the shader's `array<vec4<u32>>` \
+             strides exactly one of them"
         );
 
         // The packing, round-tripped: a slot in the high bits, a local vertex id in the low ones, and
@@ -5435,8 +5437,8 @@ mod binding_visibility_tests {
             );
 
             // **The table the stage reads, and the record inside it.** `section_records` is a storage
-            // array at group 2, of a struct that must be the four words the Rust side writes in
-            // declaration order.
+            // array at group 2, of `vec4<u32>` elements - a record is two of them, read as two loads
+            // at `slot * 2` and `slot * 2 + 1`.
             let table = module
                 .global_variables
                 .iter()
@@ -5476,24 +5478,30 @@ mod binding_visibility_tests {
 
             assert_eq!(
                 record_stride, 16,
-                "{name}.wgsl's record array strides {record_stride} bytes, and the Rust record is \
-                 sixteen"
+                "{name}.wgsl's record array strides {record_stride} bytes, and a record is two \
+                 vec4<u32>s"
             );
 
-            let naga::TypeInner::Struct { members, .. } = &module.types[record_ty].inner else {
-                panic!("{name}.wgsl's record array does not hold a struct")
+            let naga::TypeInner::Vector {
+                size: record_width,
+                scalar,
+                ..
+            } = module.types[record_ty].inner
+            else {
+                panic!("{name}.wgsl's record array does not hold vec4s")
             };
 
             assert_eq!(
-                members.len(),
-                4,
-                "{name}.wgsl's `SectionRecord` has {} members, and the Rust one has four",
-                members.len()
+                record_width,
+                naga::VectorSize::Quad,
+                "{name}.wgsl's record array holds {}-component vectors, and the record is read as \
+                 two whole vec4 loads",
+                record_width as u8
             );
             assert_eq!(
-                module.types[record_ty].inner.size(module.to_ctx()),
-                16,
-                "{name}.wgsl's `SectionRecord` is not sixteen bytes"
+                scalar.kind,
+                naga::ScalarKind::Uint,
+                "{name}.wgsl's record array does not hold unsigned words"
             );
         }
     }

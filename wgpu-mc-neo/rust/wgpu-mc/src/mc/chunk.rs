@@ -167,7 +167,7 @@ pub const fn arena_slots(render_distance: u32) -> u32 {
     const RING: u32 = 2;
     /// How many sections deep a column of an ordinary world is meshed.
     const SECTIONS_PER_COLUMN: u32 = 3;
-    /// One section's vertices and indices, in u32 slots: about 80 KB, or 909 quads.
+    /// One section's vertices and indices, in u32 slots: about 84 KB, or 909 quads.
     ///
     /// It was **16 000**, and the water is why it is not any more. The measurement above is the pool at
     /// **79%** with only the solid and cutout layers in it, and the transparent layer is a whole layer
@@ -182,7 +182,13 @@ pub const fn arena_slots(render_distance: u32) -> u32 {
     /// section but a *column* that is all water from the surface to the floor, where the average is the
     /// only thing this constant can describe. What it does not cover is `WmRenderer::grow_arena`, which
     /// doubles the pool the moment a section does not fit - see `REFUSED`.
-    const SLOTS_PER_SECTION: u32 = 20_000;
+    ///
+    /// **21 000 rather than 20 000** because a quad is one slot heavier than it was: the packed
+    /// ambient-occlusion word every quad carries for the vertex stage's single-load corner read, and
+    /// the vec4 alignment slack every range is rounded up with (see `allocate_ranges`). One word in
+    /// twenty-two is four and a half percent, and a constant that undershoots by that much is one
+    /// more avoidable growth on the way to a world's steady state.
+    const SLOTS_PER_SECTION: u32 = 21_000;
 
     let capped = if render_distance > 64 {
         64
@@ -888,6 +894,19 @@ impl SectionStorage {
         let mut freed = Vec::new();
         let mut replaced_records = Vec::new();
 
+        // **The packed corner words, here rather than only at the bake.** The bake packs them on its
+        // worker thread, but the allocation sizes the vertex range from `vertices + ao` - so a layer
+        // that arrives without a tail (a direct call, a test, any path that predates the packing)
+        // would be allocated without room for the words its record names. One shape check per layer,
+        // against a tail that is four bytes a quad when it is present.
+        for layer in baked_layers.iter_mut() {
+            let expected = layer.vertices.len() / (Vertex::VERTEX_LENGTH * 4) * 4;
+
+            if layer.ao.len() != expected {
+                pack_quad_ao(layer);
+            }
+        }
+
         // **The cliff, checked while the bytes are still plain local ids.** One pass over the bake's
         // indices, which the packing loop below walks anyway, so the cost is a second read of memory
         // that is already resident - tens of thousands of u32 per section against a drain that runs
@@ -1002,6 +1021,11 @@ impl SectionStorage {
                     y: pos.y,
                     z: pos.z,
                     word_base: ranges.vertex_range.start,
+                    // The packed corner words sit directly after the packed quads, inside the same
+                    // allocation: the range was sized for the vertices, the tail and the vec4 slack
+                    // together. See `BakedLayer::ao` and the allocation's alignment note.
+                    ao_base: ranges.vertex_range.start + layer.vertices.len() as u32 / 4,
+                    _pad: [0; 3],
                 },
             );
         }
@@ -1154,7 +1178,7 @@ impl SectionStorage {
         self.parked
             .values()
             .flat_map(|parked| parked.layers.iter())
-            .map(|layer| layer.vertices.len() + layer.indices.len())
+            .map(|layer| layer.vertices.len() + layer.indices.len() + layer.ao.len())
             .sum()
     }
 
@@ -1338,20 +1362,33 @@ impl SectionStorage {
             let first = chosen.unwrap_or(self.current_arena as u32) as usize;
             let mut placed = None;
 
+            // **Every allocation is a multiple of four words, and that is the shader's alignment
+            // contract.** The vertex stage loads the arena as `array<vec4<u32>>` - the vertex the
+            // index names is one `vec4` load at `word_base / 4 + local_vertex` - and a `vec4` load
+            // is only defined where its byte offset is a multiple of sixteen, which makes every
+            // range *start* a multiple of four words. That holds by induction over the pool: it
+            // begins as one free range at word zero, and if every allocation hands back a
+            // four-multiple of words, every boundary the free list ever sees stays on one. So the
+            // packed quads (four words a vertex) plus the AO tail (one word a quad) plus the indices
+            // (six words a quad) are each rounded up to the next four words, and the rounding's
+            // slack - under three words a range - is allocated and never read.
+            let vertex_words = (layer.vertices.len() + layer.ao.len()) as u32 / 4;
+            let index_words = layer.indices.len() as u32 / 4;
+
             for step in 0..self.arenas.len() {
                 let arena_index = (first + step) % self.arenas.len();
                 let arena = &mut self.arenas[arena_index];
 
                 let Ok(vertices) = arena
                     .allocator
-                    .allocate_range(layer.vertices.len() as u32 / 4)
+                    .allocate_range(vertex_words.next_multiple_of(4))
                 else {
                     continue;
                 };
 
                 let Ok(indices) = arena
                     .allocator
-                    .allocate_range(layer.indices.len() as u32 / 4)
+                    .allocate_range(index_words.next_multiple_of(4))
                 else {
                     // Give the vertices back before trying the next arena: a range the allocator still
                     // believes is handed out is a piece of that arena that never comes back.
@@ -1384,6 +1421,14 @@ impl SectionStorage {
             chosen = Some(buffer);
             self.current_arena = buffer as usize;
 
+            debug_assert!(
+                vertices.start % 4 == 0 && indices.start % 4 == 0,
+                "the arena handed out a range not on a vec4 boundary: vertices at {}, indices at {} - \
+                 the terrain shaders load both as array<vec4<u32>>",
+                vertices.start,
+                indices.start
+            );
+
             layers.push(Some(SectionRanges {
                 vertex_range: vertices,
                 index_range: indices,
@@ -1394,8 +1439,9 @@ impl SectionStorage {
 
         // What one section of this world costs at its worst, which is the number `arena_slots` is
         // guessing at: a pool has to hold *every* section it keeps at once, and the constant in there is
-        // per section. One quad is twenty-two slots - four vertices of four words and six indices - so a
-        // section whose shell is a thousand quads is twenty-two thousand, three times the constant this
+        // per section. One quad is twenty-three slots - four vertices of four words, one packed
+        // corner word, six indices - plus the vec4 alignment slack of under one word a range, so a
+        // section whose shell is a thousand quads is twenty-three thousand, three times the constant this
         // path was written with.
         let slots = layers
             .iter()
@@ -2373,6 +2419,44 @@ pub static DIAGNOSTIC_LOGGING: std::sync::atomic::AtomicBool =
 pub struct BakedLayer {
     pub vertices: Vec<u8>,
     pub indices: Vec<u8>,
+    /// **One packed ambient-occlusion word per quad, four bytes each, appended in quad order.**
+    ///
+    /// The smooth-lighting blend the terrain fragment stage runs needs the occlusion count of all
+    /// four corners of a quad, and the packed vertex words carry one corner each - so the vertex
+    /// stage used to load all four corners' words per vertex to find them. This tail is what
+    /// replaces that: [`pack_quad_ao`] walks the packed quads and packs the four three-bit counts
+    /// into one word, and the drain uploads it right after the vertex data with the record's
+    /// `ao_base` naming where it landed. One load per vertex where there were four, and the four
+    /// vertices of a quad load the same word. See [`SectionRecord`](crate::mc::SectionRecord).
+    pub ao: Vec<u8>,
+}
+
+/// Packs each of a layer's quads' four corner occlusion counts into one word, into `layer.ao`.
+///
+/// The counts are read back out of the packed vertices themselves - the three bits above the
+/// normal in each vertex's third word, exactly what the shader used to load the four corners for -
+/// so this is a pure function of the vertex bytes and cannot disagree with them. Corner `i` of the
+/// quad lands in bits `i * 3..i * 3 + 3`, which is the order the shader unpacks into `ao1..ao4`.
+// `as_chunks` is nightly-only, which is the same trade the winding walk below made - see there.
+#[allow(clippy::chunks_exact_to_as_chunks)]
+pub fn pack_quad_ao(layer: &mut BakedLayer) {
+    const VERTEX_LENGTH: usize = crate::render::pipeline::Vertex::VERTEX_LENGTH;
+    const QUAD_BYTES: usize = VERTEX_LENGTH * 4;
+
+    layer.ao.clear();
+    layer.ao.reserve(layer.vertices.len() / QUAD_BYTES * 4);
+
+    for quad in layer.vertices.chunks_exact(QUAD_BYTES) {
+        let mut packed = 0u32;
+
+        for (corner, vertex) in quad.chunks_exact(VERTEX_LENGTH).enumerate() {
+            let word = u32::from_le_bytes([vertex[8], vertex[9], vertex[10], vertex[11]]);
+
+            packed |= ((word >> 29) & 0x7) << (corner as u32 * 3);
+        }
+
+        layer.ao.extend_from_slice(&packed.to_le_bytes());
+    }
 }
 
 /// The corner the ambient-occlusion sampling reads the world by, for one vertex of one face.
@@ -3002,6 +3086,14 @@ fn bake_layers<Provider: BlockStateProvider>(
     // **Only the translucent layer.** The solid and cutout layers are order-independent - they are
     // opaque, so the depth test decides - and sorting them would be work with no effect.
     sort_translucent_quads(&mut layers[RenderLayer::Transparent as usize]);
+
+    // **The packed corner words, after every quad the section will hold is in.** The fluid faces
+    // above and the translucent sort before this both leave the vertex bytes where they are - the
+    // sort reorders index groups, not vertices - so the packing here reads exactly the quads the
+    // section was baked with, whichever order the draw visits them in. See [`pack_quad_ao`].
+    for layer in &mut layers {
+        pack_quad_ao(layer);
+    }
 
     layers
 }
@@ -6052,7 +6144,11 @@ mod translucent_sort_tests {
             }
         }
 
-        BakedLayer { vertices, indices }
+        BakedLayer {
+            vertices,
+            indices,
+            ao: Vec::new(),
+        }
     }
 
     /// The distance a quad's centroid sits at, which is the key the sort is by.
@@ -6566,12 +6662,18 @@ mod face_culling_tests {
 mod arena_tests {
     use super::*;
 
-    /// How many `u32` slots one quad takes: four vertices of four words each, and six indices.
-    const QUAD_SLOTS: u32 = 4 * 4 + 6;
+    /// What one layer of `quads` quads costs the arena, **with the vec4 rounding the allocator
+    /// applies**: the packed quads (four words a vertex plus one corner word a quad) and the indices
+    /// are each rounded up to a four-multiple of words, which is what keeps every range start on a
+    /// vec4 boundary. See the alignment note in `allocate_ranges`.
+    fn layer_slots(quads: u32) -> u32 {
+        (quads * 17).next_multiple_of(4) + (quads * 6).next_multiple_of(4)
+    }
 
-    /// A pool that holds exactly `quads` quads and not one more, so a test can say what "full" means.
+    /// A pool that holds exactly `quads` **one-quad sections** and not one more, so a test can say
+    /// what "full" means.
     fn pool_for(quads: u32) -> u32 {
-        quads * QUAD_SLOTS
+        quads * layer_slots(1)
     }
 
     /// One layer of `quads` quads, in the shape the baker produces: four vertices and six indices,
@@ -6580,6 +6682,7 @@ mod arena_tests {
         BakedLayer {
             vertices: vec![0u8; quads * 4 * 4 * 4],
             indices: vec![0u8; quads * 6 * 4],
+            ao: Vec::new(),
         }
     }
 
@@ -6637,7 +6740,7 @@ mod arena_tests {
         );
         assert_eq!(
             storage.largest_free_run(),
-            QUAD_SLOTS,
+            layer_slots(1),
             "and the longest run is one section - nothing larger fits"
         );
     }
@@ -6724,15 +6827,20 @@ mod arena_tests {
         let second = IVec3::new(1, 0, 0);
         let third = IVec3::new(2, 0, 0);
         let mut layers = vec![layer(1), layer(2)];
-        let bytes: usize = layers
-            .iter()
-            .map(|held| held.vertices.len() + held.indices.len())
-            .sum();
 
         assert!(
             storage.allocate(second, &mut layers).is_none(),
             "the pool is full"
         );
+
+        // **After the allocate**, which is when the bytes are what the arena is holding: the
+        // allocate packs the corner words into a layer that arrived without them, so the held
+        // geometry is the vertices, the indices and the tail.
+        let bytes: usize = layers
+            .iter()
+            .map(|held| held.vertices.len() + held.indices.len() + held.ao.len())
+            .sum();
+
         assert!(storage.park(second, layers));
 
         assert_eq!(storage.parked_len(), 1);

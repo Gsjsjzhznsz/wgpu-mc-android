@@ -458,14 +458,23 @@ pub fn arena_buffer_slot_cap(max_buffer_size: u64, max_binding_size: u64) -> u32
 /// empty: a caller that asks for zero slots is answered with one buffer of zero slots is *not*
 /// answered at all - zero-sized buffers are refused - so the floor is one slot.
 pub fn split_arena_slots(slots: u32, per_arena: u32) -> Vec<u32> {
-    let per_arena = per_arena.max(1);
+    let per_arena = per_arena.max(4);
     let mut split = Vec::new();
-    let mut left = slots.max(1);
+    let mut left = slots.max(4);
 
     while left > 0 {
-        let take = left.min(per_arena);
+        // **Rounded down to a multiple of four words, and never below four.** The terrain shaders
+        // read an arena as `array<vec4<u32>>`, whose length is the buffer's size in whole vec4s - a
+        // buffer whose word count was not a multiple of four would have a tail the array cannot
+        // name, and an allocation that landed in that tail would read past the binding. Every
+        // allocation is a four-multiple of words (see `allocate_ranges`), so a buffer that is one
+        // never hands out its last three words. The floor is what a remainder of one to three words
+        // becomes - one last buffer at the vec4 minimum rather than a buffer the shaders' array type
+        // cannot name - so the sum lands on the ask rounded up to four words, a few bytes over at
+        // most.
+        let take = (left.min(per_arena) & !3).max(4);
         split.push(take);
-        left -= take;
+        left = left.saturating_sub(take);
     }
 
     split
@@ -541,11 +550,16 @@ pub const INDIRECT_DRAW_CAPACITY: usize = 24_000;
 pub const SECTION_DRAW_CAPACITY: usize = 1 << 15;
 
 /// One terrain draw's arguments, read by the vertex stage out of a storage table the section's
-/// record slot names: sixteen bytes, written once at bake and never again.
+/// record slot names: **thirty-two bytes, two `vec4<u32>`s**, written once at bake and never again.
 ///
-/// Four `u32`s. A struct with a `vec3` in it was the other shape this could have had and it is the
-/// one to avoid: `vec3<i32>` is sixteen bytes of storage for twelve bytes of data, and three scalars
-/// say what the four offsets are without anyone having to know the alignment rule.
+/// The table is declared `array<vec4<u32>>` in the shaders rather than an array of a struct, which is
+/// not a style choice: a `vec4` load is one memory operation, while a four-scalar struct read is four
+/// that the compiler is under no obligation to merge - and the terrain vertex stage loads this table
+/// once per vertex, where load/store pressure is the budget everything else is paid from.
+///
+/// Eight `u32`s. The second vector's three trailing words are padding, which keeps every record a
+/// whole number of vectors and the two reads of a record parallel: both are addressed by the slot
+/// alone, so neither waits on the other.
 ///
 /// **How a draw finds its record, and why it is not `first_instance`.** The record used to travel
 /// three ways, one per generation of this path: a storage binding indexed by
@@ -557,14 +571,25 @@ pub const SECTION_DRAW_CAPACITY: usize = 1 << 15;
 /// section for the whole of android.26-28. The channel that survives on every driver is the one the
 /// per-section fallback always used: **the index buffer itself**. Each section's indices are baked
 /// with its record slot in the bits above the local vertex id - see [`RECORD_ID_SHIFT`] - so the
-/// shader reads `section_records[vi >> RECORD_ID_SHIFT]` and the indirect record needs no per-draw
-/// channel at all: `first_instance` and `base_vertex` are zero in every record, on every path.
+/// shader reads `section_records[(vi >> RECORD_ID_SHIFT) * 2..]` and the indirect record needs no
+/// per-draw channel at all: `first_instance` and `base_vertex` are zero in every record, on every path.
 ///
 /// **The position is absolute now, and the camera subtraction is the shader's.** A record written
 /// once at bake cannot carry the camera-relative offset the per-frame record carried, so `x`, `y`
 /// and `z` are the section's own coordinates and the shader subtracts the camera's section, which
 /// travels in the pass' immediate. Three integer subtractions per vertex buy a record upload that
 /// happens per bake instead of per frame.
+///
+/// **`ao_base` is the second half of the vertex stage's load budget.** The smooth-lighting blend the
+/// fragment stage runs needs the occlusion count of *all four corners* of the quad, and the previous
+/// layout had them scattered one per vertex - so every vertex loaded all four corners' words to find
+/// them, four extra loads a vertex that were the same four for every vertex of the quad. The bake now
+/// packs the four counts into one word per quad (three bits a corner, the same bits each vertex
+/// carried), and the words live in the arena right after the record's vertex data - so the vertex
+/// stage loads one word where it loaded four, and the four vertices of a quad load the *same* word.
+/// `ao_base` is where that run starts, in u32 words from the arena buffer's start: the data the bake
+/// wrote is `vertices` bytes of packed quads, then `ao` bytes of packed corner words, so the base is
+/// the vertex range's start plus the packed quads' length in words. See `BakedLayer` in `mc/chunk.rs`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SectionRecord {
@@ -574,8 +599,17 @@ pub struct SectionRecord {
     pub y: i32,
     pub z: i32,
     /// The u32 slot in the arena the section's vertices start at, which is what `chunk_data` is
-    /// indexed by in the shader: the vertex the index names is at `word_base + local_vertex * 4`.
+    /// indexed by in the shader: the vertex the index names is the `vec4` at
+    /// `word_base / 4 + local_vertex`. **The base is a multiple of four words**, which is what makes
+    /// that a `vec4` index and not an unaligned one - see the alignment invariant in
+    /// `SectionStorage::allocate_ranges`.
     pub word_base: u32,
+    /// The u32 slot in the arena the record's packed ambient-occlusion words start at: quad `q`'s
+    /// word is the one at `ao_base + q`, loaded as the `vec4` at `ao_base / 4`-ish and picked apart
+    /// by the low two bits of the word index. See [`SectionRecord`] for why the words exist.
+    pub ao_base: u32,
+    /// Padding, so a record is two whole `vec4<u32>`s and the two reads of it stay independent.
+    pub _pad: [u32; 3],
 }
 
 /// The bits of an index value above the local vertex id, which carry the section's record slot.

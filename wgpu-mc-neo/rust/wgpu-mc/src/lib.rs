@@ -653,11 +653,23 @@ impl WmRenderer {
                     // lists are kept in step, so it is a bug rather than a state, and skipping one range
                     // beats panicking mid-drain.
                     //
-                    // Vertices and indices, in whichever order they are laid out: a free-list allocator
-                    // can hand out the index range before the vertex range, and a run has to be in
-                    // ascending offsets to be one write.
+                    // Vertices, the packed corner words and the indices, in whichever order they are
+                    // laid out: a free-list allocator can hand out the index range before the vertex
+                    // range, and a run has to be in ascending offsets to be one write. The corner
+                    // words are a tail of the *vertex* allocation - they live directly after the
+                    // packed quads, which is where the record's `ao_base` names them - so their
+                    // range is derived here rather than carried in `SectionRanges`, and the run
+                    // merge folds it into the same write as the vertices.
+                    let data_words = layers[i].vertices.len() as u32 / 4;
+                    let ao_words = layers[i].ao.len() as u32 / 4;
+
                     let mut pieces = [
                         (ranges.vertex_range.clone(), &layers[i].vertices),
+                        (
+                            (ranges.vertex_range.start + data_words)
+                                ..(ranges.vertex_range.start + data_words + ao_words),
+                            &layers[i].ao,
+                        ),
                         (ranges.index_range.clone(), &layers[i].indices),
                     ];
 
@@ -1267,21 +1279,33 @@ mod arena_budget_tests {
         let cap = arena_buffer_slot_cap(1 << 30, 128 * 1024 * 1024);
 
         // The pool from the log, and one that fits without a split, and one smaller than a slot's
-        // worth of cap arithmetic - each buffer under the cap, the total the pool that was asked for.
+        // worth of cap arithmetic - each buffer under the cap, the total the pool that was asked for
+        // **rounded up to the four-word floor and the four-word alignment**: every buffer is a
+        // four-multiple of words now (the terrain shaders read the arena as `array<vec4<u32>>`, so a
+        // buffer with a tail its words cannot name is one an allocation could land past - see
+        // `split_arena_slots`), which puts the sum at or a few words above the ask and never below
+        // one buffer's floor.
         for slots in [50_460_000, cap, cap - 1, 1] {
             let split = split_arena_slots(slots, cap);
 
-            assert_eq!(split.iter().map(|&s| s as u64).sum::<u64>(), slots as u64);
-            assert!(split.iter().all(|&s| s <= cap && s > 0), "{split:?}");
+            assert_eq!(
+                split.iter().map(|&s| s as u64).sum::<u64>(),
+                slots.max(4).next_multiple_of(4) as u64
+            );
+            assert!(
+                split.iter().all(|&s| s <= cap && s > 0 && s % 4 == 0),
+                "{split:?}"
+            );
         }
 
         // Two of the log's pool: 128 MiB, then the 58 MB the view still wanted.
         let split = split_arena_slots(50_460_000, cap);
         assert_eq!(split, vec![33_554_432, 16_905_568]);
 
-        // A zero-slot ask is one slot, because a zero-sized buffer is a refused one and the callers
-        // build a buffer per entry.
-        assert_eq!(split_arena_slots(0, cap), vec![1]);
+        // A zero-slot ask is one buffer at the four-word floor, because a zero-sized buffer is a
+        // refused one, the callers build a buffer per entry, and a buffer smaller than one vec4 is
+        // one the shaders' array type cannot name.
+        assert_eq!(split_arena_slots(0, cap), vec![4]);
     }
 
     /// **The budget is whichever of the device and the policy is smaller**, which is the whole of the fix
@@ -1465,6 +1489,8 @@ mod record_upload_tests {
             y: x * 2,
             z: x * 3,
             word_base,
+            ao_base: word_base + 16,
+            _pad: [0; 3],
         }
     }
 

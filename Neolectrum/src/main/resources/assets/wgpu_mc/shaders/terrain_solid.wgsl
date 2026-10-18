@@ -180,21 +180,17 @@ struct FogEnvironment {
 
 @group(0) @binding(9) var<uniform> fog: FogEnvironment;
 
-@group(1) @binding(0) var<storage> chunk_data: array<u32>;
+@group(1) @binding(0) var<storage, read> chunk_data: array<vec4<u32>>;
 
 // **The section-record table**, the same binding `terrain.wgsl` declares and the full note beside it:
-// one `SectionRecord` per record slot, written once per bake, found through the slot the draw's own
-// indices carry in their high bits. This shader has no `discard` and no test in it - the solid layer's
+// two `vec4<u32>`s per record slot, written once per bake, found through the slot the draw's own
+// indices carry in their high bits. Vector 0 is the section's `x`, `y`, `z` and `word_base`; vector 1
+// is `ao_base` - the packed corner words the bake wrote into the arena after the vertex data - with
+// three words of padding. This shader has no `discard` and no test in it - the solid layer's
 // whole reason to exist - and it reads the same records through the same group because the two shaders
 // draw one world.
-struct SectionRecord {
-    x: i32,
-    y: i32,
-    z: i32,
-    word_base: u32,
-}
 
-@group(2) @binding(0) var<storage> section_records: array<SectionRecord>;
+@group(2) @binding(0) var<storage, read> section_records: array<vec4<u32>>;
 
 // **What one draw of this pass reads, and where from: the indices, not the input assembler.** The
 // same story as `terrain.wgsl`, which is where the full note is - the record travelled as an
@@ -226,10 +222,11 @@ struct VertexResult {
     // So the two are gone rather than kept at zero: a varying that is always zero reads as "something
     // should be filling this in", and the next person to look at it has to do this same search to find
     // out that nothing should.
-    @interpolate(flat) @location(12) ao1: f32,
-    @interpolate(flat) @location(13) ao2: f32,
-    @interpolate(flat) @location(14) ao3: f32,
-    @interpolate(flat) @location(15) ao4: f32,
+    // **The quad's four corner occlusion counts, packed** - one flat u32 where four flat f32s were,
+    // corner `i` in bits `i * 3..i * 3 + 3`, unpacked by the fragment stage. The full note is in
+    // `terrain.wgsl`, whose values this file has to match; the packing is what cut the varyings the
+    // fragment reads from eleven to five.
+    @interpolate(flat) @location(12) ao: u32,
     @location(16) light_uv: vec2<f32>,
     // The light at this vertex, fetched from the game's lightmap by the vertex stage - which is where
     // the game's own terrain shader fetches it, so the rasterizer interpolates the *colour*, exactly as
@@ -239,22 +236,12 @@ struct VertexResult {
     // as the game's own varyings are: the fog is applied per pixel from a per-vertex distance.
     @location(20) fog_distances: vec2<f32>,
     @location(18) color: vec4<f32>,
-    // Which atlas `tex_coords` is in: bit 0 of the ten the vertex format reserves for an animated
-    // texture. Flat, because it is a property of the face and not of the corner: every vertex of a
-    // quad carries the same answer, and the fragment stage selects between the two atlases with it.
-    // It is **not** branched on - see the sampling note in the fragment stage, where a `textureSample`
-    // under an `if` would be undefined behaviour whatever this varying says.
-    @interpolate(flat) @location(19) game_atlas: u32,
-    // Whether the game animates this face's sprite: bit 1 of the same ten, `UV_ANIMATED`. Flat for the same
-    // reason, and it is what scopes the level-of-detail offset in the fragment stage - a coarse mip of a
-    // *moving* sprite is a moving average and a still one's is a fixed pyramid. The full note is in
-    // `terrain.wgsl`, which this file is the solid-layer half of and whose values have to match.
-    //
-    // 21 and not 20: 20 is `fog_distances` above.
-    @interpolate(flat) @location(21) animated: u32,
-    // How many levels this face may be pushed down the chain, decoded in the vertex stage because the
-    // bits live in `v3` and `v3` is a vertex-local. Flat for the same reason the two above are.
-    @interpolate(flat) @location(22) lod_floor: u32
+    // **Which atlas `tex_coords` is in, whether the game animates this face's sprite, and the face's
+    // level-of-detail floor - one packed flat u32**, the same layout `terrain.wgsl`'s varying uses:
+    // bit 0 the atlas, bit 1 animated, bit 2 the mipped cutout (a flag the solid layer never sets
+    // and never reads, packed here so the two shaders carry one shape), bits 3..7 the floor. The
+    // fragment stage unpacks with the same three shifts.
+    @interpolate(flat) @location(19) flags: u32,
 };
 
 // What one terrain draw is told about itself **beyond its own draw record**: the alpha cutoff its
@@ -310,34 +297,27 @@ fn vert(
 //    var vert1_i = ((vi >> 2u) << 2u)+base_vertex;
 
     // The record slot out of the index's high bits, the local vertex id out of the rest - the decode
-    // `terrain.wgsl`'s vertex stage carries the full note for.
-    let record = section_records[vi >> 17u];
+    // `terrain.wgsl`'s vertex stage carries the full note for. **Four loads a vertex, where there
+    // were nine**: two record vectors (parallel, addressed by the slot alone), the vertex's own data
+    // as one `vec4`, and the quad's packed corner word - the same one for all four vertices of the
+    // quad, replacing the four scalar corner loads.
+    let slot = vi >> 17u;
+    let head = section_records[slot * 2u];
+    let tail = section_records[slot * 2u + 1u];
     let local_vertex = vi & 0x1ffffu;
 
-    let base_vertex = record.word_base;
-    var offset = local_vertex & 3u;
-    var vert1_i = local_vertex & ~3u;
+    let word_base = head.w;
+    let data = chunk_data[(word_base >> 2u) + local_vertex];
+    let v1 = data.x;
+    let v2 = data.y;
+    let v3 = data.z;
+    let v4 = data.w;
 
-    var id = ((vert1_i + offset) << 2u) + base_vertex;
-
-    var vert1_base = ((vert1_i) << 2u) + base_vertex;
-
-    // **The ambient-occlusion count of each corner of this quad, straight out of the vertex**: how many
-    // of the four blocks around that corner fill their whole block. The curve is applied in the fragment
-    // stage, where the four are blended - see there for why.
-    //
-    // Three bits, because four is as high as the count goes. Those bits used to be the position's "this
-    // coordinate is exactly 16" flags, and the position used to hold its own count here; the two swapped
-    // when the position needed eight more bits an axis than a byte could hold.
-    var vert1_v3 = chunk_data[vert1_base + 2u];
-    var vert2_v3 = chunk_data[vert1_base + 6u];
-    var vert3_v3 = chunk_data[vert1_base + 10u];
-    var vert4_v3 = chunk_data[vert1_base + 14u];
-
-    var v1_ao = f32((vert1_v3 >> 29u) & 0x7u);
-    var v2_ao = f32((vert2_v3 >> 29u) & 0x7u);
-    var v3_ao = f32((vert3_v3 >> 29u) & 0x7u);
-    var v4_ao = f32((vert4_v3 >> 29u) & 0x7u);
+    // **The ambient-occlusion count of each corner of this quad, one packed word.** Corner `i` in
+    // bits `i * 3..i * 3 + 3`, straight out of the same third-word bits this stage used to load the
+    // four corners for. See the packed varying on `VertexResult` for where they go.
+    let ao_word = tail.x + (local_vertex >> 2u);
+    let ao_packed = chunk_data[ao_word >> 2u][ao_word & 3u];
 
     var uv = array<vec2<f32>,4>(
             vec2(1.0,1.0),
@@ -348,17 +328,9 @@ fn vert(
     var light_uv = uv[vi & 3];
 
     var vr: VertexResult;
-    vr.ao1 = v1_ao;
-    vr.ao2 = v2_ao;
-    vr.ao3 = v3_ao;
-    vr.ao4 = v4_ao;
+    vr.ao = ao_packed;
 
     vr.light_uv = light_uv;
-
-    var v1 = chunk_data[id];
-    var v2 = chunk_data[id + 1u];
-    var v3 = chunk_data[id + 2u];
-    var v4 = chunk_data[id + 3u];
 
     // **Sixteen bits an axis, at 1/2048 of a block.** That is the scale VulkanMod's compressed terrain
     // vertex uses for the same three numbers (`POSITION_INV = 1.0 / 2048.0`), and it is eight bits an axis
@@ -399,6 +371,10 @@ fn vert(
     let animated = (v3 >> 17u) & 1u;
     // The level-of-detail floor: four bits at bit 18, written by the bake. See `UV_LOD_FLOOR_SHIFT`.
     let lod_floor = (v3 >> 18u) & 0xfu;
+    // And the mipped-cutout bit, two bits above the floor's four: bit 6 of the flag half, which is
+    // bit 22 of `v3`. A flag the solid layer's faces never carry and its fragment never reads,
+    // decoded so the packed varying below is the same seven bits `terrain.wgsl` writes.
+    let mipped = (v3 >> 22u) & 1u;
     let uv_scale = select(0.00048828125, 1.0 / 65535.0, game_atlas == 1u);
 
     // The half-texel shift, which is under test and is explained in full in `terrain.wgsl`. Selected with
@@ -418,10 +394,13 @@ fn vert(
 
     // The record's absolute position, made camera-relative here - see the note in `terrain.wgsl`'s
     // vertex stage, which is where the reasoning lives and this is the same three subtractions.
+    // The record's words are unsigned and the camera's section is signed, so the subtraction is
+    // i32 - i32: section coordinates fit an i32 by definition, and a u32-i32 mix is a shader that
+    // does not validate.
     var section_origin = vec3<f32>(
-        f32(record.x - section_pos.camera_section.x),
-        f32(record.y - section_pos.camera_section.y),
-        f32(record.z - section_pos.camera_section.z),
+        f32(i32(head.x) - section_pos.camera_section.x),
+        f32(i32(head.y) - section_pos.camera_section.y),
+        f32(i32(head.z) - section_pos.camera_section.z),
     ) * 16.0;
     var world_pos = pos + section_origin;
 
@@ -440,9 +419,9 @@ fn vert(
     vr.pos.y = -vr.pos.y;
 
     vr.tex_coords = vec2<f32>(u, v);
-    vr.game_atlas = game_atlas;
-    vr.animated = animated;
-    vr.lod_floor = lod_floor;
+    // The face flags, packed: bit 0 the atlas, bit 1 animated, bit 2 the mipped cutout, bits 3..7
+    // the level-of-detail floor. See the varying's note on `VertexResult`.
+    vr.flags = game_atlas | (animated << 1u) | (mipped << 2u) | (lod_floor << 3u);
 
     // The lighting, fetched the way the game's own terrain shader fetches it: one lightmap texel per
     // vertex, and the rasterizer interpolates the *colour*, which is what `vertexColor = Color *
@@ -540,10 +519,14 @@ fn fragment_geometry(in: VertexResult, atlas_texel: f32) -> FragmentGeometry {
     // to agree with it: these two shaders draw one world.
     const LOD_FLOOR_IS_LEVEL_ZERO: bool = false;
 
+    // The packed face flags, unpacked here: bit 1 is `animated`, bits 3..7 the floor.
+    let animated = (in.flags >> 1u) & 1u;
+    let lod_floor = (in.flags >> 3u) & 0xfu;
+
     let floor = select(
         0.0,
-        select(64.0, f32(in.lod_floor), !LOD_FLOOR_IS_LEVEL_ZERO),
-        in.animated == 1u && !magnified,
+        select(64.0, f32(lod_floor), !LOD_FLOOR_IS_LEVEL_ZERO),
+        animated == 1u && !magnified,
     );
 
     let bias = section_pos.lod_bias - floor;
@@ -570,7 +553,15 @@ fn fragment_geometry(in: VertexResult, atlas_texel: f32) -> FragmentGeometry {
 /// draws the opaque group with, and the same split the game makes. See `terrain_layers` in `graph.rs`,
 /// which is where a layer is paired with the pipeline that draws it.
 fn shade(in: VertexResult, texel: vec4<f32>) -> vec4<f32> {
-    var occluders = mix(mix(in.ao3, in.ao4, in.light_uv.x), mix(in.ao2, in.ao1, in.light_uv.x), in.light_uv.y);
+    // The corners arrive **packed** - one flat u32 varying, three bits a corner, corner `i` in bits
+    // `i * 3..i * 3 + 3` - and unpack to the same four numbers the four f32 varyings carried.
+    let ao_packed = in.ao;
+    let ao1 = f32(ao_packed & 7u);
+    let ao2 = f32((ao_packed >> 3u) & 7u);
+    let ao3 = f32((ao_packed >> 6u) & 7u);
+    let ao4 = f32((ao_packed >> 9u) & 7u);
+
+    var occluders = mix(mix(ao3, ao4, in.light_uv.x), mix(ao2, ao1, in.light_uv.x), in.light_uv.y);
     var ao = 1.0 - 0.2 * occluders;
 
     // The light is a colour now, not a number: the game's lightmap has a colour in it, and the game's
@@ -597,20 +588,23 @@ fn frag(
     // Which atlas this face samples, and the whole of what the flag does. The full note is in
     // `terrain.wgsl`, and this is a copy of its shape: one `select` for the *number* the level is
     // computed from, then real branches over fetches at explicit levels.
+    let game_atlas = in.flags & 1u;
+    let animated = (in.flags >> 1u) & 1u;
+
     let pixel_size = select(
         vec2<f32>(section_pos.texel_ours, section_pos.texel_ours),
         vec2<f32>(section_pos.texel_game, section_pos.texel_game),
-        in.game_atlas == 1u,
+        game_atlas == 1u,
     );
 
     let fg = fragment_geometry(in, min(pixel_size.x, pixel_size.y));
 
     var texel: vec4<f32>;
 
-    if in.game_atlas == 1u {
+    if game_atlas == 1u {
         if fg.magnified {
             texel = sample_at_level(t_game_atlas_magnify, t_game_sampler_magnify, fg.geometry, section_pos.use_rgss);
-        } else if in.animated == 1u {
+        } else if animated == 1u {
             texel = sample_at_level(t_game_atlas_animated, t_game_sampler_animated, fg.geometry, section_pos.use_rgss);
         } else {
             texel = sample_at_level(t_game_atlas, t_game_sampler, fg.geometry, section_pos.use_rgss);
@@ -618,7 +612,7 @@ fn frag(
     } else {
         if fg.magnified {
             texel = sample_at_level(t_texture_magnify, t_sampler_magnify, fg.geometry, section_pos.use_rgss);
-        } else if in.animated == 1u {
+        } else if animated == 1u {
             texel = sample_at_level(t_texture_animated, t_sampler_animated, fg.geometry, section_pos.use_rgss);
         } else {
             texel = sample_at_level(t_texture, t_sampler, fg.geometry, section_pos.use_rgss);
@@ -635,13 +629,15 @@ fn frag(
 fn frag_game_atlas(
     in: VertexResult
 ) -> @location(0) vec4<f32> {
+    let animated = (in.flags >> 1u) & 1u;
+
     let fg = fragment_geometry(in, section_pos.texel_game);
 
     var texel: vec4<f32>;
 
     if fg.magnified {
         texel = sample_at_level(t_game_atlas_magnify, t_game_sampler_magnify, fg.geometry, section_pos.use_rgss);
-    } else if in.animated == 1u {
+    } else if animated == 1u {
         texel = sample_at_level(t_game_atlas_animated, t_game_sampler_animated, fg.geometry, section_pos.use_rgss);
     } else {
         texel = sample_at_level(t_game_atlas, t_game_sampler, fg.geometry, section_pos.use_rgss);

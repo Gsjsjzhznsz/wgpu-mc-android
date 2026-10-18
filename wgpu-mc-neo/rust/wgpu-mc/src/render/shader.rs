@@ -32,14 +32,12 @@ impl WgslShader {
     /// `create_shader_module` asks naga to make the shader safe against itself: every indexing of a
     /// runtime-sized array gets an `arrayLength` load and a `min` in front of it, so that an
     /// out-of-range index reads the last element (or zero) instead of whatever is past the binding.
-    /// **For this renderer's terrain shaders that is eight clamped loads per vertex**, all into the
-    /// section arena, which is bound as one buffer with `min_binding_size: None`, so the length the
-    /// clamp compares against is the *whole* arena. The check can therefore only ever fire on an index
-    /// that is wrong by more than the entire arena, which is not a mistake the indices can make: they
-    /// are `word_base` (the slot the Rust baker allocated) plus offsets into the section it baked
-    /// there. The draw record - the other per-draw value - is a vertex attribute now, fetched by the
-    /// input assembler, which has no `arrayLength` to clamp and needs none: the record buffer is
-    /// `SECTION_DRAW_CAPACITY` records and nothing indexes past the fetch.
+    /// **For this renderer's terrain shaders that is four clamped loads per vertex**, all into the
+    /// section arena and the record table, which are bound with `min_binding_size: None`, so the
+    /// length the clamp compares against is the *whole* buffer. The check can therefore only ever
+    /// fire on an index that is wrong by more than the entire arena, which is not a mistake the
+    /// indices can make: they are `word_base` (the slot the Rust baker allocated) plus offsets into
+    /// the section it baked there, and the record vectors are named by the slot alone.
     ///
     /// So the promise this makes is a real one and it is about *this* repository's shaders: **every
     /// storage buffer here is addressed by a value the baker or the pass computed to be in range, and
@@ -65,11 +63,11 @@ impl WgslShader {
 
         // SAFETY: the two promises above. The one buffer these shaders index is `chunk_data` (the
         // arena), written by this side; the values indexed with are the section's slot in the arena,
-        // and no shader here loops without a bound it can see. The draw record is fetched as a vertex
-        // attribute, which no index reaches. Note what is *not* claimed: nothing verifies this at run
-        // time any more, so a change that makes an index unbounded is a change that has to be made
-        // carefully - see the tests in `graph.rs` that pin the sizes and the shapes these indices
-        // depend on.
+        // and no shader here loops without a bound it can see. The record table's two vectors and
+        // the packed corner word are named by the same slot and by the allocation the slot was sized
+        // for. Note what is *not* claimed: nothing verifies this at run time any more, so a change
+        // that makes an index unbounded is a change that has to be made carefully - see the tests
+        // in `graph.rs` that pin the sizes and the shapes these indices depend on.
         let module = unsafe {
             device.create_shader_module_trusted(
                 ShaderModuleDescriptor {
@@ -225,27 +223,32 @@ mod unguarded_index_tests {
     ///
     /// `WgslShader::init` builds its modules with `ShaderRuntimeChecks::unchecked()`, so naga adds no
     /// clamp in front of any of these - that is the point of it, and on the terrain's vertex stage it is
-    /// eight clamped `arrayLength` loads per vertex saved. What it turns into is a list somebody has to
-    /// keep: an index expression that is not bounded by construction is a read past the binding, and
-    /// this table is where that is true.
+    /// the load/store work of the one stage that runs per vertex, unclamped. What it turns into is a
+    /// list somebody has to keep: an index expression that is not bounded by construction is a read
+    /// past the binding, and this table is where that is true.
     ///
-    /// Into the arena, all eight per terrain shader: the four corners of the quad this vertex belongs
-    /// to, read twice - once for the occlusion count packed into each corner's fourth word, and once
-    /// for the position, the light and the colour. Every one is `word_base + k` for `k` in `0..16`,
-    /// where `word_base` is the arena slot the pass wrote into the draw's record - which travels as a
-    /// vertex attribute, fetched by the input assembler and indexed by nothing; see the shader and
-    /// `SectionDraw` for why those are in range.
+    /// Into the arena, **five index expressions per terrain shader**: the two record vectors (the
+    /// section's origin and base in one, its packed-corner base in the other), the vertex's own four
+    /// words as one `vec4`, and the quad's packed ambient-occlusion word - which is *one* memory
+    /// operation written as a chain of two IR accesses, the vector and then its component. Every
+    /// one is `word_base + k` for `k` in `0..17`, where `word_base` is the arena slot the pass wrote
+    /// into the draw's record - which travels in the indices, and `allocate_ranges` rounds every
+    /// range to a four-multiple of words so the `vec4` addressing lands inside the record's own
+    /// allocation. See the shaders and `SectionRecord` for why those are in range.
     ///
-    /// Asserted rather than described because **the numbers are load-bearing now**: with the checks on, a
-    /// read that went out of range was clamped and the picture was merely wrong. This is what says the
-    /// counts out loud, so a change that adds one has to come here and say why it is safe.
+    /// **Nine used to be the number** - the four corner loads a vertex paid for its quad's smooth
+    /// lighting, twice over, on top of four scalar vertex words and the record. The packed corner
+    /// tail and the vector loads are what cut it, and the count is asserted rather than described
+    /// because the numbers are load-bearing: with the checks on, a read that went out of range was
+    /// clamped and the picture was merely wrong. This is what says the counts out loud, so a change
+    /// that adds one has to come here and say why it is safe.
     ///
     /// A file that is not in this table must have none, which is the half that catches a *new* shader.
     ///
     /// The files are read out of the Neolectrum checkout, so a clone of this repository that has never
     /// seen the mod skips the check rather than failing it; see `wgpu_mc_modtree`.
     const UNGUARDED_STORAGE_READS: &[(&str, usize)] =
-        &[("entity", 1), ("terrain", 9), ("terrain_solid", 9)];
+        &[("entity", 1), ("terrain", 5), ("terrain_solid", 5)];
 
     #[test]
     fn the_shaders_this_crate_builds_index_a_storage_buffer_only_where_it_is_listed() {
@@ -319,9 +322,10 @@ mod unguarded_index_tests {
     ///
     /// The table above holds the counts; this holds the *shape* of the one that was counted, because the
     /// number alone does not say which stage pays for it - and it is the vertex stage, once per vertex,
-    /// that made nine worth removing.
+    /// that made the count worth cutting from nine to five (the fifth being the corner word's
+    /// component pick, which is one memory operation the IR writes as two accesses).
     #[test]
-    fn the_terrain_vertex_stage_is_where_the_nine_reads_are() {
+    fn the_terrain_vertex_stage_is_where_the_five_reads_are() {
         let Some(terrain) = modtree::shader("terrain") else {
             modtree::skip("the unguarded-index checks");
             return;

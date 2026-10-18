@@ -99,15 +99,16 @@ struct FogEnvironment {
 
 @group(0) @binding(9) var<uniform> fog: FogEnvironment;
 
-@group(1) @binding(0) var<storage> chunk_data: array<u32>;
+@group(1) @binding(0) var<storage, read> chunk_data: array<vec4<u32>>;
 
 /// **What one draw of this pass reads about its section, and the third channel the per-draw data has
-/// had.** One `SectionRecord` per record slot, sixteen bytes, written once per bake and never again.
+/// had.** Two `vec4<u32>`s per record slot in one flat array, written once per bake and never again.
 ///
 /// The channel a draw finds its record through is **the index buffer itself**: every baked index is
 /// `(record_slot << 17) | local_vertex`, so `vi >> 17` names the record and `vi & 0x1ffff` names the
-/// vertex within the section - one storage fetch, and no input-assembler state at all. The two
-/// channels before this one both died on the same Adreno 640: a storage binding indexed by
+/// vertex within the section - and the table is read as two whole-vector loads at
+/// `section_records[(vi >> 17) * 2]` and `+ 1`, one memory operation each. The two channels before
+/// this one both died on the same Adreno 640: a storage binding indexed by
 /// `@builtin(instance_index)` drew a hollow world because the driver accepted a non-zero
 /// `firstInstance` and did not carry it into the builtin, and the instance-step attribute that
 /// replaced it drew the same hollow world because the driver does not carry `firstInstance` into the
@@ -115,19 +116,35 @@ struct FogEnvironment {
 /// already proven on every device this renderer runs on - a draw's `first_index` is what selects its
 /// own slice of the arena's index buffer, and that has never been optional.
 ///
+/// **Why vectors and not a struct.** The vertex stage loads this table once per vertex, and the
+/// load/store pressure of that stage is the budget everything else is paid from: a `vec4` load is
+/// one operation, a four-scalar struct read is four that no compiler is obliged to merge. Vector 0
+/// carries the section's `x`, `y`, `z` and `word_base`; vector 1 carries `ao_base` in its first
+/// word, with three words of padding so a record is two whole vectors and the two loads stay
+/// independent of each other.
+///
 /// **The position is absolute, and the camera subtraction is `section_pos.camera_section`'s job.** A
 /// record written at bake time cannot know where the camera will be, so `x`, `y` and `z` are the
 /// section's own coordinates and the vertex stage subtracts the camera's section, which travels in
 /// the pass immediate. Three integer subtractions per vertex are what a per-frame record upload used
 /// to cost the CPU.
-struct SectionRecord {
-    x: i32,
-    y: i32,
-    z: i32,
-    word_base: u32,
-}
+///
+/// **`ao_base` names the packed corner words that replaced the four corner loads.** The
+/// smooth-lighting blend in the fragment stage needs the occlusion count of all four corners of the
+/// quad; the vertex words carry one corner each, so this stage used to load all four corners'
+/// third words per vertex - the same four, four times a quad. The bake now packs the four
+/// three-bit counts into one word per quad and writes the words into the arena right after the
+/// record's vertex data; `ao_base` is where that run starts, in u32 words, so quad `q`'s packed
+/// word is the one at `ao_base + q`, read as the `vec4` at `(ao_base + q) / 4` with its component
+/// picked by the low two bits. One load a vertex where there were four, and the four vertices of a
+/// quad read the same word.
+///
+/// `chunk_data` above is `array<vec4<u32>>` for the same reason and by the same contract: the
+/// arena's ranges are all multiples of four words (`allocate_ranges` rounds them there), so
+/// `word_base / 4` is an exact vector index and the vertex the index names is the vector at
+/// `word_base / 4 + local_vertex`.
 
-@group(2) @binding(0) var<storage> section_records: array<SectionRecord>;
+@group(2) @binding(0) var<storage, read> section_records: array<vec4<u32>>;
 
 // **What one draw of this pass reads, and where from.** Nothing per draw arrives through the input
 // assembler at all: the pipelines declare no vertex buffers, and the draw's only per-draw inputs are
@@ -175,40 +192,36 @@ struct VertexResult {
     // So the two are gone rather than kept at zero: a varying that is always zero reads as "something
     // should be filling this in", and the next person to look at it has to do this same search to find
     // out that nothing should.
-    @interpolate(flat) @location(12) ao1: f32,
-    @interpolate(flat) @location(13) ao2: f32,
-    @interpolate(flat) @location(14) ao3: f32,
-    @interpolate(flat) @location(15) ao4: f32,
+    // **The quad's four corner occlusion counts, packed.** One flat u32 where four flat f32s used to
+    // be: three bits a corner, corner `i` in bits `i * 3..i * 3 + 3`, in the order the fragment
+    // stage unpacks into `ao1..ao4` for the blend. The counts were four separate varyings, and a
+    // varying is read by every fragment of the quad - a packed word is a quarter of that traffic
+    // for the same four numbers, and the unpack is three shifts in a stage that was already doing
+    // the multiplies.
+    //
+    // The word itself is loaded once per vertex out of the packed corner tail the bake wrote (see
+    // `section_records`' note) - and the four vertices of a quad load the same word, so three of
+    // the four are cache hits.
+    @interpolate(flat) @location(12) ao: u32,
     @location(16) light_uv: vec2<f32>,
     // The light at this vertex, fetched from the game's lightmap by the vertex stage - which is where
     // the game's own terrain shader fetches it, so the rasterizer interpolates the *colour*, exactly as
     // it does for the game's terrain.
     @location(5) light_color: vec3<f32>,
+    // **Which atlas `tex_coords` is in, whether the game animates this face's sprite, whether the
+    // face is a mipped cutout, and the face's level-of-detail floor - one packed flat u32.** Bit 0
+    // is `game_atlas`, bit 1 `animated`, bit 2 `mipped`, bits 3..7 the four-bit floor: four
+    // varyings of face-level facts in one, unpacked by the fragment stage with the same three
+    // shifts. Flat, because every member is a property of the face and not of the corner: every
+    // vertex of a quad carries the same answer, and the fragment stage selects with it.
+    //
+    // The atlas flag is **not** branched on - see the sampling note in the fragment stage, where a
+    // `textureSample` under an `if` would be undefined behaviour whatever this varying says.
+    @interpolate(flat) @location(19) flags: u32,
     // How far this vertex is from the camera, the two ways the game measures it for fog. Interpolated,
     // as the game's own varyings are: the fog is applied per pixel from a per-vertex distance.
     @location(20) fog_distances: vec2<f32>,
     @location(18) color: vec4<f32>,
-    // Which atlas `tex_coords` is in: bit 0 of the ten the vertex format reserves for an animated
-    // texture. Flat, because it is a property of the face and not of the corner: every vertex of a
-    // quad carries the same answer, and the fragment stage selects between the two atlases with it.
-    // It is **not** branched on - see the sampling note in the fragment stage, where a `textureSample`
-    // under an `if` would be undefined behaviour whatever this varying says.
-    @interpolate(flat) @location(19) game_atlas: u32,
-    // Whether the game animates this face's sprite: bit 1 of the same ten, `UV_ANIMATED`. Flat for the
-    // same reason - it is the face's property and every corner carries it - and it is what scopes the
-    // level-of-detail offset in the fragment stage, because a coarse mip of a *moving* sprite is a moving
-    // average and a still one's is a fixed pyramid. See the level-of-detail floor in the fragment stage.
-    //
-    // **21 and not 20**: 20 is `fog_distances` above. This list is not in order, and a location named
-    // twice is a shader that fails to compile rather than one that silently picks a winner.
-    @interpolate(flat) @location(21) animated: u32,
-    // How many levels this face may be pushed down the chain, decoded in the vertex stage because the
-    // bits live in `v3` and `v3` is a vertex-local. Flat for the same reason the two above are.
-    @interpolate(flat) @location(22) lod_floor: u32,
-    // Whether this face belongs to Minecraft's **`cutout_mipped`** pipeline rather than its `cutout`
-    // one: bit 6 of `v3`'s flag half, `UV_CUTOUT_MIPPED`. Flat for the same reason as the three above,
-    // and it is what picks between the game's two cutouts in the fragment stage - 0.1 against 0.5.
-    @interpolate(flat) @location(23) mipped: u32
 };
 
 // What one terrain draw is told about itself **beyond its own draw record**: the alpha cutoff its
@@ -496,10 +509,15 @@ fn fragment_geometry(in: VertexResult, atlas_texel: f32) -> FragmentGeometry {
     // whole of it: four bits the bake wrote, and `LOD_FLOOR_IS_LEVEL_ZERO` picking which floor.
     const LOD_FLOOR_IS_LEVEL_ZERO: bool = false;
 
+    // The packed face flags, unpacked here: bit 1 is `animated`, bits 3..7 the floor. See the
+    // varying's note on `VertexResult` for the packing.
+    let animated = (in.flags >> 1u) & 1u;
+    let lod_floor = (in.flags >> 3u) & 0xfu;
+
     let floor = select(
         0.0,
-        select(64.0, f32(in.lod_floor), !LOD_FLOOR_IS_LEVEL_ZERO),
-        in.animated == 1u && !magnified,
+        select(64.0, f32(lod_floor), !LOD_FLOOR_IS_LEVEL_ZERO),
+        animated == 1u && !magnified,
     );
 
     let bias = section_pos.lod_bias - floor;
@@ -532,7 +550,16 @@ fn shade(in: VertexResult, texel: vec4<f32>) -> vec4<f32> {
     // Minecraft's are what the rasterizer makes of four per-vertex colours: the curve is the game's, the
     // blend is this renderer's (bilinear over the corners rather than linear across two triangles, which
     // is why a face here has no diagonal seam through its shading).
-    var occluders = mix(mix(in.ao3, in.ao4, in.light_uv.x), mix(in.ao2, in.ao1, in.light_uv.x), in.light_uv.y);
+    //
+    // The corners arrive **packed** - one flat u32 varying, three bits a corner, corner `i` in bits
+    // `i * 3..i * 3 + 3` - and unpack to the same four numbers the four f32 varyings carried.
+    let ao_packed = in.ao;
+    let ao1 = f32(ao_packed & 7u);
+    let ao2 = f32((ao_packed >> 3u) & 7u);
+    let ao3 = f32((ao_packed >> 6u) & 7u);
+    let ao4 = f32((ao_packed >> 9u) & 7u);
+
+    var occluders = mix(mix(ao3, ao4, in.light_uv.x), mix(ao2, ao1, in.light_uv.x), in.light_uv.y);
     var ao = 1.0 - 0.2 * occluders;
 
     // The light is a colour now, not a number: the game's lightmap has a colour in it (the sky light
@@ -561,8 +588,8 @@ fn shade(in: VertexResult, texel: vec4<f32>) -> vec4<f32> {
     // renderer has one cutout layer for both - so the number comes from the face's own pipeline through
     // the varying rather than from the layer alone. A mip of a leaf or a grass tuft is mostly the
     // low-alpha fringe the game keeps and 0.5 discards, which is why the two renderers' frames differed
-    // most on exactly those sprites. See `UV_CUTOUT_MIPPED`.
-    let cutoff = select(section_pos.alpha_cutout, 0.1, in.mipped != 0u);
+    // most on exactly those sprites. See `UV_CUTOUT_MIPPED`. Bit 2 of the packed face flags.
+    let cutoff = select(section_pos.alpha_cutout, 0.1, ((in.flags >> 2u) & 1u) != 0u);
 
     if (col.a < cutoff) {
         discard;
@@ -601,10 +628,13 @@ fn frag(
     // this struct exactly. **wgpu aborts the process when it does not** (`Not all immediate data
     // required by the pipeline has been set ... missing byte ranges: 48..52`), which is how the
     // duplicate was found.
+    let game_atlas = in.flags & 1u;
+    let animated = (in.flags >> 1u) & 1u;
+
     let pixel_size = select(
         vec2<f32>(section_pos.texel_ours, section_pos.texel_ours),
         vec2<f32>(section_pos.texel_game, section_pos.texel_game),
-        in.game_atlas == 1u,
+        game_atlas == 1u,
     );
 
     // **Every derivative, every level and every adjusted coordinate, taken once - here, and outside
@@ -628,10 +658,10 @@ fn frag(
     // what this is made of.
     var texel: vec4<f32>;
 
-    if in.game_atlas == 1u {
+    if game_atlas == 1u {
         if fg.magnified {
             texel = sample_at_level(t_game_atlas_magnify, t_game_sampler_magnify, fg.geometry, section_pos.use_rgss);
-        } else if in.animated == 1u {
+        } else if animated == 1u {
             texel = sample_at_level(t_game_atlas_animated, t_game_sampler_animated, fg.geometry, section_pos.use_rgss);
         } else {
             texel = sample_at_level(t_game_atlas, t_game_sampler, fg.geometry, section_pos.use_rgss);
@@ -639,7 +669,7 @@ fn frag(
     } else {
         if fg.magnified {
             texel = sample_at_level(t_texture_magnify, t_sampler_magnify, fg.geometry, section_pos.use_rgss);
-        } else if in.animated == 1u {
+        } else if animated == 1u {
             texel = sample_at_level(t_texture_animated, t_sampler_animated, fg.geometry, section_pos.use_rgss);
         } else {
             texel = sample_at_level(t_texture, t_sampler, fg.geometry, section_pos.use_rgss);
@@ -676,13 +706,15 @@ fn frag_game_atlas(
 ) -> @location(0) vec4<f32> {
     // `texel_game` is one texel of the game's atlas, which is the `pixel_size` this variant would have
     // selected anyway - so this is the same number `frag` computes, without the `select`.
+    let animated = (in.flags >> 1u) & 1u;
+
     let fg = fragment_geometry(in, section_pos.texel_game);
 
     var texel: vec4<f32>;
 
     if fg.magnified {
         texel = sample_at_level(t_game_atlas_magnify, t_game_sampler_magnify, fg.geometry, section_pos.use_rgss);
-    } else if in.animated == 1u {
+    } else if animated == 1u {
         texel = sample_at_level(t_game_atlas_animated, t_game_sampler_animated, fg.geometry, section_pos.use_rgss);
     } else {
         texel = sample_at_level(t_game_atlas, t_game_sampler, fg.geometry, section_pos.use_rgss);
@@ -704,33 +736,33 @@ fn vert(
     // bits name the vertex within the section - the decode the input assembler used to do with an
     // instance-step fetch and a `first_instance` per record. See `SectionRecord` above for why the
     // fetch lost to the index.
-    let record = section_records[vi >> 17u];
+    //
+    // **Four loads a vertex, where there were nine.** The two record vectors are addressed by the
+    // slot alone and load in parallel; the vertex's own data is one `vec4` (the four words the old
+    // code read as four scalars); and the quad's packed corner word is one more load, the same one
+    // for all four vertices of the quad. What used to be four scalar loads of the four corners'
+    // third words is gone entirely - the bake packs those counts into one word per quad and this
+    // stage reads the pack. The data and the corner word each wait on one record vector and on
+    // nothing else, so the stage is two dependent memory rounds deep, the same as it ever was -
+    // but with a quarter of the load/store work in each.
+    let slot = vi >> 17u;
+    let head = section_records[slot * 2u];
+    let tail = section_records[slot * 2u + 1u];
     let local_vertex = vi & 0x1ffffu;
 
-    let base_vertex = record.word_base;
-    var offset = local_vertex & 3u;
-    var vert1_i = local_vertex & ~3u;
+    let word_base = head.w;
+    let data = chunk_data[(word_base >> 2u) + local_vertex];
+    let v1 = data.x;
+    let v2 = data.y;
+    let v3 = data.z;
+    let v4 = data.w;
 
-    var id = ((vert1_i + offset) << 2u) + base_vertex;
-
-    var vert1_base = ((vert1_i) << 2u) + base_vertex;
-
-    // **The ambient-occlusion count of each corner of this quad, straight out of the vertex**: how many
-    // of the four blocks around that corner fill their whole block. The curve is applied in the fragment
-    // stage, where the four are blended - see there for why.
-    //
-    // Three bits, because four is as high as the count goes. Those bits used to be the position's "this
-    // coordinate is exactly 16" flags, and the position used to hold its own count here; the two swapped
-    // when the position needed eight more bits an axis than a byte could hold.
-    var vert1_v3 = chunk_data[vert1_base + 2u];
-    var vert2_v3 = chunk_data[vert1_base + 6u];
-    var vert3_v3 = chunk_data[vert1_base + 10u];
-    var vert4_v3 = chunk_data[vert1_base + 14u];
-
-    var v1_ao = f32((vert1_v3 >> 29u) & 0x7u);
-    var v2_ao = f32((vert2_v3 >> 29u) & 0x7u);
-    var v3_ao = f32((vert3_v3 >> 29u) & 0x7u);
-    var v4_ao = f32((vert4_v3 >> 29u) & 0x7u);
+    // **The ambient-occlusion count of each corner of this quad, one packed word.** The bake wrote
+    // one per quad into the arena tail the record's `ao_base` names: corner `i` in bits
+    // `i * 3..i * 3 + 3`, straight out of the same third-word bits this stage used to load the four
+    // corners for. See the packed varying on `VertexResult` for where they go.
+    let ao_word = tail.x + (local_vertex >> 2u);
+    let ao_packed = chunk_data[ao_word >> 2u][ao_word & 3u];
 
     var uv = array<vec2<f32>,4>(
             vec2(1.0,1.0),
@@ -741,17 +773,9 @@ fn vert(
     var light_uv = uv[vi & 3];
 
     var vr: VertexResult;
-    vr.ao1 = v1_ao;
-    vr.ao2 = v2_ao;
-    vr.ao3 = v3_ao;
-    vr.ao4 = v4_ao;
+    vr.ao = ao_packed;
 
     vr.light_uv = light_uv;
-
-    var v1 = chunk_data[id];
-    var v2 = chunk_data[id + 1u];
-    var v3 = chunk_data[id + 2u];
-    var v4 = chunk_data[id + 3u];
 
     // **Sixteen bits an axis, at 1/2048 of a block.** That is the scale VulkanMod's compressed terrain
     // vertex uses for the same three numbers (`POSITION_INV = 1.0 / 2048.0`), and it is eight bits an axis
@@ -850,10 +874,13 @@ fn vert(
     // exactly what the relative-position generations drew, because the number it names is the same
     // number - a small one, which is the whole point (see `camera_section_pos` in `mc/mod.rs` for
     // why absolute positions in `f32` ground sections into each other).
+    // The record's words are unsigned and the camera's section is signed, so the subtraction is
+    // i32 - i32: section coordinates fit an i32 by definition, and a u32-i32 mix is a shader that
+    // does not validate.
     var section_origin = vec3<f32>(
-        f32(record.x - section_pos.camera_section.x),
-        f32(record.y - section_pos.camera_section.y),
-        f32(record.z - section_pos.camera_section.z),
+        f32(i32(head.x) - section_pos.camera_section.x),
+        f32(i32(head.y) - section_pos.camera_section.y),
+        f32(i32(head.z) - section_pos.camera_section.z),
     ) * 16.0;
     var world_pos = pos + section_origin;
 
@@ -872,10 +899,9 @@ fn vert(
     vr.pos.y = -vr.pos.y;
 
     vr.tex_coords = vec2<f32>(u, v);
-    vr.game_atlas = game_atlas;
-    vr.animated = animated;
-    vr.lod_floor = lod_floor;
-    vr.mipped = mipped;
+    // The face flags, packed: bit 0 the atlas, bit 1 animated, bit 2 the mipped cutout, bits 3..7
+    // the level-of-detail floor. See the varying's note on `VertexResult`.
+    vr.flags = game_atlas | (animated << 1u) | (mipped << 2u) | (lod_floor << 3u);
 
     // The lighting, fetched the way the game's own terrain shader fetches it: one lightmap texel per
     // vertex, and the rasterizer interpolates the *colour*, which is what `vertexColor = Color *
