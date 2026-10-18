@@ -17,7 +17,7 @@ accessible	class	net/minecraft/world/level/lighting/SkyLightSectionStorage$SkyDa
 # The Rust palette/light paths read these out of the container's internals.
 accessible	field	net/minecraft/world/level/chunk/PalettedContainer	data	Lnet/minecraft/world/level/chunk/PalettedContainer$Data;
 accessible	field	net/minecraft/world/level/chunk/PalettedContainer$Data	palette	Lnet/minecraft/world/level/chunk/Palette; # GUESS
-accessible	field	net/minecraft/world/level/chunk/PalettedContainer$Data	storage	Lnet/minecraft/world/level/chunk/BitStorage; # GUESS
+accessible	field	net/minecraft/world/level/chunk/PalettedContainer$Data	storage	Lnet/minecraft/util/BitStorage;
 accessible	field	net/minecraft/world/level/chunk/PalettedContainer$Data	configuration	Lnet/minecraft/world/level/chunk/Configuration;
 
 # 26.1 leaves renderThread non-public; the render-thread checks read it.
@@ -33,12 +33,13 @@ accessible	field	net/minecraft/util/SimpleBitStorage	valuesPerLong	I
 accessible	field	net/minecraft/util/SimpleBitStorage	divideAdd	I
 accessible	field	net/minecraft/util/SimpleBitStorage	divideMul	I
 accessible	field	net/minecraft/util/SimpleBitStorage	divideShift	I
-accessible	field	net/minecraft/util/SimpleBitStorage	mask	I
+accessible	field	net/minecraft/util/SimpleBitStorage	mask	J
 
 accessible	field	net/minecraft/world/level/lighting/LevelLightEngine	blockEngine	Lnet/minecraft/world/level/lighting/LightEngine; # GUESS
 accessible	field	net/minecraft/world/level/lighting/LevelLightEngine	skyEngine	Lnet/minecraft/world/level/lighting/LightEngine; # GUESS
-accessible	field	net/minecraft/world/level/lighting/LayerLightSectionStorage	updatingSectionData	Lnet/minecraft/world/level/lighting/SkyLightSectionStorage$SkyDataLayerStorageMap; # GUESS
-accessible	field	net/minecraft/world/level/lighting/LayerLightSectionStorage	visibleSectionData	Lnet/minecraft/world/level/lighting/SkyLightSectionStorage$SkyDataLayerStorageMap; # GUESS
+# The light-storage fields the NeoForge AT carries (updatingSectionData / visibleSectionData)
+# are NeoForge's own patches on that class - the vanilla jar this build compiles against has
+# neither, and no source this build compiles reads them, so they are simply not widened here.
 
 # ---------- Method accessibility ----------
 # onMove/onButton/onScroll remain package-private in 26.1; the input mixins invoke them.
@@ -58,7 +59,7 @@ accessible	field	net/minecraft/client/renderer/texture/TextureAtlasSprite	v0	F #
 accessible	field	net/minecraft/client/renderer/texture/TextureAtlasSprite	u1	F # GUESS
 accessible	field	net/minecraft/client/renderer/texture/TextureAtlasSprite	v1	F # GUESS
 accessible	method	net/minecraft/client/renderer/texture/TextureAtlasSprite	contents	()Lnet/minecraft/client/renderer/texture/SpriteContents; # GUESS
-accessible	field	net/minecraft/client/renderer/texture/TextureAtlas	textures	Ljava/util/Map; # GUESS
+accessible	field	net/minecraft/client/renderer/texture/TextureAtlas	texturesByName	Ljava/util/Map;
 
 # The options screen walks the game's value sets, which are package-private here and widened by
 # NeoForge's own transformer there.

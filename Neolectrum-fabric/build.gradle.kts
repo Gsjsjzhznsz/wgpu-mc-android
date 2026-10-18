@@ -113,6 +113,10 @@ sourceSets.main {
                 "dev/birb/wgpu/backend/WgpuFormat.kt",
                 "dev/birb/wgpu/render/TintProfile.kt",
                 "dev/birb/wgpu/render/Wgpu.kt",
+                // The block cache reads the atlas' sprite map, whose vanilla name is
+                // `texturesByName` where NeoForge's patched jar answers `textures` - the same map
+                // by either name, and the answer is this module's own copy.
+                "dev/birb/wgpu/BlockCache.kt",
         )
         resources.exclude(
                 "META-INF/neoforge.mods.toml",
