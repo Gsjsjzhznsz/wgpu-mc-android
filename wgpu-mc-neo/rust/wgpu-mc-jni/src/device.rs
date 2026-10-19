@@ -88,6 +88,10 @@ struct PresentBlit {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    /// The one uniform the sharpened upscale takes: the source's texel size and the unsharp
+    /// amount. Written per frame - the values are two settings and the source's size, and the
+    /// buffer is sixteen bytes, so caching it would cost more than the write.
+    params: wgpu::Buffer,
 }
 
 /// Full-screen quad, sampled with `v` running the other way.
@@ -95,6 +99,16 @@ struct PresentBlit {
 /// `corner.y` of 0 lands on the *bottom* row of the destination - `corner * 2 - 1` puts it at NDC
 /// y = -1, which every wgpu backend maps to the last framebuffer row - and reads source row 0
 /// there, so the source's rows come out reversed exactly once.
+///
+/// **And it is the upscale.** When the render scale setting is below 1.0, the main render target
+/// is smaller than the window, and this is the pass that stretches it back - with a sharpen, so
+/// the stretched frame keeps the crispness the window's own resolution would have had. The
+/// kernel is an unsharp mask over the four cross neighbours of the sample, one *source* texel
+/// out: the detail that a smaller render target lost is exactly the detail the neighbourhood
+/// has and the centre does not, and adding it back scaled by `sharpness` is the difference
+/// between a soft upscale and one a phone display accepts. `sharpness` of 0 - which is what a
+/// render scale of 1.0 turns it into - samples once and touches nothing else, which is the
+/// pass this always was before the scale existed.
 const PRESENT_BLIT_WGSL: &str = r#"
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -110,12 +124,42 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     return out;
 }
 
+struct BlitParams {
+    // 1 over the source texture's width and height: the step from one source texel to the next.
+    // The kernel moves with the picture rather than with the window, and it is
+    // direction-symmetric, which is why the v flip the vertex stage does does not bias it.
+    texel_size: vec2<f32>,
+    // The unsharp amount. 0 samples once and skips the neighbourhood entirely.
+    sharpness: f32,
+    _pad: f32,
+}
+
 @group(0) @binding(0) var source_texture: texture_2d<f32>;
 @group(0) @binding(1) var source_sampler: sampler;
+@group(0) @binding(2) var<uniform> params: BlitParams;
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(source_texture, source_sampler, in.tex_coords);
+    // Sampled at an explicit level rather than an implicit one: the main target has a single
+    // mip level, and an explicit fetch needs no derivatives, so the sharpen branch below is
+    // uniform control flow even where a driver disagrees about what else it is.
+    let center = textureSampleLevel(source_texture, source_sampler, in.tex_coords, 0.0);
+    if (params.sharpness <= 0.0) {
+        return center;
+    }
+
+    let north = textureSampleLevel(
+        source_texture, source_sampler, in.tex_coords + vec2<f32>(0.0, -params.texel_size.y), 0.0);
+    let south = textureSampleLevel(
+        source_texture, source_sampler, in.tex_coords + vec2<f32>(0.0, params.texel_size.y), 0.0);
+    let west = textureSampleLevel(
+        source_texture, source_sampler, in.tex_coords + vec2<f32>(-params.texel_size.x, 0.0), 0.0);
+    let east = textureSampleLevel(
+        source_texture, source_sampler, in.tex_coords + vec2<f32>(params.texel_size.x, 0.0), 0.0);
+
+    let blur = (north + south + west + east) * 0.25;
+    let detail = center.rgb - blur.rgb;
+    return vec4<f32>(clamp(center.rgb + detail * params.sharpness, vec3<f32>(0.0), vec3<f32>(1.0)), center.a);
 }
 "#;
 
@@ -143,6 +187,16 @@ impl PresentBlit {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(16),
+                    },
                     count: None,
                 },
             ],
@@ -190,26 +244,52 @@ impl PresentBlit {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
+            // **Linear, not the Nearest this used to be.** At a render scale of 1.0 the blit
+            // samples texel centers one-to-one, where Linear and Nearest agree exactly, so the
+            // un-scaled picture is unchanged. Below 1.0 the blit is an upscale, and Nearest
+            // magnification would turn it into a mosaic.
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
+        });
+
+        let params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wgpu-mc present blit params"),
+            size: 16,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
+            mapped_at_creation: false,
         });
 
         Self {
             pipeline,
             layout,
             sampler,
+            params,
         }
     }
 
     fn copy(
         &self,
+        queue: &wgpu::Queue,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         source: &wgpu::TextureView,
         destination: &wgpu::TextureView,
+        source_width: u32,
+        source_height: u32,
+        sharpness: f32,
     ) {
+        // The sharpening uniforms, written every frame: the texel size follows the source, which
+        // a target resize moves, and the sharpness follows the settings, which a player moves.
+        let texel_x = 1.0 / source_width.max(1) as f32;
+        let texel_y = 1.0 / source_height.max(1) as f32;
+        let mut params = [0u8; 16];
+        params[0..4].copy_from_slice(&texel_x.to_le_bytes());
+        params[4..8].copy_from_slice(&texel_y.to_le_bytes());
+        params[8..12].copy_from_slice(&sharpness.to_le_bytes());
+        queue.write_buffer(&self.params, 0, &params);
+
         // Built per frame rather than cached. Caching it by the source view's *address* was tried and
         // is wrong: Minecraft closes the main target's view when it rebuilds the target - which is
         // what a resize does - and the allocator hands the same address to the new one, so the cache
@@ -227,6 +307,14 @@ impl PresentBlit {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.params,
+                        offset: 0,
+                        size: None,
+                    }),
                 },
             ],
         });
@@ -8795,6 +8883,12 @@ pub fn setVisibleSections(mut env: JNIEnv, _class: JClass, keys: jni::objects::J
 /// recorded into the shared encoder rather than one of its own: the whole frame is in that encoder,
 /// and this is the submission that carries it, right before the swapchain image is presented.
 ///
+/// **It is also the upscale.** The JVM hands over the source's own width and height, which a
+/// render scale below 1.0 makes smaller than the window the swapchain is sized to; the blit
+/// samples the whole source and covers the whole destination, so the stretch happens here, and
+/// the sharpening rides on it. At a scale of 1.0 the two sizes agree and the pass is the copy
+/// it has always been.
+///
 /// This is also where the scene is ticked, because it is the one point in a frame that is known to
 /// happen exactly once and to have a framebuffer size behind it: the sections the baker finished
 /// since the last frame are moved into the arena here, the ones the camera has left behind are
@@ -8805,8 +8899,23 @@ pub extern "C" fn blit_from_texture(
     wm: &WmRenderer,
     texture_view: &wgpu::TextureView,
     surface_texture: &SurfaceTexture,
+    source_width: i32,
+    source_height: i32,
 ) {
     trace_marker(&format!("blit {:p}", texture_view));
+
+    // The sharpening is the scaled frame's answer, and it is read where it is used: at a scale of
+    // 1.0 nothing is stretched, so the neighbourhood samples would sharpen a picture that is
+    // already the window's own - the one thing a player who asked for 1.0 did not ask for.
+    let (scale, sharpening) = {
+        let settings = crate::SETTINGS.read();
+        match settings.as_ref() {
+            Some(settings) => (settings.render_scale(), settings.upscale_sharpening()),
+            None => (1.0, 0.0),
+        }
+    };
+    let sharpness = if scale < 0.999 { sharpening } else { 0.0 };
+
     // The destination view has to be created with the format the swapchain was configured with,
     // and the blitter has to have been built for that same format. Both come from the state
     // `configure_surface` left behind, because the format is negotiated with the driver and is
@@ -8847,9 +8956,16 @@ pub extern "C" fn blit_from_texture(
         // presented straight after it. The blit has to be in the same submission as the passes that
         // drew the target, or the swapchain gets the image as it was before them.
         with_shared_encoder(|encoder| {
-            state
-                .blitter
-                .copy(&wm.gpu.device, encoder, texture_view, &view);
+            state.blitter.copy(
+                &wm.gpu.queue,
+                &wm.gpu.device,
+                encoder,
+                texture_view,
+                &view,
+                source_width.max(1) as u32,
+                source_height.max(1) as u32,
+                sharpness,
+            );
 
             // The blit is the last thing a frame submits, so this is where its end timestamp goes.
             crate::timing::frame_end(encoder, wm);
@@ -8857,6 +8973,32 @@ pub extern "C" fn blit_from_texture(
     };
 
     flush_shared_encoder(wm);
+}
+
+/// The render scale the JVM's mixin sizes Minecraft's main render target by.
+///
+/// Called when a target is sized - at the game's startup resize and at every window resize after
+/// it, plus once per settings apply - rather than per frame, which is why it is its own export
+/// instead of a field of a larger answer. 1.0 while the settings have not been loaded yet, which
+/// is the honest answer: a target sized before the config arrived should be the un-scaled one,
+/// and the JVM re-sizes the main target again once the renderer is up.
+#[unsafe(no_mangle)]
+pub extern "C" fn get_render_scale() -> f32 {
+    crate::SETTINGS
+        .read()
+        .as_ref()
+        .map_or(1.0, |settings| settings.render_scale())
+}
+
+/// The sharpening the present blit stretches a scaled frame with. Read by the same callers as
+/// [`get_render_scale`], for the same reasons; 0.0 while the settings have not arrived, which is
+/// the plain bilinear the scale of 1.0 ships with anyway.
+#[unsafe(no_mangle)]
+pub extern "C" fn get_upscale_sharpening() -> f32 {
+    crate::SETTINGS
+        .read()
+        .as_ref()
+        .map_or(0.0, |settings| settings.upscale_sharpening())
 }
 
 /// The size a buffer carrying `len` bytes of initial data is created at, which is the util

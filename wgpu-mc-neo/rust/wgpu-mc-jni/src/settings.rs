@@ -88,6 +88,33 @@ pub struct Settings {
     /// next launch.
     #[serde(default = "two_frames_in_flight")]
     pub frames_in_flight: IntSetting,
+    /// **The fraction of the window's own resolution the frame is rendered at**, and the one
+    /// number that decides most of the frame time on the phones this port runs on: a tiler's
+    /// fragment cost is a cost per pixel, and everything the game draws - terrain, entities,
+    /// water, sky, GUI - is drawn into the one main render target, whose size this scales.
+    /// The present blit then stretches the smaller picture back over the window, sharpening
+    /// as it goes - see [`Settings::upscale_sharpening`].
+    ///
+    /// **0.75 on Android by default**, where the fill rate is the frame's budget and the displays
+    /// are dense; 1.0 everywhere else, which is the picture this renderer has always made. 1.0 on
+    /// any platform is the un-scaled picture sampled one-to-one, so a player who wants the exact
+    /// old frame types it in and loses nothing but the time.
+    ///
+    /// It scales Minecraft's main render target itself (`MainTarget`, through the mixin), so the
+    /// game lays its GUI out by the *window* as it always did and draws it into the smaller
+    /// target - the picture is proportionally right and its text softer by the scale. Input is
+    /// unaffected: touch and mouse coordinates are translated by the window, which never changes
+    /// size. See `RenderScale` on the JVM side and `PresentBlit` on this side.
+    #[serde(default = "render_scale_default")]
+    pub render_scale: FloatSetting,
+    /// **How much the present blit sharpens the picture it stretches** - the unsharp amount
+    /// applied when the frame is rendered below the window's resolution. See
+    /// [`Settings::render_scale`]. Zero is plain bilinear; the default is a moderate sharpen,
+    /// which puts the crispness a phone display expects back over a scaled frame. It does nothing
+    /// at a render scale of 1.0, where nothing is stretched and the blit samples one texel per
+    /// pixel as it always has.
+    #[serde(default = "upscale_sharpening_default")]
+    pub upscale_sharpening: FloatSetting,
     /// The switches that change how the frame is rendered, under the `Optimization` heading.
     ///
     /// **Field order here is the row order on the options screen**, and the sections have to come out
@@ -324,6 +351,51 @@ fn no_lod_bias() -> FloatSetting {
     }
 }
 
+/// The default of [`Settings::render_scale`]: **0.75 on Android, 1.0 everywhere else.**
+///
+/// The phone's number is not a judgement call dressed as a measurement - it is the fill rate
+/// arithmetic of the device this port ships for. An Adreno 640 at 2284x1080 was measured at
+/// roughly thirty frames a second with every path this renderer has already shaved: the batched
+/// draws, the four-word vertices, the far field's two texture fetches. What is left at that
+/// point is per-pixel work - fragment shading, blending, tile memory - and that work is
+/// *linear in pixels*, so 0.75 hands back about forty percent of it, and the sharpened blit
+/// (`PresentBlit`) puts the crispness back at the only step that runs at full resolution.
+/// It is also what the player asked for: the MobileGlues configuration this device runs under
+/// names an FSR1 preset the Vulkan dispatcher does not implement - the renderer answering the
+/// same question itself is the setting.
+///
+/// The step is 0.05 so the slider can reach 0.75 exactly, and the floor is 0.5, below which the
+/// GUI text stops being a softer copy of itself and starts being a different picture.
+fn render_scale_default() -> FloatSetting {
+    FloatSetting {
+        min: 0.5,
+        max: 1.0,
+        step: 0.05,
+        value: render_scale_value_default(),
+    }
+}
+
+/// The value [`render_scale_default`] ships, named so the test that pins the platform split can
+/// call it directly rather than reading a setting.
+fn render_scale_value_default() -> f64 {
+    if cfg!(target_os = "android") {
+        0.75
+    } else {
+        1.0
+    }
+}
+
+/// The default of [`Settings::upscale_sharpening`]: a moderate unsharp, halfway up a 0-1 range
+/// whose top is already harsh. See the shader that takes it, `PRESENT_BLIT_WGSL`.
+fn upscale_sharpening_default() -> FloatSetting {
+    FloatSetting {
+        min: 0.0,
+        max: 1.0,
+        step: 0.05,
+        value: 0.5,
+    }
+}
+
 /// The default of a setting that is off unless a player asks for it.
 ///
 /// `BoolSetting`'s own default is `true`, which is right for a switch that disables something and
@@ -520,6 +592,11 @@ pub struct SettingsInfo {
     /// in one place. See `OptionPages`' `DRAWN_ELSEWHERE`.
     animated_textures: EnumSettingInfo<AnimatedTextures>,
     frames_in_flight: SettingInfo,
+    /// The picture settings that decide most of the frame time on a phone. Plain rows - they are
+    /// not diagnostics and not a decision a player makes to bisect anything. See
+    /// [`Settings::render_scale`], whose field order this matches.
+    render_scale: SettingInfo,
+    upscale_sharpening: SettingInfo,
     /// The switches that change *how* the frame is rendered rather than what is reported about
     /// it. **This order has to match [`Settings`]'s**, because the two halves of a row come from the
     /// two documents: the row itself and its order from the settings, and the heading it sits under
@@ -625,6 +702,21 @@ lazy_static! {
             needs_restart: false,
             section: None,
         },
+        render_scale: SettingInfo::new(
+            "Render the frame at a fraction of the window's own resolution and stretch it back \
+            over the window, sharpened. The GPU's fragment cost is per pixel, so on a phone this \
+            is the largest frame-time lever there is - 0.75 hands back roughly forty percent of \
+            it. 1.0 is the un-scaled picture. Takes effect the moment it is applied; the GUI \
+            stays laid out by the window and is drawn proportionally, a little softer.",
+            false,
+        ),
+        upscale_sharpening: SettingInfo::new(
+            "How much the present blit sharpens the frame it stretches. 0 is plain bilinear; \
+            higher is crisper, and too high draws halos around bright edges. It only does \
+            something while the render scale is below 1.0, because only then is anything \
+            stretched.",
+            false,
+        ),
         host_validation: SettingInfo::debug(
             "Load the graphics vendor's own validation layer - D3D12's debug layer, Vulkan's \
             validation layer or GL's debug output - which catches what wgpu cannot see: a barrier in \
@@ -1256,6 +1348,25 @@ impl Settings {
         self.atlas_lod_bias.value as f32
     }
 
+    /// The fraction of the window's resolution the frame renders at, clamped to the schema's own
+    /// range - the config is a text file and the range is advice to the options screen, not a
+    /// rule the reader can enforce. Read twice a frame's bookkeeping rather than per draw: by
+    /// the JVM mixin that sizes the main target (per resize) and by the present blit (per frame,
+    /// where the sharpening uniforms are written).
+    pub fn render_scale(&self) -> f32 {
+        self.render_scale
+            .value
+            .clamp(self.render_scale.min, self.render_scale.max) as f32
+    }
+
+    /// The unsharp amount the present blit applies to a stretched frame. Zero is plain bilinear.
+    /// Clamped for the same reason the scale is - a hand-edited config is read as it stands.
+    pub fn upscale_sharpening(&self) -> f32 {
+        self.upscale_sharpening
+            .value
+            .clamp(self.upscale_sharpening.min, self.upscale_sharpening.max) as f32
+    }
+
     /// **Whether the sampler for the game's own block atlas blends between mip levels.**
     ///
     /// alse - the default - gives MipmapFilterMode::Nearest: the level chosen from the screen-space
@@ -1283,6 +1394,10 @@ impl Default for Settings {
             // not been told about this row expects to see.
             animated_textures: EnumSetting::from_variant(AnimatedTextures::default()),
             frames_in_flight: two_frames_in_flight(),
+            // The picture settings: 0.75 on the phones, the un-scaled picture everywhere else, and
+            // a moderate sharpen over the stretch. See `render_scale_default` for the arithmetic.
+            render_scale: render_scale_default(),
+            upscale_sharpening: upscale_sharpening_default(),
             // The debug switches default to the behaviour the renderer had before they existed:
             // logging and tracing off, the bind group cache and dynamic offsets on, and both
             // validation layers off. Host-side validation and GPU-based validation used to be
@@ -2046,13 +2161,15 @@ mod tests {
 
     /// Every setting's name, which is the same in both documents. Kept as a list because the two
     /// documents' own key order is not readable through `serde_json::Value` - see the test above.
-    const NAME_LIST: [&str; 35] = [
+    const NAME_LIST: [&str; 37] = [
         "backend",
         "vsync",
         "fullscreen_mode",
         "terrain",
         "animated_textures",
         "frames_in_flight",
+        "render_scale",
+        "upscale_sharpening",
         "bind_group_cache",
         "dynamic_offsets",
         "terrain_indirect",
@@ -2659,6 +2776,11 @@ mod tests {
             "binding_verbosity",
             "dump_shaders",
             "gpu_timestamps",
+            // The picture settings are read per present (the blit's uniforms are written per frame)
+            // and per resize (the mixin that sizes the main target) - a new value is the next
+            // frame's picture and nothing else.
+            "render_scale",
+            "upscale_sharpening",
             // These two are built into a pipeline rather than consulted as it draws, but a rebuild
             // of the graph's pipelines is still not a restart: applying one takes effect on the
             // frame after it is applied.
@@ -2674,6 +2796,31 @@ mod tests {
                 "{name} applies without a restart"
             );
         }
+    }
+
+    #[test]
+    fn the_render_scale_defaults_to_the_phone_that_pays_for_it() {
+        // The platform split is the whole point of the default: the phones this port ships for
+        // are fill-rate bound at their own resolution, and the rest of the world gets the picture
+        // this renderer has always made. See `render_scale_value_default`.
+        let scale = Settings::default().render_scale();
+        if cfg!(target_os = "android") {
+            assert!(
+                (scale - 0.75).abs() < 1e-6,
+                "Android ships the scaled picture, not {scale}"
+            );
+        } else {
+            assert!(
+                (scale - 1.0).abs() < 1e-6,
+                "everywhere else ships the full picture, not {scale}"
+            );
+        }
+
+        let sharpening = Settings::default().upscale_sharpening();
+        assert!(
+            (0.0..=1.0).contains(&sharpening),
+            "the sharpening is a fraction, not {sharpening}"
+        );
     }
 
     #[test]

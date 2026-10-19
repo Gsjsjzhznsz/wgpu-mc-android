@@ -137,6 +137,16 @@ class OptionPages : Iterable<OptionPages.Page> {
             // because it is the side that dumps frames.
             Diagnostics.refresh()
             syncVanillaVsync(rendererOptions)
+
+            // The render scale sizes the main render target, and a target only sizes itself when
+            // the game resizes it - which happens at startup and on window resizes, neither of
+            // which an Apply is. Asking the game's own resize path to run again is what makes a
+            // change on this screen reach the picture this frame: the resize goes through the
+            // render-scale mixin, which re-records the window's size for the surface, and the
+            // present blit picks the new scale and sharpening up on its next frame by itself.
+            val minecraft = Minecraft.getInstance()
+            val window = minecraft.window
+            minecraft.getMainRenderTarget().resize(window.getWidth(), window.getHeight())
         }
 
         pages.forEach { it.apply() }

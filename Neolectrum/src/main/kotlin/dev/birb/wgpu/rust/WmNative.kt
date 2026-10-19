@@ -872,7 +872,15 @@ object WmNative {
         handle("acquire_next_texture", FunctionDescriptor.of(PTR, PTR))
 
     @JvmField val blitFromTexture: MethodHandle =
-        handle("blit_from_texture", FunctionDescriptor.ofVoid(PTR, PTR, PTR))
+        handle("blit_from_texture", FunctionDescriptor.ofVoid(PTR, PTR, PTR, INT, INT))
+
+    /** The render scale, read when a main render target is sized rather than per frame. */
+    @JvmField val getRenderScale: MethodHandle =
+        handle("get_render_scale", FunctionDescriptor.of(FLOAT))
+
+    /** The upscale sharpening, read by the same callers as [getRenderScale]. */
+    @JvmField val getUpscaleSharpening: MethodHandle =
+        handle("get_upscale_sharpening", FunctionDescriptor.of(FLOAT))
 
     @JvmField val presentSurface: MethodHandle =
         handle("present_surface", FunctionDescriptor.ofVoid(PTR, PTR))
