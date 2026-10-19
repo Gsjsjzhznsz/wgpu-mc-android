@@ -954,6 +954,29 @@ object RustChunkBake {
         fun meshesInRust(): Boolean = tookThisSection.get()
 
         /**
+         * The region of the rebuild this thread is inside, or null when it is not inside one.
+         *
+         * Set by the rebuild-task hook at the head of `doTask` and cleared at its return; read by
+         * `SectionCompilerMixin`'s two compile callbacks, which capture none of `compile`'s own
+         * arguments - the two loaders ship different `compile` signatures (NeoForge's patch adds a
+         * trailing `List`), and Mixin takes a callback either all of a target's arguments or none,
+         * so an argument-capturing handler pinned to either loader could not serve both. The region
+         * is the one fact both callbacks need from the enclosing task, and the same thread is
+         * running both the task and the compile, so a thread-local hand-over is exact.
+         */
+        private val rebuilding = ThreadLocal<RenderSectionRegion?>()
+
+        /** The rebuild task's region for this thread; see [rebuilding]. */
+        @JvmStatic
+        fun noteRebuildRegion(region: RenderSectionRegion?) {
+                rebuilding.set(region)
+        }
+
+        /** The region the compile running on this thread belongs to, or null outside a rebuild. */
+        @JvmStatic
+        fun rebuildingRegion(): RenderSectionRegion? = rebuilding.get()
+
+        /**
          * Whether the arena is at the device's buffer limit, so a section this side cannot draw is one the
          * game has to.
          *

@@ -1,0 +1,13 @@
+# Mixin targets this audit deliberately does not check against the vanilla jar.
+#
+# One fully-qualified mixin class per line, then the reason. Everything listed
+# here is either excluded from the Fabric build by path (see
+# Neolectrum-fabric/build.gradle.kts) or targets a member only NeoForge's
+# patched jar carries - the vanilla client jar is the wrong ground truth for
+# them, and the NeoForge device is where they prove themselves.
+#
+# render.WindowMixin redirects EarlyLoadingScreenController.current() inside
+# Window.createGlfwWindow - an FML class and a call site only NeoForge's
+# patched Window has. The mixin is excluded from the Fabric build and its
+# mixins.json, so it never applies on Fabric.
+render.WindowMixin

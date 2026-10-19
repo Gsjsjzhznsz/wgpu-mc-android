@@ -167,6 +167,33 @@ jobs:
             exit 1
           fi
 
+      - name: Audit every mixin target against the vanilla jar
+        # The mixin annotations carry their targets as strings nothing at compile
+        # time checks, and a target that does not exist at runtime is a class that
+        # fails to transform - on Fabric that was "joining a world crashes the
+        # client" (the SectionCompiler compile descriptor was NeoForge's
+        # five-argument shape, which vanilla does not have). The audit resolves
+        # every `method =`/`target =`/`@Accessor`/`@Invoker` string in both
+        # mixins.json files against the real vanilla 26.1.2 client jar - the jar
+        # both loaders share - before a single build step runs. NeoForge-only
+        # surfaces live in scripts/mixin_audit_allowlist.txt with a reason.
+        run: |
+          version="$(grep -m1 '^neoforge_minecraft_version=' Neolectrum/gradle.properties | cut -d= -f2)"
+          jar=".mc-cache/client-$version.jar"
+          if [ ! -f "$jar" ]; then
+            mkdir -p .mc-cache
+            url="$(curl -sfL https://piston-meta.mojang.com/mc/game/version_manifest_v2.json \
+              | python3 -c "import json,sys;print(next(v['url'] for v in json.load(sys.stdin)['versions'] if v['id']=='$version'))")"
+            curl -sfL "$url" -o .mc-cache/version.json
+            client="$(python3 -c "import json;print(json.load(open('.mc-cache/version.json'))['downloads']['client']['url'])")"
+            curl -sfL "$client" -o "$jar"
+          fi
+          ls -la "$jar"
+          python3 scripts/audit_mixin_targets.py --jar "$jar" \
+            --allow scripts/mixin_audit_allowlist.txt \
+            Neolectrum/src/main/resources/wgpu_mc.mixins.json \
+            Neolectrum-fabric/src/main/resources/wgpu_mc.mixins.json
+
       - name: Set up JDK 25
         uses: actions/setup-java@v4
         with:

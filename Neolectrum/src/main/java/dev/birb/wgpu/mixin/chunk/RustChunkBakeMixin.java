@@ -39,10 +39,25 @@ public class RustChunkBakeMixin {
 
     @Inject(method = "doTask", at = @At("HEAD"))
     private void wgpuMc$bakeInRust(SectionBufferBuilderPack pack, CallbackInfoReturnable<Object> cir) {
+        // **The rebuild context first, the bake second.** The compile callbacks read the region this
+        // thread is rebuilding (they capture none of compile's own arguments - the two loaders ship
+        // different compile signatures), and it has to be in place before any compile can run inside
+        // this task. bake() records whether Rust took the section, which is what decides whether
+        // Minecraft meshes it at all.
+        //
         // **No second `noteTookSection` here.** `bake` records the answer itself, where the tables it
         // depends on are; this used to pass `bake(region)`'s return value in, and that value was "did it
         // not throw" - true for every refusal inside, so a section Rust had refused was still dropped
         // from Minecraft's mesh and drawn by neither side.
+        RustChunkBake.noteRebuildRegion(this.region);
         RustChunkBake.bake(this.region);
+    }
+
+    @Inject(method = "doTask", at = @At("RETURN"))
+    private void wgpuMc$forgetTheRebuildRegion(CallbackInfoReturnable<Object> cir) {
+        // The context is cleared rather than left behind so that a thread whose last task is done
+        // does not answer a compile that reached SectionCompiler some other way with a stale region's
+        // position - the callbacks decline on a null, which is the safe answer.
+        RustChunkBake.noteRebuildRegion(null);
     }
 }

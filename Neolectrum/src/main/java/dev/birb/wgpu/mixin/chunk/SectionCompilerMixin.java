@@ -1,6 +1,5 @@
 package dev.birb.wgpu.mixin.chunk;
 
-import com.mojang.blaze3d.vertex.VertexSorting;
 import dev.birb.wgpu.WgpuMcMod;
 import dev.birb.wgpu.chunk.ContainerData;
 import dev.birb.wgpu.chunk.RustChunkBake;
@@ -87,6 +86,20 @@ import java.util.List;
  * the bake that set it. All four handlers ask it, and the two predicates ask it for every non-air block
  * rather than only for the blocks that got as far as geometry, so it now sits on the innermost path of
  * the loop - which is affordable only because the answer is a thread-local read.
+ *
+ * <p><b>Two loaders, two {@code compile} signatures, one mixin.</b> NeoForge's patch adds a
+ * trailing {@code List} to {@code SectionCompiler.compile} (its additional-geometry channel),
+ * so the same source file names both signatures in every {@code method =} entry: the four-
+ * argument one vanilla (and Fabric) runs, and the five-argument one NeoForge patched in. Mixin
+ * applies the entry that matches and ignores the other, and with {@code defaultRequire: 1} a
+ * version where neither matches is a loud failure at apply time, not a silent miss.
+ *
+ * <p>Both {@code @Inject} callbacks therefore capture <em>none</em> of {@code compile}'s
+ * arguments: Mixin takes either all of a target's arguments or none of them
+ * ({@code CallbackInjector.checkDescriptor}), and a handler pinned to either loader's full
+ * argument list could not serve the other. What the callbacks need - the region and the
+ * section position - comes from {@link RustChunkBake#rebuildingRegion()}, the rebuild context
+ * the task hook sets per thread before {@code compile} runs.
  */
 @Mixin(SectionCompiler.class)
 public class SectionCompilerMixin {
@@ -117,7 +130,10 @@ public class SectionCompilerMixin {
      * {@code RustChunkBake} answer is now read once per block.
      */
     @Redirect(
-        method = "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;Ljava/util/List;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;",
+        method = {
+            "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;",
+            "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;Ljava/util/List;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;"
+        },
         at = @At(
             value = "INVOKE",
             target = "Lnet/minecraft/world/level/block/state/BlockState;getRenderShape()" +
@@ -145,7 +161,10 @@ public class SectionCompilerMixin {
      * still answers {@code MODEL} for.
      */
     @Redirect(
-        method = "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;Ljava/util/List;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;",
+        method = {
+            "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;",
+            "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;Ljava/util/List;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;"
+        },
         at = @At(
             value = "INVOKE",
             target = "Lnet/minecraft/client/renderer/block/ModelBlockRenderer;tesselateBlock(" +
@@ -184,7 +203,10 @@ public class SectionCompilerMixin {
      * that reached a fluid.
      */
     @Redirect(
-        method = "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;Ljava/util/List;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;",
+        method = {
+            "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;",
+            "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;Ljava/util/List;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;"
+        },
         at = @At(
             value = "INVOKE",
             target = "Lnet/minecraft/world/level/block/state/BlockState;getFluidState()" +
@@ -209,7 +231,10 @@ public class SectionCompilerMixin {
      * Minecraft's.
      */
     @Redirect(
-        method = "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;Ljava/util/List;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;",
+        method = {
+            "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;",
+            "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;Ljava/util/List;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;"
+        },
         at = @At(
             value = "INVOKE",
             target = "Lnet/minecraft/client/renderer/block/FluidRenderer;tesselate(" +
@@ -273,13 +298,18 @@ public class SectionCompilerMixin {
     private static final ThreadLocal<BitSet> OPAQUE = ThreadLocal.withInitial(BitSet::new);
 
     /**
-     * The section this thread is compiling, so that the redirect below can file the answer it resolves.
+     * The section being compiled, packed as {@code SectionPos.asLong} of the middle section of the
+     * rebuild's 3x3x3 region.
      *
-     * A {@code ThreadLocal} and not a field on the graph, for the reason every other one here is: chunk
-     * builds run on a pool of threads, and the graph does not know what position it belongs to. Set at the
-     * head of the compile, which is the only place {@code SectionPos} is reachable, and read once.
+     * <p>A long rather than a {@code SectionPos} because the callbacks that fill and read it capture no
+     * arguments - the position is derived from the rebuild region {@link RustChunkBake#rebuildingRegion()}
+     * hands over, and a long is everything {@code noteVisibility} asks of it.
+     *
+     * <p>A {@code ThreadLocal} and not a field, for the reason every other one here is: chunk builds run
+     * on a pool of threads, and the graph does not know what position it belongs to. Set at the head of
+     * the compile, which is where the region is reachable, and read once.
      */
-    private static final ThreadLocal<SectionPos> COMPILING = new ThreadLocal<>();
+    private static final ThreadLocal<Long> COMPILING = new ThreadLocal<>();
 
     /**
      * {@code Direction.values()}, which builds a fresh array on every call.
@@ -360,20 +390,36 @@ public class SectionCompilerMixin {
      * baker has.
      */
     @Inject(
-        method = "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;Ljava/util/List;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;",
+        method = {
+            "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;",
+            "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;Ljava/util/List;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;"
+        },
         at = @At("HEAD")
     )
     private void wgpuMc$gatherOcclusionAndBlockEntities(
-            SectionPos sectionPos,
-            RenderSectionRegion region,
-            VertexSorting vertexSorting,
-            SectionBufferBuilderPack builders,
-            List<?> additionalRenderers,
             CallbackInfoReturnable<SectionCompiler.Results> info) {
         MASKED.set(Boolean.FALSE);
         SKIPPED.set(Boolean.FALSE);
         ENTITY_COUNT.set(0);
-        COMPILING.set(sectionPos);
+
+        // The compile's own arguments are not captured (the two loaders' compile signatures differ,
+        // and a handler pinned to either one cannot serve the other), so the section and the region
+        // come from the rebuild context the task hook set on this thread. A null there means this
+        // compile was reached from outside a rebuild task on a thread whose last task is gone -
+        // nothing this side contributes is safe to assume, so the vanilla path runs untouched.
+        RenderSectionRegion region = RustChunkBake.rebuildingRegion();
+
+        if (region == null) {
+            COMPILING.set(null);
+            return;
+        }
+
+        RenderSectionRegionAccessor corners = (RenderSectionRegionAccessor) region;
+        int centreX = corners.wgpu_mc$minSectionX() + 1;
+        int centreY = corners.wgpu_mc$minSectionY() + 1;
+        int centreZ = corners.wgpu_mc$minSectionZ() + 1;
+
+        COMPILING.set(SectionPos.asLong(centreX, centreY, centreZ));
 
         if (!RustChunkBake.meshesInRust()) {
             return;
@@ -494,7 +540,10 @@ public class SectionCompilerMixin {
      * the visibility answer is the game's.
      */
     @Redirect(
-        method = "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;Ljava/util/List;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;",
+        method = {
+            "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;",
+            "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;Ljava/util/List;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;"
+        },
         at = @At(
             value = "INVOKE",
             target = "Lnet/minecraft/client/renderer/chunk/VisGraph;" +
@@ -516,7 +565,7 @@ public class SectionCompilerMixin {
             ((VisGraphMixin) (Object) graph).wgpu_mc$setEmpty(4096 - count);
         }
 
-        SectionPos compiling = COMPILING.get();
+        Long compiling = COMPILING.get();
         VisibilitySet visibility = graph.resolve();
 
         // Filed after resolving, and under the position this compile is for. The payload that will carry the
@@ -524,10 +573,7 @@ public class SectionCompilerMixin {
         // this point, so this compile's own answer cannot be in that payload - and a section whose answer has
         // not come back yet is sent as unanswered rather than as "nothing is visible out of it".
         if (compiling != null) {
-                RustChunkBake.noteVisibility(
-                SectionPos.asLong(compiling.x(), compiling.y(), compiling.z()),
-                wgpuMc$packVisibility(visibility)
-                );
+                RustChunkBake.noteVisibility(compiling, wgpuMc$packVisibility(visibility));
         }
 
         return visibility;
@@ -626,7 +672,10 @@ public class SectionCompilerMixin {
      * loop is still there for the fallback and nothing else in {@code compile} reads its result.
      */
     @Redirect(
-        method = "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;Ljava/util/List;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;",
+        method = {
+            "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;",
+            "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;Ljava/util/List;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;"
+        },
         at = @At(
             value = "INVOKE",
             target = "Lnet/minecraft/core/BlockPos;betweenClosed(" +
@@ -656,21 +705,33 @@ public class SectionCompilerMixin {
      * {@code x | z << 4 | y << 8} - the same de-interleaving the {@code VisGraph} bit index needs.
      */
     @Inject(
-        method = "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;Ljava/util/List;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;",
+        method = {
+            "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;",
+            "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;Ljava/util/List;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;"
+        },
         at = @At("RETURN")
     )
     private void wgpuMc$addTheMaskedBlockEntities(
-            SectionPos sectionPos,
-            RenderSectionRegion region,
-            VertexSorting vertexSorting,
-            SectionBufferBuilderPack builders,
-            List<?> additionalRenderers,
             CallbackInfoReturnable<SectionCompiler.Results> info) {
         if (!MASKED.get()) {
             return;
         }
 
-        int count = ENTITY_COUNT.get();
+        // The region again from the rebuild context - the same one the head callback read, on the
+        // same thread, inside the same compile. A null here cannot be reached with MASKED set (the
+        // head callback clears the mask before it declines), so the read below is safe.
+        RenderSectionRegion region = RustChunkBake.rebuildingRegion();
+
+        if (region == null) {
+            return;
+        }
+
+        RenderSectionRegionAccessor corners = (RenderSectionRegionAccessor) region;
+        BlockPos origin = new BlockPos(
+            (corners.wgpu_mc$minSectionX() + 1) << 4,
+            (corners.wgpu_mc$minSectionY() + 1) << 4,
+            (corners.wgpu_mc$minSectionZ() + 1) << 4
+        );
 
         // **The entities are the second of the two things a compile must still do, and this is where the
         // two versions of it are crossed.** With the walk skipped, the entities found here are the answer
@@ -683,7 +744,7 @@ public class SectionCompilerMixin {
             : new SectionCompiler.Results();
 
         int[] entityAt = ENTITY_AT.get();
-        BlockPos origin = sectionPos.origin();
+        int count = ENTITY_COUNT.get();
         BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
         SectionCompilerInvoker invoker = (SectionCompilerInvoker) (Object) this;
 
