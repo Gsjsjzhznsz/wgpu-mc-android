@@ -383,7 +383,6 @@ pub fn registerEntities(mut env: JNIEnv, _class: JClass, string: JString) {
                     "wgpu-mc: registerEntities: helperSetPartIndex failed ({err}); the rest of \
                      this entity's parts are skipped"
                 );
-                return;
             }
         });
     });

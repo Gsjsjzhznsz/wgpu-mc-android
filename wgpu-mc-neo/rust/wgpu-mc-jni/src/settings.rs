@@ -2716,14 +2716,12 @@ mod tests {
             validate_indirect_calls_default_on(false),
             "a host keeps indirect-call validation: it has never misfired off the phones"
         );
-        assert_eq!(
+        assert!(
             validate_indirect_calls_default_on(false),
-            true,
             "the host arm of the platform default is on"
         );
-        assert_eq!(
-            validate_indirect_calls_default_on(true),
-            false,
+        assert!(
+            !validate_indirect_calls_default_on(true),
             "the Android arm of the platform default is off - the probes read their clear colour \
              with the validation's rewritten arguments in the way"
         );

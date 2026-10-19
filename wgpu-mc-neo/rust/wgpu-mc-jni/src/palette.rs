@@ -148,12 +148,7 @@ pub fn paletteReadPacket(
         // length subtraction into an enormous slice, and reading it is undefined behaviour.
         // An out-of-range position reads nothing and the packet is refused.
         let start = (current_position as usize).min(array.len());
-        unsafe {
-            slice::from_raw_parts(
-                array.as_ptr().offset(start as isize) as *mut u8,
-                array.len() - start,
-            )
-        }
+        unsafe { slice::from_raw_parts(array.as_ptr().add(start) as *mut u8, array.len() - start) }
     };
 
     let mut cursor = Cursor::new(vec);

@@ -1452,10 +1452,7 @@ fn bind_groups_for_call(
 
                     match &binding.resource {
                         PlannedResource::Uniform { min_size } => {
-                            let Some((buffer, address)) = call_buffer(&plan.name, binding, &entry)
-                            else {
-                                return None;
-                            };
+                            let (buffer, address) = call_buffer(&plan.name, binding, &entry)?;
                             let range = entry.offset..entry.offset + entry.length;
 
                             addresses.push(address);
@@ -1485,10 +1482,7 @@ fn bind_groups_for_call(
                             })
                         }
                         PlannedResource::Storage | PlannedResource::PerDrawStorage => {
-                            let Some((buffer, address)) = call_buffer(&plan.name, binding, &entry)
-                            else {
-                                return None;
-                            };
+                            let (buffer, address) = call_buffer(&plan.name, binding, &entry)?;
                             let range = entry.offset..entry.offset + entry.length;
 
                             addresses.push(address);
@@ -1503,10 +1497,7 @@ fn bind_groups_for_call(
                             })
                         }
                         PlannedResource::Texture { .. } => {
-                            let Some((view, address)) = call_texture(&plan.name, binding, &entry)
-                            else {
-                                return None;
-                            };
+                            let (view, address) = call_texture(&plan.name, binding, &entry)?;
 
                             addresses.push(address);
 
@@ -1516,11 +1507,7 @@ fn bind_groups_for_call(
                             })
                         }
                         PlannedResource::Sampler => {
-                            let Some((sampler, address)) =
-                                call_sampler(&plan.name, binding, &entry)
-                            else {
-                                return None;
-                            };
+                            let (sampler, address) = call_sampler(&plan.name, binding, &entry)?;
 
                             addresses.push(address);
 
@@ -1533,9 +1520,7 @@ fn bind_groups_for_call(
                 })
                 .collect::<Option<Vec<_>>>();
 
-            let Some(entries) = entries else {
-                return None;
-            };
+            let entries = entries?;
 
             Some(wm.gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(&plan.name),

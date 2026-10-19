@@ -2743,7 +2743,6 @@ pub fn cacheBlockStates(mut env: JNIEnv, _class: JClass) {
                 "wgpu-mc: helperSetBlockStateIndex failed ({err}); the rest of the states are \
                  skipped"
             );
-            return;
         }
     });
 

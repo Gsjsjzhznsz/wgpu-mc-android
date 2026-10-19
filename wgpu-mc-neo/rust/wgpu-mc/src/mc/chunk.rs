@@ -2008,7 +2008,7 @@ fn report_winding(pos: IVec3, layers: &[BakedLayer]) {
     // census of every sixteenth bake answers as exactly as a census of all of them - while costing
     // a sixteenth. The diagnostic switch is the "I am looking at one section" case, and it walks
     // every bake.
-    let sampled = SAMPLE.fetch_add(1, Ordering::Relaxed) % 16 == 0;
+    let sampled = SAMPLE.fetch_add(1, Ordering::Relaxed).is_multiple_of(16);
     if !sampled && !DIAGNOSTIC_LOGGING.load(Ordering::Relaxed) {
         return;
     }
