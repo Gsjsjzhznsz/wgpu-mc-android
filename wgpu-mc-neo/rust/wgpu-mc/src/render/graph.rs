@@ -309,7 +309,17 @@ fn plan_runs(calls: &[DrawCall]) -> Vec<DrawRun> {
 /// with no copy at all, and a pass over it gathers into the compacted buffer exactly as before. The
 /// once-a-second report names a pass that crossed it, so a world whose arenas fragment past the rail
 /// is visible in a log nobody is profiling.
-const IN_PLACE_RUN_LIMIT: u64 = 256;
+///
+/// **1024, where 256 used to be, because the rail sat where the world lives.** android.44's device
+/// log shows a loaded world's passes planning 258-324 runs - bake-order allocation makes roughly
+/// thirty sections contiguous at a stretch - so the passes spent their frames straddling the rail:
+/// in-place one frame, then the compacted draw with its blit traffic and buffer growth the next,
+/// then in-place again. 256 was written when the runs a healthy arena produced were assumed to be
+/// dozens, not hundreds; at hundreds the per-run draw cost the rail guards against is still the
+/// cheaper side of a few thousand blits. The rail now sits an order of magnitude above what a
+/// loaded world plans, and the compacted draw takes over only where it was meant to: fragmentation
+/// so bad the runs alone are the frame.
+const IN_PLACE_RUN_LIMIT: u64 = 1024;
 
 /// Says so, once a second, when a pass wanted more in-place runs than the limit holds.
 ///

@@ -373,9 +373,13 @@ fn no_adv_culling() -> IntSetting {
 /// still answers the desktop-era `true` to the default the phones this port runs on draw well: a
 /// fresh install's `true` was the config file's answer, not the player's, and on a phone whose GPU
 /// cannot hold the display's refresh it is the difference between half-rate stutter and the frames
-/// the GPU actually makes. After it has run, a player who turns vsync back on keeps that answer:
-/// the marker says the config is current, and a current config is read as it stands.
-const CURRENT_DEFAULTS_REVISION: u32 = 2;
+/// the GPU actually makes. Revision 3 moves a `validate_indirect_calls` that still answers the
+/// builds' `true` to the default the phones draw at all: on the Adreno drivers, the validation's
+/// rewritten arguments reach the draw zeroed, the probes read their clear colour, and the batching
+/// the whole pipeline is built around is refused for a fault the driver does not have. After a
+/// migration has run, a player who turns the moved switch back keeps that answer: the marker says
+/// the config is current, and a current config is read as it stands.
+const CURRENT_DEFAULTS_REVISION: u32 = 3;
 
 /// Whether a fresh install syncs its framerate to the display. **Off**, and for one reason: the
 /// `Fifo` present mode vsync asks for is a double-buffered queue, and a frame that misses the
@@ -387,6 +391,30 @@ const CURRENT_DEFAULTS_REVISION: u32 = 2;
 /// the compositor absorbing most of what `Fifo` used to smooth over.
 fn vsync_default() -> bool {
     false
+}
+
+/// Whether wgpu's own indirect-argument validation runs, **by platform** - the form the tests
+/// read, so both arms are assertable from a host. See [`validate_indirect_calls_default`].
+fn validate_indirect_calls_default_on(android: bool) -> bool {
+    !android
+}
+
+/// Whether wgpu's own indirect-argument validation runs, by default.
+///
+/// **Off on Android, on elsewhere.** The check is a compute pass wgpu injects ahead of every
+/// indirect draw, rewriting the arguments into a buffer it has bounds-checked first - and on the
+/// Adreno drivers this port's phones run, that rewritten buffer arrives at the draw zeroed, so the
+/// draw rasterises nothing: the probes the batching is gated on read back their clear colour
+/// (android.41's `[999, 999, 999, 999]`), the batched path is refused for a driver fault it does
+/// not have, and the terrain falls back to hundreds of draws or thousands of blits a frame - the
+/// "performance below what the hardware should manage" report, with every counter except the
+/// framerate agreeing. Without the check a draw reads the arguments this renderer wrote itself,
+/// and the batched path bounds its counts before it records them; what the check exists to catch
+/// is an out-of-bounds argument, which here would be a renderer bug rather than a driver one.
+/// Desktops keep it: it has never misfired there, and D3D12's indirect semantics are the ones the
+/// check was written for.
+fn validate_indirect_calls_default() -> bool {
+    validate_indirect_calls_default_on(cfg!(target_os = "android"))
 }
 
 /// Where the defaults revision lives: beside the config, in its own file.
@@ -620,12 +648,15 @@ lazy_static! {
             true,
         ),
         validate_indirect_calls: SettingInfo::debug(
-            "Check the arguments in an indirect draw buffer before issuing the draw, and turn the draw \
-            into a no-op when they are out of bounds. On by default and it should stay on: without it \
-            an out-of-bounds indirect argument is undefined behaviour rather than an error, and on \
-            D3D12 it would draw terrain from the wrong offsets. What it costs is a check on a handful \
-            of integers per indirect call, not per section.",
-            true,
+            "Check the arguments in an indirect draw buffer before issuing the draw, and turn the \
+            draw into a no-op when they are out of bounds. Off by default on Android and on \
+            elsewhere: the check is a compute pass wgpu injects ahead of every indirect draw, and \
+            on the Adreno drivers these phones run its rewritten arguments reach the draw zeroed, \
+            so the draw rasterises nothing - the probes read their clear colour, the batched \
+            terrain path is refused, and the frame pays hundreds of draws or thousands of blits \
+            instead of one. The draw reads arguments this renderer wrote and bounded itself; \
+            turning this back on is for diagnosis, not for play.",
+            validate_indirect_calls_default(),
         ),
         discard_backend_labels: SettingInfo::debug(
             "Do not pass the labels this renderer gives its objects down to the graphics backend, which \
@@ -1049,7 +1080,23 @@ impl Settings {
     ///   is exactly the "performance below what the hardware should manage" the port keeps hearing
     ///   about; the default moves to off, and a player who turns it back on - it is a real preference
     ///   on a desktop that tears - keeps that answer once the marker says revision 2.
+    ///
+    /// * `3` - `validate_indirect_calls`, **on Android**. Every build before this one defaulted it
+    ///   on on every platform, and the configs carry that `true` the same way. On the Adreno drivers
+    ///   the phones run, the validation's compute-rewritten arguments reach the draw zeroed, the
+    ///   draw rasterises nothing, and the probes the batched terrain path is gated on read their
+    ///   clear colour - the batching refused for a fault the driver does not have. The default is
+    ///   platform-conditional (off on Android, on elsewhere, see
+    ///   [`validate_indirect_calls_default`]), so the migration moves the carried `true` to the
+    ///   platform's default; a player who turns it back on keeps that answer once the marker says
+    ///   revision 3.
     fn migrate_defaults(&mut self, config_revision: u32) -> bool {
+        self.migrate_defaults_on(config_revision, cfg!(target_os = "android"))
+    }
+
+    /// [`Settings::migrate_defaults`] with the platform handed in, so the Android-only arm is
+    /// exercisable from a host test - the same split [`Settings::enforce_android_terrain`] uses.
+    fn migrate_defaults_on(&mut self, config_revision: u32, android: bool) -> bool {
         if config_revision >= CURRENT_DEFAULTS_REVISION {
             return false;
         }
@@ -1071,6 +1118,20 @@ impl Settings {
                  here"
             );
             self.vsync = BoolSetting::of(vsync_default());
+        }
+
+        if config_revision < 3 && self.validate_indirect_calls.value {
+            let default = validate_indirect_calls_default_on(android);
+            if !default && android {
+                log::info!(
+                    "wgpu-mc: this config carries indirect-call validation on from the builds that \
+                     defaulted it on; on this platform the validation's rewritten arguments reach \
+                     the draw zeroed, the probes read their clear colour, and the batched terrain \
+                     path is refused for a fault the driver does not have - the default is off now, \
+                     and turning it back on holds from here"
+                );
+            }
+            self.validate_indirect_calls = BoolSetting::of(default);
         }
 
         true
@@ -1230,13 +1291,14 @@ impl Default for Settings {
             // switch rather than a constant.
             host_validation: BoolSetting::of(false),
             gpu_based_validation: BoolSetting::of(false),
-            // The instance flags that were constants in `device.rs` until they were settings. Two are
-            // on because that is what the renderer was building by hand: `DEBUG` (it set the flag
-            // directly) and `VALIDATION_INDIRECT_CALL` (it lost the flag by setting `DEBUG` alone
-            // instead of `InstanceFlags::debugging()`). The other two were off because they were
+            // The instance flags that were constants in `device.rs` until they were settings. `DEBUG`
+            // is on because that is what the renderer was building by hand; `VALIDATION_INDIRECT_CALL`
+            // is the platform-conditional default - on where it has never misfired, off on Android
+            // where its rewritten arguments reached the draw zeroed and killed every indirect draw
+            // (see `validate_indirect_calls_default`). The other two were off because they were
             // never set at all.
             shader_debug_info: BoolSetting::of(true),
-            validate_indirect_calls: BoolSetting::of(true),
+            validate_indirect_calls: BoolSetting::of(validate_indirect_calls_default()),
             discard_backend_labels: BoolSetting::of(false),
             allow_noncompliant_adapter: BoolSetting::of(false),
             logging: BoolSetting::of(false),
@@ -2640,17 +2702,35 @@ mod tests {
             !debug.host_validation,
             "host-side validation is off by default now; it used to be unconditional"
         );
-        // **The four instance flags that were constants in `device.rs`.** Two are on because that is
-        // what the renderer was building by hand, and two are off because it never set them - so this
-        // is a record of what changed as much as of what the defaults are.
+        // **The four instance flags that were constants in `device.rs`.** `DEBUG` is on because
+        // that is what the renderer was building by hand; indirect-call validation follows the
+        // platform-conditional default, so a host (where it has never misfired) keeps it on and a
+        // phone - where its rewritten arguments reached the draw zeroed - ships with it off. The
+        // last two are off because they were never set at all.
         assert!(
             debug.shader_debug_info,
             "the DEBUG instance flag was unconditional, so it stays on by default"
         );
-        assert!(
+        assert_eq!(
             debug.validate_indirect_calls,
-            "indirect-call validation was on - `InstanceFlags::from_build_config` returns it in a \
-             release build, and the renderer lost it by setting `DEBUG` alone"
+            validate_indirect_calls_default_on(false),
+            "a host keeps indirect-call validation: it has never misfired off the phones"
+        );
+        assert_eq!(
+            validate_indirect_calls_default_on(false),
+            true,
+            "the host arm of the platform default is on"
+        );
+        assert_eq!(
+            validate_indirect_calls_default_on(true),
+            false,
+            "the Android arm of the platform default is off - the probes read their clear colour \
+             with the validation's rewritten arguments in the way"
+        );
+        assert_eq!(
+            debug.validate_indirect_calls,
+            validate_indirect_calls_default(),
+            "the built default agrees with the platform default this host resolves to"
         );
         assert!(
             !debug.discard_backend_labels,
@@ -2987,9 +3067,75 @@ mod tests {
         );
     }
 
+    /// The revision-3 migration, which is what carries indirect-call validation off onto the
+    /// installs whose config has been answering the every-platform `true` since the first build
+    /// wrote it. On the Adreno drivers the phones run, that `true` is what zeroes the validation's
+    /// rewritten arguments at the draw - the probes read their clear colour and the batched terrain
+    /// path is refused for a fault the driver does not have - so the default moves with the
+    /// platform, and the same shape as the migrations beside it holds afterwards: once the marker
+    /// says the config is current, a `true` is the player's own answer and stands.
+    #[test]
+    fn the_defaults_migration_moves_a_carried_indirect_validation_switch() {
+        let mut carried: Settings = serde_json::from_str(
+            r#"{ "validate_indirect_calls": { "type": "bool", "value": true } }"#,
+        )
+        .expect("a config carrying the every-platform answer");
+
+        assert!(
+            carried.migrate_defaults_on(0, true),
+            "a config without a revision marker is due the migration"
+        );
+        assert!(
+            !carried.validate_indirect_calls.value,
+            "on Android the validation is what zeroed the draws, so the carried on moves to off"
+        );
+
+        // A desktop's config carries the same `true`, and the desktop default is still `on` - the
+        // migration is a platform-conditional move, not a global flip.
+        let mut desktop: Settings = serde_json::from_str(
+            r#"{ "validate_indirect_calls": { "type": "bool", "value": true } }"#,
+        )
+        .expect("the same answer, on a desktop");
+
+        assert!(desktop.migrate_defaults_on(0, false));
+        assert!(
+            desktop.validate_indirect_calls.value,
+            "off the phones the validation has never misfired, so the default stays on"
+        );
+
+        // A config already marked revision 2 is still due revision 3 - the revisions are a ladder,
+        // and the configs the phones run today carry exactly this shape.
+        let mut current: Settings = serde_json::from_str(
+            r#"{ "validate_indirect_calls": { "type": "bool", "value": true } }"#,
+        )
+        .expect("a config written under revision 2");
+
+        assert!(
+            current.migrate_defaults_on(2, true),
+            "revision 2 is due revision 3"
+        );
+        assert!(!current.validate_indirect_calls.value);
+
+        // The same wish once the marker says the config is current: that answer is the player's
+        // own, and the migration holds off - or the switch would be a constant.
+        let mut wanted: Settings = serde_json::from_str(
+            r#"{ "validate_indirect_calls": { "type": "bool", "value": true } }"#,
+        )
+        .expect("the same wish, under the current revision");
+
+        assert!(!wanted.migrate_defaults_on(CURRENT_DEFAULTS_REVISION, true));
+        assert!(
+            wanted.validate_indirect_calls.value,
+            "after the migration an explicit on is the player's answer - the diagnosis switch is \
+             theirs to keep"
+        );
+    }
+
     /// The fresh-install defaults, named so a flip shows up here rather than on a phone: vsync is
-    /// **off** because Fifo halves a GPU that misses the refresh, and the batching is on because the
-    /// devices that proved it can run it outnumber the ones that cannot.
+    /// **off** because Fifo halves a GPU that misses the refresh, the batching is on because the
+    /// devices that proved it can run it outnumber the ones that cannot, and indirect-call
+    /// validation follows the platform default - off where the phones run, since it is what zeroes
+    /// their indirect draws.
     #[test]
     fn the_fresh_install_defaults_are_the_ones_the_phones_draw_well() {
         let settings = Settings::default();
@@ -3001,6 +3147,11 @@ mod tests {
         assert!(
             settings.terrain_indirect.value,
             "a fresh install batches what its device can prove"
+        );
+        assert_eq!(
+            settings.validate_indirect_calls.value,
+            validate_indirect_calls_default(),
+            "a fresh install's indirect-call validation is the platform default"
         );
     }
 }
