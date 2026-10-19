@@ -167,7 +167,9 @@ def our_claims(json_paths: list[Path]) -> dict:
             + list(config.get("server", []))
         resources_root = json_path.parent
         src_roots = [resources_root.parent / "java"]
-        if resources_root.parent.name == "resources":
+        if resources_root.name == "resources":
+            # a config in another module's resources/ (the Fabric build shares
+            # the Neolectrum source tree): fall back to that tree too
             src_roots.append(resources_root.parent.parent.parent
                              / "Neolectrum" / "src" / "main" / "java")
         for name in names:
