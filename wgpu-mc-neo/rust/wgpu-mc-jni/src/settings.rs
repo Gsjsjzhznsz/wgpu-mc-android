@@ -379,7 +379,16 @@ fn no_adv_culling() -> IntSetting {
 /// the whole pipeline is built around is refused for a fault the driver does not have. After a
 /// migration has run, a player who turns the moved switch back keeps that answer: the marker says
 /// the config is current, and a current config is read as it stands.
-const CURRENT_DEFAULTS_REVISION: u32 = 3;
+///
+/// Revision 4 is a retirement rather than a move: the render-scale pair - the frame rendered at a
+/// fraction of the window and stretched back sharpened - is gone from the renderer, and the configs
+/// the builds that shipped it wrote carry two rows nothing reads any more. Nothing breaks while they
+/// sit there: serde ignores what the struct does not name. What the rewrite buys is a config that
+/// says what the renderer does - the options screen rebuilds the file from the schema on every
+/// apply, and a row the schema has no answer for is one more thing a diff of two configs explains
+/// around. So the marker moves to 4, the file is written back without the pair, and the log says
+/// what left and why - once, because the marker stops the next launch from repeating it.
+const CURRENT_DEFAULTS_REVISION: u32 = 4;
 
 /// Whether a fresh install syncs its framerate to the display. **Off**, and for one reason: the
 /// `Fifo` present mode vsync asks for is a double-buffered queue, and a frame that misses the
@@ -1090,6 +1099,15 @@ impl Settings {
     ///   [`validate_indirect_calls_default`]), so the migration moves the carried `true` to the
     ///   platform's default; a player who turns it back on keeps that answer once the marker says
     ///   revision 3.
+    ///
+    /// * `4` - the render-scale pair (`render_scale`, `upscale_sharpening`), **retired**. The
+    ///   builds that shipped them wrote both rows into every config they saved, and the fields no
+    ///   longer exist to read them, so the rows are dead weight the file carries. Serde's own
+    ///   reading of the file has already dropped them by the time this runs - there is nothing in
+    ///   the struct to move - so this revision's work is the *write*: the config rewritten without
+    ///   the pair, the marker beside it saying the purge ran, and a log line naming what left.
+    ///   A config that never carried them is rewritten byte-for-byte the same content, which is
+    ///   harmless.
     fn migrate_defaults(&mut self, config_revision: u32) -> bool {
         self.migrate_defaults_on(config_revision, cfg!(target_os = "android"))
     }
@@ -1132,6 +1150,15 @@ impl Settings {
                 );
             }
             self.validate_indirect_calls = BoolSetting::of(default);
+        }
+
+        if config_revision < 4 {
+            log::info!(
+                "wgpu-mc: this config carries the render-scale pair - the frame at a fraction of \
+                 the window, stretched back sharpened - which this build retires; the file is \
+                 rewritten without it and the renderer draws the window's own resolution, which \
+                 is the picture every build before android.52 made"
+            );
         }
 
         true
@@ -3126,6 +3153,37 @@ mod tests {
             wanted.validate_indirect_calls.value,
             "after the migration an explicit on is the player's answer - the diagnosis switch is \
              theirs to keep"
+        );
+    }
+
+    /// The revision-4 retirement: the configs android.52's builds wrote carry `render_scale` and
+    /// `upscale_sharpening`, and the renderer no longer has either field. Serde's read of such a
+    /// file has already dropped the pair by the time the migration runs - which is the claim this
+    /// test pins on both ends: a config with the pair parses into the current struct, and what the
+    /// struct writes back names neither row. The migration itself answers "yes, write" for any
+    /// config older than the marker, which is what makes the load path rewrite the file without
+    /// them.
+    #[test]
+    fn the_defaults_migration_retires_the_render_scale_pair() {
+        let mut carried: Settings = serde_json::from_str(
+            r#"{
+                "render_scale": { "type": "float", "min": 0.5, "max": 1.0, "step": 0.05, "value": 0.75 },
+                "upscale_sharpening": { "type": "float", "min": 0.0, "max": 1.0, "step": 0.05, "value": 0.5 }
+            }"#,
+        )
+        .expect("a config carrying the retired pair still parses - serde ignores what the struct does not name");
+
+        assert!(
+            carried.migrate_defaults_on(3, true),
+            "a config marked revision 3 is due the retirement's rewrite"
+        );
+
+        let written =
+            serde_json::to_string(&carried).expect("the settings serialize for the config file");
+
+        assert!(
+            !written.contains("render_scale") && !written.contains("upscale_sharpening"),
+            "the rewritten config names neither retired row: {written}"
         );
     }
 
