@@ -5,10 +5,7 @@ import dev.birb.wgpu.chunk.ContainerData;
 import dev.birb.wgpu.chunk.RustChunkBake;
 import net.minecraft.client.renderer.SectionBufferBuilderPack;
 import net.minecraft.client.renderer.block.BlockAndTintGetter;
-import net.minecraft.client.renderer.block.BlockQuadOutput;
 import net.minecraft.client.renderer.block.FluidRenderer;
-import net.minecraft.client.renderer.block.ModelBlockRenderer;
-import net.minecraft.client.renderer.block.dispatch.BlockStateModel;
 import net.minecraft.client.renderer.chunk.RenderSectionRegion;
 import net.minecraft.client.renderer.chunk.SectionCompiler;
 import net.minecraft.client.renderer.chunk.VisGraph;
@@ -78,6 +75,23 @@ import java.util.List;
  * {@code ModelBlockRenderer} and builds its own geometry. That geometry is not something this renderer
  * knows how to build in Rust, so it is left to Minecraft to produce, exactly as before.
  *
+ * <p><b>The tesselateBlock call is not redirected, and Indigo is the reason.</b> fabric-renderer-api-v1
+ * redirects the same call inside the same method - its {@code tesselateBlockProxy}, the seam its own
+ * renderer hangs on - and two {@code @Redirect}s on one instruction cannot both apply: Mixin hands the
+ * instruction to one of them and the other's {@code require} check then fails, which is a class that
+ * refuses to transform, and on Fabric that was the client leaving the world at the login packet
+ * (android.46's log: {@code InjectionError ... (0/1) succeeded. Scanned 0 target(s)}). So this mixin
+ * claims nothing there. It does not need to: while Rust owns the section, the {@code getRenderShape}
+ * redirect above answers {@code INVISIBLE} for every non-air block, which keeps the whole
+ * {@code == RenderShape.MODEL} body - the call site included - from executing; and when Rust does not
+ * own the section, the predicate forwards the real shape and Indigo's proxy runs exactly as it would
+ * without this mod. A redirect did sit here once, as a fallback for blocks the predicate still answered
+ * {@code MODEL} for - but the predicate and the fallback read the same thread-local answer in the same
+ * block iteration, so there was no reachable state the fallback decided and the predicate did not, and
+ * the claim it bought was the crash. {@code scripts/audit_mixin_conflicts.py} is the gate that reads
+ * the other mods' compiled mixins and keeps every remaining claim in this file free of the same
+ * collision.
+ *
  * <p>The answer comes from {@code RustChunkBake} rather than from the setting, and that is the point:
  * the setting says the path is on, while the bake says whether Rust actually took *this* section. A bake
  * that failed - no block cache yet, an exception, the registry not ready - leaves Minecraft's geometry
@@ -146,49 +160,6 @@ public class SectionCompilerMixin {
         }
 
         return blockState.getRenderShape();
-    }
-
-    /**
-     * The block geometry: {@code blockRenderer.tesselateBlock(...)}.
-     *
-     * <p>Redirected rather than cancelled at a line number, so the target is the call and not a position:
-     * a descriptor match cannot silently start patching nothing because a patch moved a line. The
-     * arguments are the receiver and the nine the call takes, in order, and none of them is used here.
-     *
-     * <p>This handler cannot save the arguments on its own - they are evaluated before it runs, the model
-     * lookup inlined into the call site included. The {@code getRenderShape} redirect above is what keeps
-     * this call site from being reached at all; this one stays as the fallback for a block the predicate
-     * still answers {@code MODEL} for.
-     */
-    @Redirect(
-        method = {
-            "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;",
-            "compile(Lnet/minecraft/core/SectionPos;Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;Lcom/mojang/blaze3d/vertex/VertexSorting;Lnet/minecraft/client/renderer/SectionBufferBuilderPack;Ljava/util/List;)Lnet/minecraft/client/renderer/chunk/SectionCompiler$Results;"
-        },
-        at = @At(
-            value = "INVOKE",
-            target = "Lnet/minecraft/client/renderer/block/ModelBlockRenderer;tesselateBlock(" +
-                "Lnet/minecraft/client/renderer/block/BlockQuadOutput;" +
-                "FFFLnet/minecraft/client/renderer/block/BlockAndTintGetter;" +
-                "Lnet/minecraft/core/BlockPos;" +
-                "Lnet/minecraft/world/level/block/state/BlockState;" +
-                "Lnet/minecraft/client/renderer/block/dispatch/BlockStateModel;J)V"
-        )
-    )
-    private void wgpuMc$skipBlockGeometry(
-            ModelBlockRenderer renderer,
-            BlockQuadOutput output,
-            float x, float y, float z,
-            BlockAndTintGetter level,
-            BlockPos pos,
-            BlockState blockState,
-            BlockStateModel model,
-            long seed) {
-        if (RustChunkBake.meshesInRust()) {
-            return;
-        }
-
-        renderer.tesselateBlock(output, x, y, z, level, pos, blockState, model, seed);
     }
 
     /**

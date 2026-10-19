@@ -194,6 +194,39 @@ jobs:
             Neolectrum/src/main/resources/wgpu_mc.mixins.json \
             Neolectrum-fabric/src/main/resources/wgpu_mc.mixins.json
 
+      - name: Audit every mixin claim against fabric-api's own
+        # The target audit above proves our injection strings describe members
+        # the game has; it cannot see the other failure mode - another mod
+        # injecting into the *same instruction*. Two @Redirects on one call
+        # cannot both apply: Mixin hands the instruction to one and the other's
+        # require check then throws, which is a class that fails to transform -
+        # on Fabric that was "joining a world crashes the client" again (our
+        # tesselateBlock redirect collided with Indigo's own redirect of the
+        # same call, which is there on every Fabric install by design). This
+        # step reads fabric-api's *compiled* mixin classes (Java 25 class
+        # files, no JDK needed) from the pinned release the players actually
+        # run, cross-checks every claimed instruction, and fails the build on
+        # any overlap that is not two plain @Injects.
+        run: |
+          mc_version="$(grep -m1 '^neoforge_minecraft_version=' Neolectrum/gradle.properties | cut -d= -f2)"
+          jar=".mc-cache/client-$mc_version.jar"
+          fa_version="$(tr -d '[:space:]' < scripts/fabric_api_audit_pin.txt)"
+          fa_jar=".mc-cache/fabric-api-$fa_version.jar"
+          if [ ! -f "$fa_jar" ]; then
+            mkdir -p .mc-cache
+            # the pin is the full version_number (it names its own game
+            # version), so no game_versions filter - one exact match or fail
+            fa_url="$(curl -sfL "https://api.modrinth.com/v2/project/fabric-api/version" \
+              | python3 -c "import json,sys; pin='$fa_version'; print(next(v['files'][0]['url'] for v in json.load(sys.stdin) if v['version_number']==pin))")"
+            curl -sfL "$fa_url" -o "$fa_jar"
+          fi
+          ls -la "$fa_jar"
+          python3 scripts/audit_mixin_conflicts.py \
+            --vanilla-jar "$jar" \
+            --other-jar "$fa_jar" --other-name "fabric-api $fa_version" \
+            Neolectrum/src/main/resources/wgpu_mc.mixins.json \
+            Neolectrum-fabric/src/main/resources/wgpu_mc.mixins.json
+
       - name: Set up JDK 25
         uses: actions/setup-java@v4
         with:
