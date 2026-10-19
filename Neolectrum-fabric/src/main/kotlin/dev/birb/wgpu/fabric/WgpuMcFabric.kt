@@ -25,8 +25,17 @@ import net.minecraft.server.packs.PackType
  * The per-tick heartbeat and the shader reload listener register here exactly as
  * `WgpuMcModClient` registers them on NeoForge - the objects are loader-neutral, the hooks are
  * not, and this file is the Fabric pair of that registration.
+ *
+ * **This is a `class`, not an `object`, and that is load-bearing.** Fabric's default language
+ * adapter instantiates entrypoints with `Class.forName(...).getDeclaredConstructor().newInstance()`
+ * - no `setAccessible` on the way - and a Kotlin `object` compiles to a class whose no-argument
+ * constructor is *private*, so the reflective construction died with
+ * `IllegalAccessException ... modifiers "private"` before one line of `onInitializeClient` ran
+ * (the every-launch crash android.43 shipped with). A plain class carries the public no-argument
+ * constructor the adapter needs; the loader builds the one instance and there is nothing here a
+ * second instance would break.
  */
-object WgpuMcFabric : ClientModInitializer {
+class WgpuMcFabric : ClientModInitializer {
         override fun onInitializeClient() {
                 WgpuMcMod.LOGGER.info("Initializing wgpu-mc Fabric module")
 

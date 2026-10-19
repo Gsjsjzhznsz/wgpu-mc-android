@@ -184,8 +184,10 @@ dependencies {
 
         // The mod is written in Kotlin and nothing on a player's Fabric classpath brings the
         // runtime: fabric-language-kotlin is the language adapter for Kotlin *entrypoints*, which
-        // this mod does not use (its entrypoint is one object the loader reflects on), but the
-        // Kotlin *classes* - every mixin and every call they make - need the stdlib on the
+        // this mod does not use (its entrypoint is one plain `class` the default adapter builds
+        // with a reflective no-argument `newInstance()` - it was an `object` once, whose private
+        // constructor that reflection cannot touch, and every launch died on it), but the Kotlin
+        // *classes* - every mixin and every call they make - need the stdlib on the
         // classpath before the first one loads. `include` is Fabric's jar-in-jar, the same shape
         // the NeoForge build's jarJar embeds.
         include("org.jetbrains.kotlin:kotlin-stdlib:2.3.20")

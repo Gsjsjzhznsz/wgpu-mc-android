@@ -281,10 +281,11 @@ jobs:
         # mappings, which 26.1's unobfuscated jar makes the same names both loaders load), with
         # this module's own entrypoints and metadata. It reads the version from
         # `Neolectrum/gradle.properties` and the natives from the NeoForge build above, so the
-        # two jars in a release answer as one version and carry the same libraries. Graduated to
-        # blocking once the scaffold has survived a run: `continue-on-error` keeps a Fabric
-        # compile break from holding the Android release hostage while it is being grown.
-        continue-on-error: true
+        # two jars in a release answer as one version and carry the same libraries. **Blocking
+        # now**: the entrypoint crash android.43 shipped is fixed, people install the Fabric jar
+        # as their primary build, and a Fabric compile break must hold the release rather than
+        # ship a NeoForge-only one under a version the update checker calls current.
+        #
         # This module's own wrapper: loom 1.19 asks for Gradle 9.8, and the NeoForge build's
         # wrapper pins 9.4.1 - two loaders, two builds, two Gradle floors. `bash gradlew`, not
         # `./gradlew`: the repo keeps core.fileMode off (the Windows half of it), so a checked-out
@@ -300,14 +301,17 @@ jobs:
           # `wgpu_mc-fabric-<version>.jar`, sources beside it.
           jar=$(ls build/libs/*.jar 2>/dev/null | grep -v -- '-sources' | head -n 1 || true)
           if [ -z "$jar" ]; then
-            echo "::warning::no Fabric jar was built (the Fabric job is still graduating); skipping the content check"
-            exit 0
+            echo "::error::no Fabric jar was built, and the Fabric build is blocking now"
+            exit 1
           fi
           echo "== $jar =="
           unzip -l "$jar"
+          # Strict: the Fabric build is a blocking step now, so a jar that cannot run on a
+          # device fails the run here rather than installing everywhere and running nowhere.
           for abi in android-arm64-v8a android-x86_64; do
             if ! unzip -l "$jar" | grep -q "assets/wgpu_mc/natives/$abi/libwgpu_mc_jni.so"; then
-              echo "::warning::the Fabric jar is missing assets/wgpu_mc/natives/$abi/libwgpu_mc_jni.so"
+              echo "::error::the Fabric jar is missing assets/wgpu_mc/natives/$abi/libwgpu_mc_jni.so"
+              exit 1
             fi
           done
           if ! unzip -l "$jar" | grep -q "fabric.mod.json"; then
@@ -335,6 +339,16 @@ jobs:
           for dir in ios-arm64 macos-arm64; do
             if ! unzip -l "$jar" | grep -q "assets/wgpu_mc/natives/$dir/libwgpu_mc_jni.dylib"; then
               echo "::error::the jar is missing assets/wgpu_mc/natives/$dir/libwgpu_mc_jni.dylib"
+              exit 1
+            fi
+          done
+          # The embedded Kotlin/KFF dependencies are the point of the `-all` name: the stdlib is
+          # what keeps a Kotlin mod off a `NoClassDefFoundError`, and the four KFF artifacts are
+          # what keeps `modLoader="kotlinforforge"` from demanding a separate download. A jar
+          # missing any of them is a release that launches nowhere.
+          for lib in kotlin-stdlib kotlinforforge-neoforge kffmod-neoforge kfflib-neoforge kfflang-neoforge; do
+            if ! unzip -l "$jar" | grep -q "META-INF/jarjar/.*$lib"; then
+              echo "::error::the jar is missing the embedded META-INF/jarjar/$lib - the -all jar must carry its Kotlin/KFF dependencies"
               exit 1
             fi
           done

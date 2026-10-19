@@ -21,6 +21,10 @@ val neoforgeNeoVersion = providers.gradleProperty("neoforge_neo_version").get()
 val neoforgeModVersion = providers.gradleProperty("neoforge_mod_version").get()
 val neoforgeMavenGroup = providers.gradleProperty("neoforge_maven_group").get()
 val neoforgeKotlinVersion = providers.gradleProperty("neoforge_kotlin_version").getOrElse("2.3.20")
+// The KFF build the jarJar embeds (the four `thedarkcolour` artifacts below). 6.4.0 is the newest
+// KFF whose `neoforge.mods.toml` accepts this mod's Minecraft range, and the range the mod file
+// declares for KFF itself (`kff_version_range`, floor 6.3.0) contains it.
+val kffEmbeddedVersion = "6.4.0"
 
 val modId = "wgpu_mc"
 val modName = "Neolectrum"
@@ -83,6 +87,32 @@ dependencies {
         // Adding a dependency to `jarJar` is what enables the `jarJar` task; its output (classifier
         // `all`) is the artifact `assemble` and `publish` hand out.
         add("jarJar", "org.jetbrains.kotlin:kotlin-stdlib:$neoforgeKotlinVersion")
+
+        // **Kotlin for Forge, inside the jar.** The `-all` suffix promised dependencies and shipped
+        // half of them: the stdlib rode along, but the mod still demanded KFF as a separate
+        // download (`modLoader="kotlinforforge"` cannot even parse this file without the language
+        // provider somewhere on the classpath). The four KFF artifacts close that gap; together
+        // with the stdlib above they are exactly what a standalone Kotlin for Forge install
+        // provides, so a fresh install needs exactly one jar:
+        //
+        //   kotlinforforge-neoforge - the Kotlin runtime carrier: its own `META-INF/jarjar/`
+        //                             nests kotlin-reflect, stdlib, coroutines and serialization,
+        //                             which FML loads recursively as libraries.
+        //   kffmod-neoforge         - the `kotlinforforge` mod itself, whose `neoforge.mods.toml`
+        //                             satisfies the dependency this file declares below.
+        //   kfflib-neoforge         - KFF's own library classes.
+        //   kfflang-neoforge        - the language provider (`META-INF/services`); the thing
+        //                             `modLoader="kotlinforforge"` resolves to.
+        //
+        // **One migration note for installs that already carry a standalone KFF**: FML refuses
+        // two mods with the same id, and the old `kotlinforforge-*.jar` in `mods/` and this
+        // embedded `kffmod-neoforge` both declare one - the old file has to go once after
+        // updating. (A mods-folder KFF the OLD way was the only way; new installs never see
+        // the question.)
+        add("jarJar", "thedarkcolour:kotlinforforge-neoforge:$kffEmbeddedVersion")
+        add("jarJar", "thedarkcolour:kffmod-neoforge:$kffEmbeddedVersion")
+        add("jarJar", "thedarkcolour:kfflib-neoforge:$kffEmbeddedVersion")
+        add("jarJar", "thedarkcolour:kfflang-neoforge:$kffEmbeddedVersion")
 }
 
 val localRuntime = configurations.named("localRuntime")
@@ -98,6 +128,13 @@ repositories {
         maven {
                 name = "NeoForged"
                 setUrl("https://maven.neoforged.net/releases")
+        }
+        // Kotlin for Forge's own maven: the four KFF artifacts the jarJar embeds below live here
+        // (and nowhere on Maven Central), and the KFF Gradle plugin came from the same URL through
+        // the settings script - this is the plain-dependency twin of that.
+        maven {
+                name = "Kotlin for Forge"
+                setUrl("https://thedarkcolour.github.io/KotlinForForge/")
         }
         mavenCentral()
 }
