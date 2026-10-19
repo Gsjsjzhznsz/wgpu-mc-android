@@ -77,6 +77,30 @@ static OCCLUSION_LIST_EXPIRED: AtomicU64 = AtomicU64::new(0);
 /// rather than a world going invisible with nothing in the log to argue about.
 static OCCLUSION_LIST_UNUSABLE: AtomicU64 = AtomicU64::new(0);
 
+/// **The walk that answers when the game's list cannot.** The frames [`OCCLUSION_LIST_UNUSABLE`]
+/// counts are frames the gather draws by the frustum alone - every section the arena holds that the
+/// frustum touches, underground and behind hills included, because the one answer that would hide
+/// them says nothing about this arena. This build stops handing those frames to the frustum: when
+/// the list cannot answer about the arena it names (or has never arrived), the renderer's **own**
+/// direction-aware walk - the flood the `adv_culling` setting drives, seeded at the camera's
+/// section, bounded by the world's own box and the frustum - draws instead. See
+/// [`RenderGraph::the_walk_answers_for_the_list_that_cannot`].
+///
+/// The budget is the walk's direction changes, and it is the most conservative of the four the
+/// cross-check probes ([`FLOOD_BUDGETS`]): the walk that over-reaches is the walk that culls
+/// something the player is looking at, and a first default has to be the one with the least reach.
+/// What it buys is counted per frame in [`OCCLUSION_WALK_FRAMES`] and reported once a second, so
+/// the next log says both that it ran and how many frames it drew.
+static OCCLUSION_WALK_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the walk's takeover has been written to the log - one line per process, because the
+/// frames it describes are exactly the ones a player would otherwise read as "the culling did
+/// nothing" with nothing in the log to say why.
+static OCCLUSION_WALK_ENGAGED: AtomicBool = AtomicBool::new(false);
+
+/// How many direction changes the fallback walk may take. See [`OCCLUSION_WALK_FRAMES`].
+const OCCLUSION_WALK_BUDGET: u8 = 4;
+
 /// One section that survived the gather: where it is, what the arena holds for each layer, and how far
 /// away it is.
 ///
@@ -2961,7 +2985,9 @@ impl RenderGraph {
         );
     }
 
-    /// How many direction changes this frame's walk may take, or `None` to draw from the game's list.
+    /// How many direction changes this frame's walk may take, or `None` to draw from the game's list -
+    /// or, when the list cannot answer about this arena, from the walk at its fallback budget
+    /// ([`OCCLUSION_WALK_FRAMES`], [`Self::the_walk_answers_for_the_list_that_cannot`]).
     ///
     /// `None` is the default - `adv_culling` at zero - and it is also the answer for a camera this side
     /// cannot seed a walk from. The walk starts in the camera's own section and is bounded by the world's
@@ -2970,6 +2996,14 @@ impl RenderGraph {
     /// edge; this walk has one seed, so the honest thing is to draw from the game's list this frame -
     /// which is what the frame does with the setting off - rather than to draw nothing at all. The
     /// cross-check says when that is happening, once a second.
+    ///
+    /// **What `None` means changed when the fallback arrived**, and the sentence above is the one place
+    /// that could be misread: `None` no longer hands the frame to the frustum *unconditionally*. It
+    /// hands it to the list; a list that answers is obeyed, and a list that cannot - the frames
+    /// [`OCCLUSION_LIST_UNUSABLE`] counts, which on the device this port ships for is every frame -
+    /// falls to the walk at [`OCCLUSION_WALK_BUDGET`], the most conservative reach the cross-check
+    /// probes. A player who wants the frustum and nothing else turns `terrain occlusion` off, which
+    /// both the list and the walk answer to.
     fn terrain_walk_budget(camera_section: IVec3) -> Option<u8> {
         let culling = ADV_CULLING.load(Ordering::Relaxed).min(16) as u8;
 
@@ -2984,6 +3018,68 @@ impl RenderGraph {
             Some(extent) if !extent.holds_the_layer(camera_section.y) => None,
             Some(_) => Some(culling - 1),
         }
+    }
+
+    /// **The budget for the frames the game's list cannot answer about.**
+    ///
+    /// `terrain_walk_budget` answers for the setting: `adv_culling` above zero asks for the walk on
+    /// every frame, and zero - the default - leaves the answer to the game's list. But the frames
+    /// the list cannot answer about ([`OCCLUSION_LIST_UNUSABLE`] counts them: it has never arrived,
+    /// or it names nothing the arena holds) are frames the gather draws by the frustum alone, and on
+    /// the device this port ships for that is **every frame** - the log that decided this ran a
+    /// hundred frames a second with the counter at a hundred a second, the terrain drawing its whole
+    /// frustum set underground included for want of any other answer.
+    ///
+    /// So a budget the setting did not ask for is answered here, once per frame, under three guards:
+    ///
+    /// * the occlusion switch (`terrain occlusion`) is on - a player who turned the game's list off
+    ///   asked for the frustum and gets the frustum;
+    /// * the list does not answer about this arena - a list that answers is obeyed as it stands,
+    ///   exactly as before, and this function is never reached with one;
+    /// * the camera is inside the world's own box - the same refusal
+    ///   [`RenderGraph::terrain_walk_budget`] makes, because a walk seeded outside its box is a walk
+    ///   that starts outside the world.
+    ///
+    /// The budget itself is [`OCCLUSION_WALK_BUDGET`], the most conservative of the cross-check's
+    /// four probes: the walk that culls here is the walk a player never asked for, so it gets the
+    /// reach least able to take something away. What it draws is what the walk reaches - a *subset*
+    /// of the frustum's answer, every one of its sections still frustum-tested in the loop below -
+    /// and what it engaged on is counted for the once-a-second line.
+    fn the_walk_answers_for_the_list_that_cannot(
+        honour_occlusion: bool,
+        list_usable: bool,
+        camera_section: glam::IVec3,
+    ) -> Option<u8> {
+        if !honour_occlusion || list_usable {
+            return None;
+        }
+
+        // The box check runs **before** the count: a camera the box refuses is a frame the frustum
+        // draws, the same as it always did, and a frame the walk did not draw is not a frame the
+        // walk's counter belongs to.
+        let budget = match crate::mc::world_extent::get() {
+            None => Some(OCCLUSION_WALK_BUDGET),
+            Some(extent) if !extent.holds_the_layer(camera_section.y) => None,
+            Some(_) => Some(OCCLUSION_WALK_BUDGET),
+        };
+
+        if budget.is_some() {
+            OCCLUSION_WALK_FRAMES.fetch_add(1, Ordering::Relaxed);
+
+            if !OCCLUSION_WALK_ENGAGED.swap(true, Ordering::Relaxed) {
+                log::info!(
+                    "wgpu-mc: the game's occlusion list is not answering about this arena - it has \
+                     never arrived, or names nothing the renderer holds - so the frames it would \
+                     have left to the frustum alone draw from the renderer's own visibility walk \
+                     instead: a flood from the camera's section through the answers the section \
+                     bakes carried, bounded by the world's own box and the frustum. The `terrain \
+                     occlusion` switch returns those frames to the frustum-only draw if it culls \
+                     something it should not"
+                );
+            }
+        }
+
+        budget
     }
 
     /// **The frame's one pass over the world**: the gather, every terrain pass's records, and the
@@ -3104,32 +3200,47 @@ impl RenderGraph {
                 OCCLUSION_LIST_UNUSABLE.fetch_add(1, Ordering::Relaxed);
             }
 
-            // **The walk's own answer, when the setting asks for it.** One flood per frame, into a set
-            // the loop below tests by position: the walk is a map of a few thousand sections while the
-            // loop visits every section the arena holds, so building the set is the cheap side of that.
+            // **The walk's own answer, when the setting asks for it - or when the game's list
+            // cannot answer about this arena.** One flood per frame, into a set the loop below
+            // tests by position: the walk is a map of a few thousand sections while the loop visits
+            // every section the arena holds, so building the set is the cheap side of that.
+            //
+            // The setting's answer comes first ([`Self::terrain_walk_budget`]); when it declined,
+            // [`Self::the_walk_answers_for_the_list_that_cannot`] answers for the frames whose list
+            // is dead - `list_usable` above is exactly that question, and the frames it counts in
+            // [`OCCLUSION_LIST_UNUSABLE`] are the frames this fallback takes over. A list that
+            // answers is obeyed as it stands, and the fallback never runs beside it.
             //
             // The answers are snapshotted rather than read through the lock per poll - a walk polls
             // thousands of positions and the arena's guard is already held here.
-            let flooded: Option<std::collections::HashSet<IVec3>> = budget.map(|budget| {
-                let answers = crate::mc::visibility::snapshot();
-                let world = FloodWorld {
-                    answers: &answers,
-                    sections: &sections,
-                    frustum,
-                    camera_section,
-                };
+            let flooded: Option<std::collections::HashSet<IVec3>> = budget
+                .or_else(|| {
+                    Self::the_walk_answers_for_the_list_that_cannot(
+                        honour_occlusion,
+                        list_usable,
+                        camera_section,
+                    )
+                })
+                .map(|budget| {
+                    let answers = crate::mc::visibility::snapshot();
+                    let world = FloodWorld {
+                        answers: &answers,
+                        sections: &sections,
+                        frustum,
+                        camera_section,
+                    };
 
-                section_graph::flood(&world, camera_section, budget)
-                    .visible
-                    .into_iter()
-                    .collect()
-            });
+                    section_graph::flood(&world, camera_section, budget)
+                        .visible
+                        .into_iter()
+                        .collect()
+                });
 
             for (pos, section) in sections.iter() {
                 if honour_occlusion {
-                    // **Which list this frame obeys.** The walk's answer when the setting asks for one -
-                    // and it is a *subset* of the game's, so what it drops is the whole of what the
-                    // setting does - and the game's own list otherwise, which is the default.
+                    // **Which list this frame obeys.** The walk's answer - the setting's when it asks,
+                    // and the fallback's when the game's list cannot answer about this arena - and the
+                    // game's own list otherwise, which is the default.
                     //
                     // The walk's path does not go through `section_visibility`, so the stale-snapshot
                     // answer that function gives is not asked for here: the walk starts from the camera's
@@ -3291,12 +3402,13 @@ impl RenderGraph {
             if PLANE_HINT_REPORTED.swap(now, Ordering::Relaxed) != now {
                 let total = hint_hits + hint_misses;
                 let unusable = OCCLUSION_LIST_UNUSABLE.swap(0, Ordering::Relaxed);
+                let walked = OCCLUSION_WALK_FRAMES.swap(0, Ordering::Relaxed);
 
                 log::info!(
                     "wgpu-mc: the frustum cull, last frame: {} section(s) tested, {} of them answered by the \
                      plane the section before was culled by ({:.1}% - one plane test rather than up to six), \
                      {} frame(s) that drew from the frustum because the game's list was empty or named \
-                     nothing the arena holds",
+                     nothing the arena holds{}",
                     total,
                     hint_hits,
                     if total == 0 {
@@ -3305,6 +3417,14 @@ impl RenderGraph {
                         100.0 * hint_hits as f64 / total as f64
                     },
                     unusable,
+                    if walked > 0 {
+                        format!(
+                            ", {} of them drawn from the renderer's own visibility walk because of it",
+                            walked
+                        )
+                    } else {
+                        String::new()
+                    }
                 );
             }
         }
@@ -7090,6 +7210,55 @@ mod indirect_capacity_tests {
         assert!(!the_indirect_path_holds(
             crate::mc::INDIRECT_DRAW_CAPACITY + 1
         ));
+    }
+}
+
+#[cfg(test)]
+mod occlusion_walk_fallback_tests {
+    use super::*;
+
+    /// **The fallback answers only for the frames the list cannot, and only when occlusion is on.**
+    ///
+    /// Three refusals and one engagement: a list that answers is obeyed as it stands (the fallback is
+    /// never reached with one), a player who turned occlusion off asked for the frustum, and a camera
+    /// outside the world's own box is a walk that cannot seed itself. What engages does so at
+    /// [`OCCLUSION_WALK_BUDGET`] - the most conservative reach the cross-check probes - and counts a
+    /// frame, which is the number the once-a-second line reports.
+    #[test]
+    fn the_walk_answers_only_when_the_list_cannot_and_occlusion_is_on() {
+        let camera = glam::ivec3(3, 5, -7);
+
+        // A list that answers about the arena: obeyed, and no walk beside it.
+        assert_eq!(
+            RenderGraph::the_walk_answers_for_the_list_that_cannot(true, true, camera),
+            None,
+            "a list that answers is the culling this frame draws by"
+        );
+
+        // Occlusion off: the player asked for the frustum, whatever the list answered.
+        assert_eq!(
+            RenderGraph::the_walk_answers_for_the_list_that_cannot(false, false, camera),
+            None,
+            "the frustum-only draw is what `terrain occlusion` off means, list or no list"
+        );
+
+        // The engagement: occlusion on, a list that cannot answer. The budget is the fallback's own,
+        // and the frame it counted is the one the once-a-second line reports.
+        let before = OCCLUSION_WALK_FRAMES.load(Ordering::Relaxed);
+        let answered = RenderGraph::the_walk_answers_for_the_list_that_cannot(true, false, camera);
+        let after = OCCLUSION_WALK_FRAMES.load(Ordering::Relaxed);
+
+        // The world's own box is a static other tests write beside this one, so the box's answer is
+        // read rather than assumed: an absent box leaves the walk bounded by the frustum alone (the
+        // engagement stands), a box that refuses the camera's layer refuses the seed (the frustum
+        // draws, the same as it always did), and a box that holds it is the engagement.
+        let expected = match crate::mc::world_extent::get() {
+            None => Some(OCCLUSION_WALK_BUDGET),
+            Some(extent) if !extent.holds_the_layer(camera.y) => None,
+            Some(_) => Some(OCCLUSION_WALK_BUDGET),
+        };
+        assert_eq!(answered, expected);
+        assert_eq!(after.saturating_sub(before), u64::from(expected.is_some()));
     }
 }
 
