@@ -8401,12 +8401,32 @@ pub extern "C" fn terrain_arena_largest_section() -> u32 {
 /// still possible - at the device's own `max_buffer_size` there is no room to grow into, and a rebuild
 /// would be refused exactly as the last one was, once per tick, for as long as the player stands there.
 /// So the JVM asks this before it dirties anything.
+///
+/// **The three limits growth answers to, and the one this used to read.** This predates the pool being
+/// more than one buffer: it compared the pool's *total* slots against `arena_cap_slots`, which is the
+/// cap on **one buffer** - `max_buffer_size` and `max_storage_buffer_binding_size` over four, whichever
+/// binds. On the device this was found on that cap is 33,554,432 slots (128 MB), and a 12-chunk view's
+/// arena is born at 52,983,000 across two buffers - so the answer was `false` from the second buffer on,
+/// on a machine with thirty more buffers, a 4,768 MB budget and a 512 MB slot ceiling still unspent.
+/// Every trim the JVM drained for the rest of that session logged "(it cannot grow)" about an arena
+/// that could have quintupled. The comparison is the one `grow_arena_if_asked` itself answers to now:
+/// another buffer must be within `ARENA_BUFFERS`, the pool must stay under `ARENA_SLOTS_CEILING`, and
+/// the bytes must stay under this scene's budget. Purely informational today - the JVM's drain stopped
+/// gating the rebuild on this answer rounds ago - but a lie in a log is a misread waiting for its
+/// reader, and this one had already misled one round of this investigation.
 #[unsafe(no_mangle)]
 pub extern "C" fn terrain_arena_can_grow() -> bool {
     RENDERER
         .get()
         .and_then(|wm| wm.scene())
-        .is_some_and(|scene| scene.section_storage.read().pool_slots() < scene.arena_cap_slots)
+        .is_some_and(|scene| {
+            let storage = scene.section_storage.read();
+            let slots = storage.pool_slots();
+
+            storage.arena_count() < wgpu_mc::mc::ARENA_BUFFERS
+                && slots < wgpu_mc::mc::ARENA_SLOTS_CEILING
+                && slots as u64 * 4 < scene.arena_memory_budget
+        })
 }
 
 /// **Whether this side is currently failing to hold what it is given**, which is the condition that

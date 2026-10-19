@@ -78,7 +78,28 @@ struct SampleGeometry {
     high_level: f32,
     level_blend: f32,
     rgss_blend: f32,
+    // The raw coordinates - what the taps are centred on, and what the far tier fetches from. The
+    // full note is in `terrain.wgsl`, whose fields this is a copy of: the two shaders draw one world.
+    uv: vec2<f32>,
+    // **The far tier.** Past `FAR_TEXELS_PER_PIXEL` the grid cannot change the answer, and two
+    // fetches answer what its eight did.
+    far: bool,
 };
+
+// An array of no taps, for the two tiers that never run the grid. See `terrain.wgsl`, which carries
+// the note; this is the same fill.
+const NO_TAPS: array<vec2<f32>, 4> = array(
+    vec2<f32>(0.0),
+    vec2<f32>(0.0),
+    vec2<f32>(0.0),
+    vec2<f32>(0.0),
+);
+
+// **The tier line between the four-tap grid and a two-fetch trilinear**, in texels per pixel. The
+// full note is in `terrain.wgsl`; the short version is that the grid's taps are 0.395 of a fine texel
+// off centre, which at eight texels a pixel is under five per cent of a coarse one - so past this
+// line two fetches answer what eight did, and below it the grid is the anti-aliasing and stays.
+const FAR_TEXELS_PER_PIXEL: f32 = 8.0;
 
 fn sample_geometry(uv: vec2<f32>, pixel_size: vec2<f32>, bias: f32) -> SampleGeometry {
     let du = dpdx(uv);
@@ -95,10 +116,24 @@ fn sample_geometry(uv: vec2<f32>, pixel_size: vec2<f32>, bias: f32) -> SampleGeo
 
     let nearest_level = max(0.0, log2(max_derivative / min_pixel_size) + bias);
 
-    let mip_exact = max(0.0, log2(sqrt(min_derivative * max_derivative) / min_pixel_size) + bias);
-    let low_level = floor(mip_exact);
-    let high_level = low_level + 1.0;
-    let level_blend = fract(mip_exact);
+    let rgss_blend = smoothstep(min_pixel_size, min_pixel_size * 2.0, max_texel_size);
+
+    // **The far tier is decided before anything the grid owns is computed** - the texel-centre
+    // correction and the taps below are the plain fetch's and the grid's, and this tier reads
+    // neither. See `FAR_TEXELS_PER_PIXEL` and `terrain.wgsl`.
+    if max_texel_size >= min_pixel_size * FAR_TEXELS_PER_PIXEL {
+        return SampleGeometry(
+            uv,
+            nearest_level,
+            NO_TAPS,
+            0.0,
+            0.0,
+            0.0,
+            rgss_blend,
+            uv,
+            true,
+        );
+    }
 
     let uv_texel = uv / pixel_size;
     let texel_center = round(uv_texel) - 0.5;
@@ -106,6 +141,30 @@ fn sample_geometry(uv: vec2<f32>, pixel_size: vec2<f32>, bias: f32) -> SampleGeo
 
     texel_offset = (texel_offset - 0.5) * pixel_size / texel_screen_size + 0.5;
     texel_offset = clamp(texel_offset, vec2<f32>(0.0), vec2<f32>(1.0));
+
+    let nearest_uv = (texel_center + texel_offset) * pixel_size;
+
+    if rgss_blend == 0.0 {
+        // **The magnified tier: the plain fetch is the whole answer.** The two levels are not read,
+        // so the second `log2`, the `sqrt` and the taps stay out of the closest pixels. The test is
+        // the blend and not `magnified` on purpose - see `terrain.wgsl` for the whole of why.
+        return SampleGeometry(
+            nearest_uv,
+            nearest_level,
+            NO_TAPS,
+            0.0,
+            0.0,
+            0.0,
+            rgss_blend,
+            uv,
+            false,
+        );
+    }
+
+    let mip_exact = max(0.0, log2(sqrt(min_derivative * max_derivative) / min_pixel_size) + bias);
+    let low_level = floor(mip_exact);
+    let high_level = low_level + 1.0;
+    let level_blend = fract(mip_exact);
 
     let taps = array<vec2<f32>, 4>(
         uv + vec2<f32>(0.125, 0.375) * pixel_size,
@@ -115,13 +174,15 @@ fn sample_geometry(uv: vec2<f32>, pixel_size: vec2<f32>, bias: f32) -> SampleGeo
     );
 
     return SampleGeometry(
-        (texel_center + texel_offset) * pixel_size,
+        nearest_uv,
         nearest_level,
         taps,
         low_level,
         high_level,
         level_blend,
-        smoothstep(min_pixel_size, min_pixel_size * 2.0, max_texel_size),
+        rgss_blend,
+        uv,
+        false,
     );
 }
 
@@ -131,7 +192,17 @@ fn sample_at_level(
     geometry: SampleGeometry,
     use_rgss: u32,
 ) -> vec4<f32> {
-    let plain = textureSampleLevel(source, samp, geometry.nearest_uv, geometry.nearest_level);
+    // **The far tier: two fetches where the grid paid eight.** Past `FAR_TEXELS_PER_PIXEL` the taps
+    // are under five per cent of a coarse texel off centre, so one bilinear fetch at each level,
+    // mixed by the same `level_blend`, answers what the four-tap average at each did. The full note
+    // is in `terrain.wgsl`, whose tiers this file is a copy of - the two shaders draw one world, and
+    // a tier that differed between the layers would be a seam down the middle of it.
+    if use_rgss != 0u && geometry.far {
+        let low = textureSampleLevel(source, samp, geometry.uv, geometry.low_level);
+        let high = textureSampleLevel(source, samp, geometry.uv, geometry.high_level);
+
+        return mix(low, high, geometry.level_blend);
+    }
 
     // **And the four-tap grid is skipped when it cannot change the answer.** `rgss_blend` is
     // `smoothstep(min_pixel_size, min_pixel_size * 2.0, max_texel_size)`, so it is exactly zero whenever a
@@ -139,7 +210,7 @@ fn sample_at_level(
     // being spent to compute a value that was then multiplied by zero. See `terrain.wgsl` for the whole of
     // it, including why the test is not `magnified`.
     if use_rgss == 0u || geometry.rgss_blend == 0.0 {
-        return plain;
+        return textureSampleLevel(source, samp, geometry.nearest_uv, geometry.nearest_level);
     }
 
     var low = vec4<f32>(0.0);
@@ -151,6 +222,16 @@ fn sample_at_level(
     }
 
     let rgss = mix(low * 0.25, high * 0.25, geometry.level_blend);
+
+    // **The plain fetch only where it has a consumer.** `rgss_blend` is exactly 1.0 from two texels a
+    // pixel out, where `mix(plain, rgss, ..)` is `rgss` bit for bit - so the fetch moves below the
+    // check, and the minified fragments that were fetching it to multiply it by zero stop carrying
+    // it. See `terrain.wgsl`.
+    if geometry.rgss_blend >= 1.0 {
+        return rgss;
+    }
+
+    let plain = textureSampleLevel(source, samp, geometry.nearest_uv, geometry.nearest_level);
 
     return mix(plain, rgss, geometry.rgss_blend);
 }

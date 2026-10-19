@@ -351,7 +351,45 @@ struct SampleGeometry {
     /// How much of the supersampled fetch survives against the plain one. Below about one texel per
     /// pixel the surface wants the plain fetch's sharpening, which RGSS would only blur.
     rgss_blend: f32,
+    /// The raw coordinates - what the taps are centred on, and what the far tier fetches from. The
+    /// corrected `nearest_uv` above is the plain fetch's answer, and the correction is a magnified
+    /// surface's exactness; at minification the level does the filtering and the raw coordinate is
+    /// where the game's own four taps start from.
+    uv: vec2<f32>,
+    /// **The far tier.** Past `FAR_TEXELS_PER_PIXEL` the rotated grid cannot change the answer to
+    /// what a screen can show, and two fetches - one at each of the two levels, mixed by
+    /// `level_blend` - answer what its eight did. See the constant, which is where the line comes
+    /// from and why it sits where it sits.
+    far: bool,
 };
+
+/// An array of no taps, for the two tiers that never run the grid. The struct carries the taps
+/// because the middle tier reads them; a tier that does not still has to fill the field, and this
+/// is the fill - never read, checked by the branch that decides the tier before any fetch.
+const NO_TAPS: array<vec2<f32>, 4> = array(
+    vec2<f32>(0.0),
+    vec2<f32>(0.0),
+    vec2<f32>(0.0),
+    vec2<f32>(0.0),
+);
+
+/// **The tier line between the four-tap grid and a two-fetch trilinear**, in texels per pixel.
+///
+/// The rotated grid is four sub-texel positions: its taps sit `|(0.125, 0.375)|` = 0.395 of a *fine*
+/// texel off the fetch's centre, and that offset is the whole of what it buys - a texel edge falling
+/// inside a pixel lands in the average at four rotations rather than one. At `n` texels a pixel, the
+/// level the fetch lands on has one of its texels covering `n` fine ones, so the same offset is
+/// `0.395 / n` of a *coarse* texel: at eight, under five per cent of one. Past that line the
+/// four-tap average at each level is that level's one-tap fetch to within what a screen cannot
+/// resolve, and two fetches answer what eight did.
+///
+/// Below the line the grid is the anti-aliasing, and it stays: a texel edge is a screen-sized thing
+/// in the near and middle field, and eight texels a pixel is a few blocks from the camera at the
+/// resolutions this renderer runs at - the band where a player sees shimmer is exactly the band the
+/// grid keeps. What the line sells is the far field, which at a loaded view is most of the terrain
+/// pixels there are: at twelve chunks the far three-quarters of them were paying the grid's eight
+/// fetches to have their answer rounded back to a two-fetch trilinear by arithmetic alone.
+const FAR_TEXELS_PER_PIXEL: f32 = 8.0;
 
 /// The geometry for one fragment: the coordinates it samples, one texel of the atlas it samples, and
 /// the level-of-detail shift the draw handed over.
@@ -393,10 +431,28 @@ fn sample_geometry(uv: vec2<f32>, pixel_size: vec2<f32>, bias: f32) -> SampleGeo
 
     let nearest_level = max(0.0, log2(max_derivative / min_pixel_size) + bias);
 
-    let mip_exact = max(0.0, log2(sqrt(min_derivative * max_derivative) / min_pixel_size) + bias);
-    let low_level = floor(mip_exact);
-    let high_level = low_level + 1.0;
-    let level_blend = fract(mip_exact);
+    // How much of the supersampled fetch survives against the plain one. Below about one texel per
+    // pixel the surface wants the plain fetch's sharpening, which RGSS would only blur - and there
+    // the blend is exactly zero, which is the test `sample_at_level` returns on.
+    let rgss_blend = smoothstep(min_pixel_size, min_pixel_size * 2.0, max_texel_size);
+
+    // **The far tier is decided before anything the grid owns is computed**, because it is the one
+    // tier that runs none of it: the levels come from the geometric mean below, but the texel-centre
+    // correction and the taps are the plain fetch's and the grid's, and the far tier reads neither.
+    // See `FAR_TEXELS_PER_PIXEL` for where the line sits and what sells it.
+    if max_texel_size >= min_pixel_size * FAR_TEXELS_PER_PIXEL {
+        return SampleGeometry(
+            uv,
+            nearest_level,
+            NO_TAPS,
+            0.0,
+            0.0,
+            0.0,
+            rgss_blend,
+            uv,
+            true,
+        );
+    }
 
     // **The texel-centre correction, and it is not a detail.** `uv / pixel_size` is texel coordinates,
     // `round(..) - 0.5` the centre of the nearest texel, and the difference between the two scaled down
@@ -410,6 +466,35 @@ fn sample_geometry(uv: vec2<f32>, pixel_size: vec2<f32>, bias: f32) -> SampleGeo
     texel_offset = (texel_offset - 0.5) * pixel_size / texel_screen_size + 0.5;
     texel_offset = clamp(texel_offset, vec2<f32>(0.0), vec2<f32>(1.0));
 
+    let nearest_uv = (texel_center + texel_offset) * pixel_size;
+
+    if rgss_blend == 0.0 {
+        // **The magnified tier: the plain fetch is the whole answer.** The two levels are not read -
+        // `sample_at_level` returns the plain fetch before it would touch them - so the second
+        // `log2`, the `sqrt` behind the geometric mean and the taps stay out of the pixels that are
+        // closest to the camera. The test is the blend and not `magnified` on purpose: `magnified` is
+        // `|dpdx.x| < texel && |dpdy.y| < texel`, which is a different question - it can be true while
+        // `max_texel_size`, the length of the whole derivative vector, is past `min_pixel_size`, and
+        // there the blend is not zero and the taps do matter. Skipping on `magnified` would be a
+        // picture change; skipping on the blend being zero is not.
+        return SampleGeometry(
+            nearest_uv,
+            nearest_level,
+            NO_TAPS,
+            0.0,
+            0.0,
+            0.0,
+            rgss_blend,
+            uv,
+            false,
+        );
+    }
+
+    let mip_exact = max(0.0, log2(sqrt(min_derivative * max_derivative) / min_pixel_size) + bias);
+    let low_level = floor(mip_exact);
+    let high_level = low_level + 1.0;
+    let level_blend = fract(mip_exact);
+
     // The game's own rotated grid - `vec2(0.125, 0.375)` and its three rotations - scaled by this
     // atlas' texel here, once, rather than per tap and per branch.
     let taps = array<vec2<f32>, 4>(
@@ -420,13 +505,15 @@ fn sample_geometry(uv: vec2<f32>, pixel_size: vec2<f32>, bias: f32) -> SampleGeo
     );
 
     return SampleGeometry(
-        (texel_center + texel_offset) * pixel_size,
+        nearest_uv,
         nearest_level,
         taps,
         low_level,
         high_level,
         level_blend,
-        smoothstep(min_pixel_size, min_pixel_size * 2.0, max_texel_size),
+        rgss_blend,
+        uv,
+        false,
     );
 }
 
@@ -450,9 +537,19 @@ fn sample_at_level(
     geometry: SampleGeometry,
     use_rgss: u32,
 ) -> vec4<f32> {
-    // The plain fetch is taken either way, because the game's `sampleRGSS` ends by blending its result
-    // against this one rather than choosing between the two.
-    let plain = textureSampleLevel(source, samp, geometry.nearest_uv, geometry.nearest_level);
+    // **The far tier: two fetches where the grid paid eight.** Past `FAR_TEXELS_PER_PIXEL` the taps
+    // are under five per cent of a coarse texel off centre, so the four-tap average at each level is
+    // that level's plain fetch to within what a screen cannot resolve - and the game's own answer is
+    // a blend of the two levels either way. One bilinear fetch at each, mixed by the same
+    // `level_blend`, is that sample for a quarter of the fetches. This is the tier the far field
+    // draws in, and the far field is most of a loaded view; the tier it replaced is the shape the
+    // branches below still draw the near and middle field with.
+    if use_rgss != 0u && geometry.far {
+        let low = textureSampleLevel(source, samp, geometry.uv, geometry.low_level);
+        let high = textureSampleLevel(source, samp, geometry.uv, geometry.high_level);
+
+        return mix(low, high, geometry.level_blend);
+    }
 
     // **And the four-tap grid is skipped when it cannot change the answer**, which is the magnified case -
     // the surfaces the player is looking at most closely.
@@ -470,7 +567,7 @@ fn sample_at_level(
     // the taps do matter. Skipping on `magnified` would be a picture change; skipping on the blend being
     // zero is not.
     if use_rgss == 0u || geometry.rgss_blend == 0.0 {
-        return plain;
+        return textureSampleLevel(source, samp, geometry.nearest_uv, geometry.nearest_level);
     }
 
     var low = vec4<f32>(0.0);
@@ -482,6 +579,18 @@ fn sample_at_level(
     }
 
     let rgss = mix(low * 0.25, high * 0.25, geometry.level_blend);
+
+    // **The plain fetch only where it has a consumer.** It used to be taken either way, because the
+    // game's `sampleRGSS` ends by blending its result against this one rather than choosing between
+    // the two - but the blend is `mix(plain, rgss, rgss_blend)`, and `rgss_blend` is exactly 1.0 from
+    // two texels a pixel out, where `mix` is `rgss` bit for bit. Between one and two texels a pixel
+    // the blend is real and so is the fetch; past it the fetch was computed and multiplied by zero -
+    // one more fetch every minified fragment carried for nothing.
+    if geometry.rgss_blend >= 1.0 {
+        return rgss;
+    }
+
+    let plain = textureSampleLevel(source, samp, geometry.nearest_uv, geometry.nearest_level);
 
     return mix(plain, rgss, geometry.rgss_blend);
 }

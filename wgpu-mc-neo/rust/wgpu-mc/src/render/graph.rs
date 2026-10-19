@@ -2854,7 +2854,7 @@ impl RenderGraph {
         visible: Option<&std::collections::HashSet<glam::IVec3>>,
         mut the_arena_holds: impl FnMut(&glam::IVec3) -> bool,
     ) -> bool {
-        visible.is_some_and(|set| set.iter().any(|pos| the_arena_holds(pos)))
+        visible.is_some_and(|set| set.iter().any(&mut the_arena_holds))
     }
 
     /// Whether a section is worth submitting, and if not, why not.
@@ -5427,6 +5427,114 @@ mod texture_sample_uniformity_tests {
             "only {checked} shader(s) were found in {}",
             directory.display()
         );
+    }
+
+    /// The text of one top-level function, with its comments and whitespace taken off.
+    ///
+    /// Comments go line by line (`//` to the end of the line - the shaders carry no block comments),
+    /// and what is left is whitespace-collapsed, so two functions whose *code* agrees compare equal
+    /// however differently their notes are written. The scan is brace-matched from the signature:
+    /// the shaders do not nest functions, and a string literal holding a brace would be a WGSL
+    /// compile error before it was a wrong answer here.
+    fn code_of_function(source: &str, name: &str) -> Option<String> {
+        let signature = format!("fn {name}(");
+        let start = source.find(&signature)?;
+        let open = source[start..].find('{')? + start;
+        let mut depth = 0usize;
+        let mut end = open;
+
+        for (index, character) in source[open..].char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+
+                    if depth == 0 {
+                        end = open + index;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let body = &source[start..=end];
+
+        let without_comments = body
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        Some(
+            without_comments
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+    }
+
+    /// **The two terrain shaders tier their sampling together.**
+    ///
+    /// The far tier is a contract between two files: `terrain.wgsl` draws the cutout layer through
+    /// it and `terrain_solid.wgsl` the solid one, and a tier that existed in one and not the other
+    /// would be a seam down the middle of the world - the same block face sampled one way from the
+    /// solid layer and another from the cutout one, at whatever distance the tier line lands on.
+    /// The two functions also have to *stay* the same code, because their comments are the only
+    /// thing allowed to differ: the notes live in full in `terrain.wgsl`, and the other file points
+    /// at them.
+    ///
+    /// So the check is the strong one: both files parse, and their `sample_geometry` and
+    /// `sample_at_level` are identical once comments and whitespace are taken off. A change to one
+    /// that is not carried to the other fails here, with the function named. The constant the tier
+    /// line is written at rides in both functions' code, so the equality covers it - moving the line
+    /// in one file alone is exactly the seam this exists for.
+    #[test]
+    fn the_two_terrain_shaders_tier_their_sampling_together() {
+        let mut per_function: Vec<(&str, Vec<(&str, String)>)> = Vec::new();
+
+        for name in ["terrain", "terrain_solid"] {
+            let Some(source) = modtree::shader(name) else {
+                modtree::skip("the sampling-tier check");
+                return;
+            };
+
+            // A shader that does not parse fails everything downstream anyway; failing here says so
+            // in this test's own words rather than wherever the next walk tripped over it.
+            naga::front::wgsl::parse_str(&source)
+                .unwrap_or_else(|error| panic!("{name}.wgsl does not parse: {error:?}"));
+
+            for function in ["sample_geometry", "sample_at_level"] {
+                let body = code_of_function(&source, function).unwrap_or_else(|| {
+                    panic!("{name}.wgsl has no `{function}`; the sampling tiers live there")
+                });
+
+                match per_function
+                    .iter_mut()
+                    .find(|(known, _)| *known == function)
+                {
+                    Some((_, pair)) => pair.push((name, body)),
+                    None => per_function.push((function, vec![(name, body)])),
+                }
+            }
+        }
+
+        for (function, pair) in per_function {
+            let [(first_name, first_body), (second_name, second_body)] = &pair[..] else {
+                panic!(
+                    "`{function}` was found {} time(s) across the two shaders",
+                    pair.len()
+                );
+            };
+
+            assert_eq!(
+                first_body, second_body,
+                "`{function}` differs between {}.wgsl and {}.wgsl; the two \
+                 draw one world and the sampling tiers are where a difference becomes a seam. Carry \
+                 the change to both files - the notes may differ, the code may not.",
+                first_name, second_name
+            );
+        }
     }
 }
 
