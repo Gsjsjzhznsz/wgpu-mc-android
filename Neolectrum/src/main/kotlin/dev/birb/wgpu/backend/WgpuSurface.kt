@@ -1,7 +1,6 @@
 package dev.birb.wgpu.backend
 
 import dev.birb.wgpu.WgpuMcMod
-import dev.birb.wgpu.render.RenderScale
 import dev.birb.wgpu.rust.NativeNames
 import dev.birb.wgpu.rust.WmNative
 import dev.birb.wgpu.rust.runsOnIos
@@ -61,40 +60,26 @@ class WgpuSurface internal constructor(
      * swapchain in step with window resizes without needing a resize hook. A swapchain that goes
      * stale for any *other* reason (a move to another monitor, a fullscreen toggle, a driver
      * reset) is recovered inside `acquire_next_texture`, so it does not depend on this.
-     *
-     * **The window's size is not the source's, once a render scale is set.** [width] and
-     * [height] are the main render target's, which the render scale mixin makes a fraction of
-     * the window's - and the swapchain has to be the *window's* size, because that is what the
-     * display shows. `RenderScale` recorded the unscaled dimensions when the target was sized,
-     * so the configure is asked for those, and the native blit is what stretches the smaller
-     * frame back over the larger swapchain. With no render scale (or before any target was
-     * sized) the two agree, which is the one-to-one blit this has always been.
      */
     fun blitAndPresent(source: WgpuTextureView, width: Int, height: Int) {
         if (closed) return
         if (width <= 0 || height <= 0) return
 
-        val windowWidth = RenderScale.windowWidth.takeIf { it > 0 } ?: width
-        val windowHeight = RenderScale.windowHeight.takeIf { it > 0 } ?: height
-        configure(windowWidth, windowHeight)
+        configure(width, height)
 
         val texture = WmNative.acquireNextTexture.invokeExact(device.renderer) as MemorySegment
         if (texture == MemorySegment.NULL) {
             // Either the frame was skipped (the window is occluded) or the swapchain is still
             // being rebuilt. Neither is worth a log line every frame.
-            reportPresent(windowWidth, windowHeight, acquired = false)
+            reportPresent(width, height, acquired = false)
             return
         }
 
         nextTexture = texture
-        // The source's own size goes with it: the sharpened upscale needs the source's texel
-        // size, which is its dimensions, and only this call knows them.
-        WmNative.blitFromTexture.invokeExact(
-            device.renderer, source.nativeView, texture, width, height,
-        ) as Unit
+        WmNative.blitFromTexture.invokeExact(device.renderer, source.nativeView, texture) as Unit
         dumpIfRequested(texture, source)
         present()
-        reportPresent(windowWidth, windowHeight, acquired = true)
+        reportPresent(width, height, acquired = true)
     }
 
     /**
