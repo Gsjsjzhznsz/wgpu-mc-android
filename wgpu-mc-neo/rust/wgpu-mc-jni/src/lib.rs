@@ -2356,6 +2356,19 @@ pub fn maxQueuedBakes(_env: JNIEnv, _class: JClass) -> jint {
     MAX_QUEUED_BAKES as jint
 }
 
+/// How many sections are **waiting for a slot in the bake pool**, against [`MAX_WAITING_BAKES`].
+///
+/// The claim report's fourth input. `queuedBakes` counts the bakes that took their slot and are on
+/// their way; this counts the ones the pool was full for, which are parked in [`BAKE_WAITERS`] with
+/// their payload already applied and nothing running. A section in there is claimed by the JVM and
+/// not published, so the difference between "the gap does not move" and "the gap is the waiters" is
+/// exactly the difference between a hole and a bookkeeping entry - and until this number was on the
+/// line, a report with a large claim gap said neither.
+#[jni_fn("dev.birb.wgpu.rust.WgpuNative")]
+pub fn waitingBakes(_env: JNIEnv, _class: JClass) -> jint {
+    BAKE_WAITERS.lock().len() as jint
+}
+
 /// Forgets every section of the world the bake was built against, and answers the new generation.
 ///
 /// Called from `LevelRenderer#setLevel`, so it covers a dimension change, a new world and the return

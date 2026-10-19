@@ -549,6 +549,13 @@ object WgpuNative {
 
         external fun maxQueuedBakes(): Int
 
+        /**
+         * How many sections are waiting for a slot in the bake pool - the payload applied, nothing
+         * running, the section claimed here and not published there. The claim report's fourth
+         * input: a gap that is waiters is bakes backing up, and a gap that is not is something else.
+         */
+        external fun waitingBakes(): Int
+
         /** How many sections the arena is actually drawing. See the note on the native side. */
         external fun arenaSections(): Int
 

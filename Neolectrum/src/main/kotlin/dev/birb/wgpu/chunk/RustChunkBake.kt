@@ -454,8 +454,9 @@ object RustChunkBake {
 
                 WgpuMcMod.LOGGER.info(
                         "wgpu: this side claims Rust has {} section(s); the arena is drawing {}, with {} awaiting a " +
-                                "rebuild and {} bake(s) queued, {} of the claims published (the arena draws them; the " +
-                                "rest are offered and waiting for their bake). Rebuilds: {} meshed by Rust's answer, " +
+                                "rebuild and {} bake(s) queued ({} more waiting for a pool slot), {} of the claims published " +
+                                "(the arena draws them; the rest are offered and waiting for their bake). Rebuilds: {} meshed by " +
+                                "Rust's answer, " +
                                 "{} refused by it, {} left to Minecraft because the arena is full, {} left to it " +
                                 "because Rust was never told",
                         rustHas.size,
@@ -463,6 +464,16 @@ object RustChunkBake {
                         pendingRedirty.size,
                         try {
                                 WgpuNative.queuedBakes()
+                        } catch (error: Throwable) {
+                                -1
+                        },
+                        // **The waiters, so the gap can be read rather than guessed.** A section whose payload
+                        // was applied but whose bake never took a slot is claimed here and published nowhere -
+                        // indistinguishable from a hole until this number says how much of the gap is exactly
+                        // that. Zero waiters and a large gap is a different sentence than a gap that is waiters,
+                        // and the report is the one place either sentence can be read.
+                        try {
+                                WgpuNative.waitingBakes()
                         } catch (error: Throwable) {
                                 -1
                         },

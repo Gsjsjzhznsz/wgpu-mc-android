@@ -900,7 +900,37 @@ pub fn can_multi_draw_indirect() -> bool {
 /// is where its answer has to be readable.
 static FIRST_INSTANCE_PROBE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// The number each probe record carries in its `x`, one more per record.
+/// What the **floor probe** concluded: 0 not run, 1 passed, 2 failed.
+///
+/// The floor probe is the question every other probe's verdict stands on: *does a trivial pipeline -
+/// four plain `draw_indexed` calls, no indirect, no instance trick, no storage read - rasterise onto
+/// this target format and read back through this methodology at all?* A driver that fails the floor
+/// cannot answer any other question honestly, because every other probe shares its target, its clear
+/// colour and its copy-back with the floor and differs only in the channel on top. So the floor's
+/// verdict **gates the others**: a channel probe only counts as a verdict where the floor passed, and
+/// a run whose floor failed keeps the batching closed with the log saying the floor - not the channel -
+/// is what could not be proven.
+///
+/// It runs on the swapchain's own format, `Rgba8Unorm` - the one target on this device that is known
+/// to rasterise, because the whole game is drawn onto one.
+static FLOOR_PROBE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// What the **integer-target probe** concluded: 0 not run, 1 passed, 2 failed.
+///
+/// The same four plain draws as [`FLOOR_PROBE`], onto `R32Uint` - the format every probe before this
+/// one rendered into. It exists because the probes and the shapes they ask about must not share a
+/// variable that can fail on its own: android.25's batched terrain demonstrably rasterised through a
+/// `multi_draw_indexed_indirect` on the Adreno 640 this port targets, and the probes that later
+/// gated that path behind a proof read **clear colour back on every pixel** - a verdict the batched
+/// call was blamed for, when the probe and the batched call share nothing but the driver. What they
+/// *did* share, and what the batched path never asked for, was an integer render target; integer
+/// targets are exactly the kind of thing a mobile tile-based driver silently stops rasterising. This
+/// probe separates the two: a driver that draws the floor on `Rgba8Unorm` but not on `R32Uint` has
+/// its answer named - the target was the verdict, not the call - and the `Rgba8Unorm` channel probes
+/// are the ones that count.
+static INTEGER_TARGET_PROBE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The number each probe record carries, one more per record.
 ///
 /// A base of 100 rather than 0 is the whole point: a driver that does not fetch the record returns
 /// **zero** for every draw (an unbound or unfetched attribute reads zero), and zeros are also what a
@@ -909,11 +939,33 @@ static FIRST_INSTANCE_PROBE: std::sync::atomic::AtomicU8 = std::sync::atomic::At
 /// - the collapsed world, the D3D12 `SV_InstanceID` signature - from both.
 const PROBE_SENTINELS: [u32; 4] = [100, 101, 102, 103];
 
+/// The clear colour every probe starts from, as the target stores it: **200**, distinct from every
+/// sentinel, from zero and from anything an unfetched record could produce.
+///
+/// The probes that draw onto `R32Uint` clear with the integer 200; the probes on `Rgba8Unorm` clear
+/// with [`probe_sentinel_color`] of it, which is the same number once the target has stored it.
+const PROBE_CLEAR: u32 = 200;
+
+/// The colour a `Rgba8Unorm` target stores for a probe sentinel, as the clear colour spells it.
+///
+/// An `Rgba8Unorm` target stores `round(f * 255)` per channel, so the exact round trip of a whole
+/// number `n` is `f64(n) / 255.0`: stored, pixel `r` holds `100 + r` in its red byte, and the
+/// readback reads it back as the same number the `R32Uint` probes compare against - one comparison
+/// helper, one report format, two target formats. (`wgpu::Color`'s fields are `f64`; the shaders
+/// write the same number as an `f32` division, whose half an ulp cannot move `round` off `n`.)
+fn probe_sentinel_color(sentinel: u32) -> f64 {
+    f64::from(sentinel) / 255.0
+}
+
 /// Whether the readback the probe asked for came back with one sentinel per pixel, in order.
 ///
 /// Split out from the GPU work so the shape of a failure can be tested without a device: a collapsed
 /// fetch (every pixel carrying record 0's number), a dead fetch (every pixel zero) and a cleared
-/// target (every pixel 999) are three different driver answers and all three fail here.
+/// target (every pixel [`PROBE_CLEAR`]) are three different driver answers and all three fail here.
+///
+/// The readback is **normalised before it gets here**: an `R32Uint` probe's words are the values the
+/// pixels hold, and an `Rgba8Unorm` probe's are the red bytes widened - so every probe compares
+/// against the sentinels through this one function whatever it rendered onto.
 fn the_probe_records_came_back(readback: &[u32]) -> bool {
     readback.len() == PROBE_SENTINELS.len()
         && readback
@@ -934,7 +986,7 @@ fn the_probe_records_came_back(readback: &[u32]) -> bool {
 /// documentation; a probe is the driver doing the thing.
 ///
 /// What it does: four records, four pixels, one render. Each record carries one sentinel in its
-/// `SectionDraw::x` (100, 101, 102, 103) and draws one pixel of a 4x1 `R32Uint` target through
+/// `SectionDraw::x` (100, 101, 102, 103) and draws one pixel of a 4x1 `Rgba8Unorm` target through
 /// `multi_draw_indexed_indirect` - the same call, the same `SectionDraw::vertex_layout` instance-step
 /// attribute, the same `first_instance`-per-record convention the terrain pass uses. The target is
 /// read back and compared against the sentinels: one per pixel, in order, or the fetch does not work
@@ -959,10 +1011,13 @@ pub fn probe_first_instance_fetch(device: &wgpu::Device, queue: &wgpu::Queue) ->
             // wgpu-mc: the first-instance probe. Four records, four pixels: record r carries the
             // sentinel 100 + r in its `x` and draws pixel r, and the readback has to name them in
             // order. One vertex per index, indexed so that `vi >> 2` is the pixel and `vi & 3` the
-            // corner of the quad that covers it.
+            // corner of the quad that covers it. The target is `Rgba8Unorm` - the swapchain's own
+            // format, the one target on the device the game has already proven - and the sentinel
+            // rides in the red channel as `f32(sentinel) / 255.0`, which the target stores back as
+            // exactly the sentinel number.
             struct ProbeOut {
                 @builtin(position) pos: vec4<f32>,
-                @location(0) @interpolate(flat) record: u32,
+                @location(0) @interpolate(flat) record: f32,
             }
 
             @vertex
@@ -977,13 +1032,13 @@ pub fn probe_first_instance_fetch(device: &wgpu::Device, queue: &wgpu::Queue) ->
 
                 var out: ProbeOut;
                 out.pos = vec4<f32>(x, y, 0.0, 1.0);
-                out.record = u32(draw_record.x);
+                out.record = f32(draw_record.x) / 255.0;
                 return out;
             }
 
             @fragment
-            fn frag(in: ProbeOut) -> @location(0) u32 {
-                return in.record;
+            fn frag(in: ProbeOut) -> @location(0) vec4<f32> {
+                return vec4<f32>(in.record, 0.0, 0.0, 1.0);
             }
             "#,
         )),
@@ -1017,9 +1072,11 @@ pub fn probe_first_instance_fetch(device: &wgpu::Device, queue: &wgpu::Queue) ->
             entry_point: Some("frag"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
-                format: wgpu::TextureFormat::R32Uint,
+                // The target the pass renders onto - see the texture below for why it is the
+                // swapchain's own format and not the integer one this probe used to ask for.
+                format: wgpu::TextureFormat::Rgba8Unorm,
                 blend: None,
-                write_mask: wgpu::ColorWrites::default(),
+                write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
         primitive: wgpu::PrimitiveState::default(),
@@ -1064,6 +1121,12 @@ pub fn probe_first_instance_fetch(device: &wgpu::Device, queue: &wgpu::Queue) ->
         mapped_at_creation: false,
     });
 
+    // **The swapchain's own format.** The probes used to render onto `R32Uint`, and the driver this
+    // port targets read clear colour back off every probe of every release that asked one - a verdict
+    // its batched terrain path had demonstrably not earned, because the same batched call rasterised
+    // fine when the game drew with it. What the probes asked for that the game never did was an
+    // integer target, so the probes now ask their question on the format the whole game is drawn
+    // onto, and [`probe_floor_draws`] on `R32Uint` keeps the old question as a forensic of its own.
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("wgpu-mc: the first-instance probe target"),
         size: wgpu::Extent3d {
@@ -1074,7 +1137,7 @@ pub fn probe_first_instance_fetch(device: &wgpu::Device, queue: &wgpu::Queue) ->
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::R32Uint,
+        format: wgpu::TextureFormat::Rgba8Unorm,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
@@ -1116,13 +1179,15 @@ pub fn probe_first_instance_fetch(device: &wgpu::Device, queue: &wgpu::Queue) ->
                 resolve_target: None,
                 depth_slice: None,
                 ops: wgpu::Operations {
-                    // 999 in every pixel before the draw, so a draw that never happened cannot be
-                    // mistaken for one that drew the wrong thing.
+                    // 200 in every pixel before the draw, so a draw that never happened cannot be
+                    // mistaken for one that drew the wrong thing. An `Rgba8Unorm` target stores
+                    // `round(f * 255)` per channel, so this is the integer 200 - distinct from
+                    // every sentinel and from an unfetched record's zero.
                     load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 999.0,
-                        g: 999.0,
-                        b: 999.0,
-                        a: 999.0,
+                        r: probe_sentinel_color(PROBE_CLEAR),
+                        g: probe_sentinel_color(PROBE_CLEAR),
+                        b: probe_sentinel_color(PROBE_CLEAR),
+                        a: 1.0,
                     }),
                     store: wgpu::StoreOp::Store,
                 },
@@ -1187,10 +1252,12 @@ pub fn probe_first_instance_fetch(device: &wgpu::Device, queue: &wgpu::Queue) ->
         return false;
     };
 
-    let words: &[u32] = bytemuck::cast_slice(&data[..16]);
-    let answer = the_probe_records_came_back(words);
+    // The red byte of each pixel, widened to the words the comparison and the report read: an
+    // `Rgba8Unorm` row is four bytes a pixel and the sentinel rides in the first of them.
+    let words = probe_rgba_readback_words(&data);
+    let answer = the_probe_records_came_back(&words);
 
-    record_probe_readback(&FIRST_INSTANCE_PROBE_READBACK, words);
+    record_probe_readback(&FIRST_INSTANCE_PROBE_READBACK, &words);
 
     drop(data);
     readback.unmap();
@@ -1220,6 +1287,8 @@ static INDEX_RECORD_PROBE: std::sync::atomic::AtomicU8 = std::sync::atomic::Atom
 /// compared against.
 static FIRST_INSTANCE_PROBE_READBACK: std::sync::Mutex<[u32; 4]> = std::sync::Mutex::new([0; 4]);
 static INDEX_RECORD_PROBE_READBACK: std::sync::Mutex<[u32; 4]> = std::sync::Mutex::new([0; 4]);
+static FLOOR_PROBE_READBACK: std::sync::Mutex<[u32; 4]> = std::sync::Mutex::new([0; 4]);
+static INTEGER_TARGET_PROBE_READBACK: std::sync::Mutex<[u32; 4]> = std::sync::Mutex::new([0; 4]);
 
 /// Copies a probe's four readback words into its slot for the per-world report to carry.
 fn record_probe_readback(slot: &std::sync::Mutex<[u32; 4]>, words: &[u32]) {
@@ -1236,6 +1305,23 @@ fn record_probe_readback(slot: &std::sync::Mutex<[u32; 4]>, words: &[u32]) {
 /// The four words a probe read back, for the report line that names them.
 fn probe_readback(slot: &std::sync::Mutex<[u32; 4]>) -> [u32; 4] {
     slot.lock().map(|words| *words).unwrap_or([0; 4])
+}
+
+/// The readback row of a probe that rendered onto `Rgba8Unorm`, as the words the comparison reads.
+///
+/// One copied row is 256 bytes wide whatever the target: four pixels of four bytes each, red first,
+/// and the sentinel rides in the red byte. Widening it here keeps every probe - `R32Uint` ones
+/// included, whose pixels are already the numbers themselves - comparing against the sentinels
+/// through the same [`the_probe_records_came_back`] and printing the same shape of readback in the
+/// report, so a log of one release reads like the log of another.
+fn probe_rgba_readback_words(data: &[u8]) -> [u32; 4] {
+    let mut words = [0u32; 4];
+
+    for (word, pixel) in words.iter_mut().zip(data.chunks(4)) {
+        *word = pixel.first().copied().unwrap_or(0) as u32;
+    }
+
+    words
 }
 
 /// One baked index of the probe's index buffer, spelled the way a bake spells every index it
@@ -1288,12 +1374,15 @@ pub fn probe_index_record_batching(device: &wgpu::Device, queue: &wgpu::Queue) -
             // wgpu-mc: the index-record probe. The terrain's own shape, miniaturised: the index
             // carries its record's slot above the local vertex id, the vertex stage reads the
             // record out of a storage table through those bits, and the indirect record says
-            // nothing about which draw it is. Record r draws pixel r with its sentinel.
+            // nothing about which draw it is. Record r draws pixel r with its sentinel. The
+            // target is `Rgba8Unorm` - the swapchain's own format, the one target on the device
+            // the game has already proven - and the sentinel rides in the red channel as
+            // `f32(sentinel) / 255.0`, which the target stores back as exactly the sentinel.
             @group(0) @binding(0) var<storage> records: array<u32>;
 
             struct ProbeOut {
                 @builtin(position) pos: vec4<f32>,
-                @location(0) @interpolate(flat) record: u32,
+                @location(0) @interpolate(flat) record: f32,
             }
 
             @vertex
@@ -1307,13 +1396,13 @@ pub fn probe_index_record_batching(device: &wgpu::Device, queue: &wgpu::Queue) -
 
                 var out: ProbeOut;
                 out.pos = vec4<f32>(x, y, 0.0, 1.0);
-                out.record = record;
+                out.record = f32(record) / 255.0;
                 return out;
             }
 
             @fragment
-            fn frag(in: ProbeOut) -> @location(0) u32 {
-                return in.record;
+            fn frag(in: ProbeOut) -> @location(0) vec4<f32> {
+                return vec4<f32>(in.record, 0.0, 0.0, 1.0);
             }
             "#,
         )),
@@ -1356,9 +1445,11 @@ pub fn probe_index_record_batching(device: &wgpu::Device, queue: &wgpu::Queue) -
             entry_point: Some("frag"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
-                format: wgpu::TextureFormat::R32Uint,
+                // The texture below says why: the target the game itself draws onto, so the
+                // verdict is about the batched shape and not about an integer format.
+                format: wgpu::TextureFormat::Rgba8Unorm,
                 blend: None,
-                write_mask: wgpu::ColorWrites::default(),
+                write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
         primitive: wgpu::PrimitiveState::default(),
@@ -1420,7 +1511,10 @@ pub fn probe_index_record_batching(device: &wgpu::Device, queue: &wgpu::Queue) -
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::R32Uint,
+        // The swapchain's own format, for the same reason the first-instance probe moved: an
+        // integer target is a variable the batched call never asked for, and the verdict this
+        // probe exists to give is about the batched call.
+        format: wgpu::TextureFormat::Rgba8Unorm,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
@@ -1460,10 +1554,10 @@ pub fn probe_index_record_batching(device: &wgpu::Device, queue: &wgpu::Queue) -
                 depth_slice: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 999.0,
-                        g: 999.0,
-                        b: 999.0,
-                        a: 999.0,
+                        r: probe_sentinel_color(PROBE_CLEAR),
+                        g: probe_sentinel_color(PROBE_CLEAR),
+                        b: probe_sentinel_color(PROBE_CLEAR),
+                        a: 1.0,
                     }),
                     store: wgpu::StoreOp::Store,
                 },
@@ -1528,15 +1622,343 @@ pub fn probe_index_record_batching(device: &wgpu::Device, queue: &wgpu::Queue) -
         return false;
     };
 
-    let words: &[u32] = bytemuck::cast_slice(&data[..16]);
-    let answer = the_probe_records_came_back(words);
+    // The red byte of each pixel, widened - see the helper for why every probe normalises here.
+    let words = probe_rgba_readback_words(&data);
+    let answer = the_probe_records_came_back(&words);
 
-    record_probe_readback(&INDEX_RECORD_PROBE_READBACK, words);
+    record_probe_readback(&INDEX_RECORD_PROBE_READBACK, &words);
 
     drop(data);
     readback.unmap();
 
     INDEX_RECORD_PROBE.store(
+        if answer { 1 } else { 2 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
+    answer
+}
+
+/// Which target format [`probe_floor_draws`] asks its question on.
+///
+/// The two variants differ in three places the shader cannot paper over: the fragment's output
+/// type, the clear value the pass starts from and the way a copied row becomes the four words the
+/// comparison reads. Everything else - the geometry, the four plain draws, the readback shape - is
+/// one probe.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ProbeTarget {
+    /// The swapchain's own format, and the one target on any device the game has already proven.
+    Rgba8,
+    /// The integer target every probe before the floor existed rendered into, kept as a forensic.
+    R32Uint,
+}
+
+impl ProbeTarget {
+    fn format(self) -> wgpu::TextureFormat {
+        match self {
+            ProbeTarget::Rgba8 => wgpu::TextureFormat::Rgba8Unorm,
+            ProbeTarget::R32Uint => wgpu::TextureFormat::R32Uint,
+        }
+    }
+}
+
+/// Whether **anything at all** rasterises through this renderer's probe methodology on this device:
+/// four quads, four plain `draw_indexed` calls, one trivial pipeline, one sentinel each, no indirect
+/// and no instance trick and no storage read - the floor every other probe's verdict stands on.
+///
+/// Why a floor at all: the probes answer questions by drawing onto a target, clearing it to a
+/// sentinel of their own and copying it back, and **every one of those steps is shared** by every
+/// probe. A driver that fails the floor fails it for a reason that has nothing to do with the
+/// channels the other probes ask about - and until this probe existed, that reason was invisible:
+/// the Adreno 640 this port targets read clear colour off every probe of every release that gated
+/// the batched path behind a proof, and the verdict "this driver cannot batch" was recorded while
+/// the same batched call rasterised fine whenever the game drew with it. What the probes asked for
+/// that the game never did was an **integer render target** - so the floor asks its question twice,
+/// once on [`ProbeTarget::Rgba8`] (the verdict that counts) and once on [`ProbeTarget::R32Uint`]
+/// (the forensic that names the old failure, whatever it turns out to have been).
+///
+/// The pass draws quad `r` with the `r`th of four `draw_indexed` calls whose vertices carry the
+/// sentinel in a plain vertex-stepped buffer - the shape with nothing left in it to doubt.
+pub fn probe_floor_draws(device: &wgpu::Device, queue: &wgpu::Queue, target: ProbeTarget) -> bool {
+    const RECORDS: u64 = 4;
+    const INDICES_PER_RECORD: u64 = 6;
+
+    // The fragment is the one thing the two targets cannot share - the output type differs - so
+    // the whole function is spelled per target and the rest of the shader is one text.
+    let fragment = match target {
+        ProbeTarget::Rgba8 => {
+            r#"
+            @fragment
+            fn frag(in: ProbeOut) -> @location(0) vec4<f32> {
+                return vec4<f32>(in.record, 0.0, 0.0, 1.0);
+            }
+            "#
+        }
+        ProbeTarget::R32Uint => {
+            r#"
+            @fragment
+            fn frag(in: ProbeOut) -> @location(0) u32 {
+                return u32(in.record * 255.0 + 0.5);
+            }
+            "#
+        }
+    };
+
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("wgpu-mc: the floor probe"),
+        source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(format!(
+            r#"
+            // wgpu-mc: the floor probe. Sixteen vertices, four quads: vertex v belongs to quad
+            // v >> 2 and covers one corner of the quad that draws pixel v >> 2 of a four-pixel
+            // target. The four draws are plain `draw_indexed` calls, one per quad - nothing here
+            // is indirect, instanced or read out of storage, because the question is whether
+            // *anything* rasterises and reads back on this device at all.
+            struct ProbeOut {{
+                @builtin(position) pos: vec4<f32>,
+                @location(0) @interpolate(flat) record: f32,
+            }}
+
+            @vertex
+            fn vert(
+                @location(0) sentinel: u32,
+                @location(1) corner: u32,
+            ) -> ProbeOut {{
+                let pixel = f32(sentinel - 100u);
+                let x = pixel * 0.5 - 1.0 + f32(corner & 1u) * 0.5;
+                let y = f32(corner >> 1u) * 2.0 - 1.0;
+
+                var out: ProbeOut;
+                out.pos = vec4<f32>(x, y, 0.0, 1.0);
+                out.record = f32(sentinel) / 255.0;
+                return out;
+            }}
+            {fragment}
+            "#
+        ))),
+    });
+
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("wgpu-mc: the floor probe"),
+        layout: None,
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: Some("vert"),
+            compilation_options: Default::default(),
+            // Two plain `Uint32` attributes, vertex-stepped: the sentinel and the corner. The
+            // most ordinary fetch there is - nothing instanced, nothing indirect, nothing read
+            // out of a table - because this probe's job is to have nothing in it to doubt.
+            buffers: &[Some(wgpu::VertexBufferLayout {
+                array_stride: 8,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Uint32,
+                        offset: 0,
+                        shader_location: 0,
+                    },
+                    wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Uint32,
+                        offset: 4,
+                        shader_location: 1,
+                    },
+                ],
+            })],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: Some("frag"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: target.format(),
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    // The vertices: one sentinel and one corner each, sixteen of them, four per quad.
+    let mut vertices = Vec::with_capacity((RECORDS * 4) as usize);
+    for record in 0..RECORDS as u32 {
+        for corner in 0..4u32 {
+            vertices.push(PROBE_SENTINELS[record as usize]);
+            vertices.push(corner);
+        }
+    }
+
+    let vertex_buffer = create_buffer_with_contents(
+        device,
+        "wgpu-mc: the floor probe vertices",
+        wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::VERTEX,
+        bytemuck::cast_slice(&vertices),
+    );
+
+    // The indices: per quad, the six corners of its two triangles, naming the quad's own four
+    // vertices. Draw `r` runs `r * 6 .. r * 6 + 6` of this one buffer.
+    let mut indices = Vec::with_capacity((RECORDS * INDICES_PER_RECORD) as usize);
+    for record in 0..RECORDS as u32 {
+        let base = record * 4;
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+
+    let index_buffer = create_buffer_with_contents(
+        device,
+        "wgpu-mc: the floor probe indices",
+        wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::INDEX,
+        bytemuck::cast_slice(&indices),
+    );
+
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("wgpu-mc: the floor probe target"),
+        size: wgpu::Extent3d {
+            width: RECORDS as u32,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: target.format(),
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu-mc: the floor probe readback"),
+        size: 256,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("wgpu-mc: the floor probe"),
+    });
+
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("wgpu-mc: the floor probe"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    // The clear that says "nothing drew here": 200 on `R32Uint`, the colour that
+                    // stores back as 200 on `Rgba8Unorm` - distinct from every sentinel and from
+                    // an unfetched record's zero, on either target.
+                    load: wgpu::LoadOp::Clear(match target {
+                        ProbeTarget::Rgba8 => wgpu::Color {
+                            r: probe_sentinel_color(PROBE_CLEAR),
+                            g: probe_sentinel_color(PROBE_CLEAR),
+                            b: probe_sentinel_color(PROBE_CLEAR),
+                            a: 1.0,
+                        },
+                        ProbeTarget::R32Uint => wgpu::Color {
+                            r: PROBE_CLEAR as f64,
+                            g: PROBE_CLEAR as f64,
+                            b: PROBE_CLEAR as f64,
+                            a: PROBE_CLEAR as f64,
+                        },
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+
+        pass.set_pipeline(&pipeline);
+        pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+        pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+
+        // Four plain draws, one per record - the calls this driver has never been caught lying
+        // about, which is what makes this probe the floor rather than the question.
+        for record in 0..RECORDS {
+            let from = (record * INDICES_PER_RECORD) as u32;
+            pass.draw_indexed(from..from + INDICES_PER_RECORD as u32, 0, 0..1);
+        }
+    }
+
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(256),
+                rows_per_image: Some(1),
+            },
+        },
+        wgpu::Extent3d {
+            width: RECORDS as u32,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    queue.submit([encoder.finish()]);
+
+    let slice = readback.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+
+    if device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
+        .is_err()
+    {
+        return false;
+    }
+
+    if receiver.recv().is_err() {
+        return false;
+    }
+
+    let Ok(data) = slice.get_mapped_range() else {
+        return false;
+    };
+
+    // An `Rgba8Unorm` row carries the sentinel in the red byte of each pixel; an `R32Uint` row
+    // carries it as the pixel itself. Both normalise into the words every probe compares.
+    let words = match target {
+        ProbeTarget::Rgba8 => probe_rgba_readback_words(&data),
+        ProbeTarget::R32Uint => {
+            let words: &[u32] = bytemuck::cast_slice(&data[..16]);
+            [words[0], words[1], words[2], words[3]]
+        }
+    };
+
+    let answer = the_probe_records_came_back(&words);
+
+    let slot = match target {
+        ProbeTarget::Rgba8 => &FLOOR_PROBE_READBACK,
+        ProbeTarget::R32Uint => &INTEGER_TARGET_PROBE_READBACK,
+    };
+    record_probe_readback(slot, &words);
+
+    drop(data);
+    readback.unmap();
+
+    let verdict = match target {
+        ProbeTarget::Rgba8 => &FLOOR_PROBE,
+        ProbeTarget::R32Uint => &INTEGER_TARGET_PROBE,
+    };
+    verdict.store(
         if answer { 1 } else { 2 },
         std::sync::atomic::Ordering::Relaxed,
     );
@@ -1561,6 +1983,41 @@ fn report_device_capabilities() {
         if multi_draw & 8 != 0 { "yes" } else { "no" }
     );
 
+    // **What the floor said**, before anything built on it. Every probe verdict below is read
+    // through the same methodology this one proves - target, clear, copy-back - so this line goes
+    // first, and a run whose floor failed reads a different sentence than a run whose channel did.
+    match (
+        FLOOR_PROBE.load(Ordering::Relaxed),
+        INTEGER_TARGET_PROBE.load(Ordering::Relaxed),
+    ) {
+        (1, 1) => info!(
+            "wgpu-mc: the floor probe drew its four sentinels on both targets - a trivial pipeline \
+             rasterises and reads back on Rgba8Unorm and on R32Uint alike, so every probe verdict \
+             below is about the channel it asks about and nothing else"
+        ),
+        (1, _) => info!(
+            "wgpu-mc: the floor probe drew its four sentinels on Rgba8Unorm (readback {:?}) but NOT \
+             on R32Uint (readback {:?}) - a trivial pipeline does not rasterise onto an integer \
+             target on this driver. Every probe before this one rendered into R32Uint, so every \
+             verdict those probes ever gave on this driver was the target's answer, not the batched \
+             call's; the channel probes below run on Rgba8Unorm, and theirs are the verdicts that \
+             count",
+            probe_readback(&FLOOR_PROBE_READBACK),
+            probe_readback(&INTEGER_TARGET_PROBE_READBACK)
+        ),
+        (2, _) => info!(
+            "wgpu-mc: the floor probe did not draw its four sentinels even on Rgba8Unorm (readback \
+             {:?}) - a trivial pipeline of four plain draw_indexed calls does not rasterise and read \
+             back through this methodology on this driver, so no channel probe's verdict here means \
+             anything and the batching stays closed on the floor's failure, not on any channel's",
+            probe_readback(&FLOOR_PROBE_READBACK)
+        ),
+        _ => info!(
+            "wgpu-mc: the floor probe did not run, because the batching was already ruled out by \
+             the adapter or the backend"
+        ),
+    }
+
     // What the terrain pass does with the answer above, which is the number a run is actually read for:
     // `terrain_indirect` is a switch, and this is the setting *and* the hardware *and the backend*
     // resolved into the one flag the draw path reads. See `debug::apply`.
@@ -1584,6 +2041,10 @@ fn report_device_capabilities() {
              buffer read per draw on top"
         } else if !wgpu_mc::render::graph::terrain_indirect_requested() {
             "one section at a time: the `terrain_indirect` switch is off, and this device could batch"
+        } else if FLOOR_PROBE.load(Ordering::Relaxed) == 2 {
+            "one section at a time, because the floor probe failed: a trivial pipeline of four plain \
+             draw_indexed calls did not rasterise and read back on this driver, so no channel probe's \
+             verdict here means anything and the batching stays closed on the floor's failure"
         } else if INDEX_RECORD_PROBE.load(Ordering::Relaxed) == 2 {
             "one section at a time, because the index-record probe failed: this driver was asked to \
              draw four records whose indices carry their own record, and it did not draw one record \
@@ -1632,12 +2093,12 @@ fn report_device_capabilities() {
             "wgpu-mc: the first-instance probe did not read its sentinels back in order (it read \
              back {:?}, where order is 100, 101, 102, 103), so the game's own draws will not batch \
              on this driver - the terrain pass has its own probe of its own record channel, \
-             reported below",
+             reported below. The probe ran on Rgba8Unorm, the target the game itself draws onto",
             probe_readback(&FIRST_INSTANCE_PROBE_READBACK)
         ),
         _ => info!(
             "wgpu-mc: the first-instance probe did not run, because the game path's batching was \
-             already ruled out by the adapter or the backend"
+             already ruled out by the adapter, the backend or the floor probe"
         ),
     }
 
@@ -1655,12 +2116,15 @@ fn report_device_capabilities() {
              back {:?}, where order is 100, 101, 102, 103), so the batched terrain path does not \
              draw one record per record on this driver - the terrain pass falls back to the \
              gathering shapes, reported above: straight out of the arena where the runs allow, and \
-             over the compacted draw (`terrain_mega`) where they do not",
+             over the compacted draw (`terrain_mega`) where they do not. The probe ran on \
+             Rgba8Unorm, the target the game itself draws onto - an integer target, the one thing \
+             this shape shares with the probes that used to fail here, is no longer part of the \
+             question",
             probe_readback(&INDEX_RECORD_PROBE_READBACK)
         ),
         _ => info!(
             "wgpu-mc: the index-record probe did not run, because the terrain's batching was already \
-             ruled out by the adapter or the backend"
+             ruled out by the adapter, the backend or the floor probe"
         ),
     }
 
@@ -2061,6 +2525,20 @@ fn try_create_renderer(
         }
     });
 
+    // **The floor every probe verdict stands on.** Four plain draws of a trivial pipeline onto the
+    // swapchain's own format: if this cannot rasterise and read back, no channel probe's verdict on
+    // this device means anything, because every probe shares its target, its clear and its
+    // copy-back with the floor. It runs before the channel probes, and its answer gates them - the
+    // state the Adreno 640 this port targets taught this file to guard against, where every probe
+    // of every release read clear colour back and the verdict "cannot batch" was recorded on a call
+    // that had never been the thing that failed. See `probe_floor_draws`.
+    let probe_floor = probe_floor_draws(&device, &queue, ProbeTarget::Rgba8);
+
+    // **And the same floor on `R32Uint`**, the format every probe before this one rendered into -
+    // not a gate, a forensic: a driver that draws the floor on `Rgba8Unorm` but not here has its
+    // history explained, and the report below names it.
+    probe_floor_draws(&device, &queue, ProbeTarget::R32Uint);
+
     // **The probe that asks whether the batched path's one per-draw channel actually works here** -
     // and the only reader of its answer is now the *game's* batched draws, not the terrain's. The
     // terrain pass stopped using the channel (its records live in a table the indices name), so a
@@ -2068,10 +2546,13 @@ fn try_create_renderer(
     // one draw at a time there, correct and slow, exactly what the Adreno 640 this port targets has
     // been doing since the probe went in. Everything above is what the adapter claims; this is the
     // device doing the thing. Runs before any pipeline of the game is compiled, so a driver that
-    // chokes on the probe does not get to choke on anything else first. See
+    // chokes on the probe does not get to choke on anything else first. A floor that failed voids
+    // the question rather than answering it: the channel probes' targets, clears and copy-backs are
+    // the floor's, so a verdict read off them would be the floor's verdict restated. See
     // `probe_first_instance_fetch`.
     let game_batching = backend != GraphicsBackend::DirectX12
         && can_multi_draw_indirect()
+        && probe_floor
         && probe_first_instance_fetch(&device, &queue);
 
     wgpu_mc::render::graph::set_game_batching_possible(game_batching);
@@ -2080,12 +2561,14 @@ fn try_create_renderer(
     // with carries each record in its own indices and needs nothing per draw - which is why it was
     // taken to be beyond the reach of the first-instance probe, and why a device could hollow a
     // world through it while passing that probe. This one asks the exact shape: indices encoding
-    // their record, one storage table, one multi-draw, four records that must each draw once. The
-    // optimistic `set_terrain_batching_possible` above resolved the adapter's claims; this resolves
-    // the device's behaviour, and a driver that fails here draws one section at a time - correct
-    // and slow, the same fallback a refused capability gets. See `probe_index_record_batching`.
+    // their record, one storage table, one multi-draw, four records that must each draw once - on
+    // the target the game has already proven. The optimistic `set_terrain_batching_possible` above
+    // resolved the adapter's claims; this resolves the device's behaviour, and a driver that fails
+    // here draws one section at a time - correct and slow, the same fallback a refused capability
+    // gets. See `probe_index_record_batching`.
     let terrain_batching = backend != GraphicsBackend::DirectX12
         && can_multi_draw_indirect()
+        && probe_floor
         && probe_index_record_batching(&device, &queue);
 
     wgpu_mc::render::graph::set_terrain_batching_possible(terrain_batching);
@@ -9124,14 +9607,66 @@ mod per_face_strip_tests {
         // The dead fetch: the attribute never reached the shader, and zeros are what that reads.
         assert!(!the_probe_records_came_back(&[0, 0, 0, 0]));
 
-        // The draw that never happened: what the clear left.
-        assert!(!the_probe_records_came_back(&[999, 999, 999, 999]));
+        // The draw that never happened: what the clear left. The integer probes read the clear
+        // value itself; the Rgba8Unorm probes read 200 out of the red byte the clear colour stores.
+        assert!(!the_probe_records_came_back(&[PROBE_CLEAR; 4]));
+        assert_eq!(
+            probe_rgba_readback_words(&[PROBE_CLEAR as u8, 0, 0, 255].repeat(4)),
+            [PROBE_CLEAR; 4]
+        );
 
         // And a wrong order is a wrong answer even when every number is a sentinel.
         assert!(!the_probe_records_came_back(&[101, 100, 102, 103]));
 
         // Short reads and long ones are the copy going wrong, not the fetch.
         assert!(!the_probe_records_came_back(&[100, 101, 102]));
+    }
+
+    /// The sentinel colour's round trip is what the `Rgba8Unorm` probes' verdicts stand on: an
+    /// `Rgba8Unorm` target stores `round(f * 255)` per channel, so a sentinel that does not survive
+    /// `f32(n) / 255.0 -> store -> red byte` would make an honest driver read like a broken one.
+    /// Every probe sentinel, the clear value included, has to survive it exactly.
+    #[test]
+    fn the_sentinel_colour_round_trips_through_an_rgba8_target() {
+        for sentinel in PROBE_SENTINELS
+            .iter()
+            .copied()
+            .chain(std::iter::once(PROBE_CLEAR))
+        {
+            // What the fragment shader writes, and what the target stores per its own formula.
+            let written = probe_sentinel_color(sentinel);
+            let stored = (written * 255.0).round() as u32;
+
+            assert_eq!(
+                stored, sentinel,
+                "sentinel {sentinel} did not survive the round trip"
+            );
+
+            // And what the readback widens out of the red byte is the number the comparison reads.
+            let row = [stored as u8, 0, 0, 255];
+            assert_eq!(probe_rgba_readback_words(&row)[0], sentinel);
+        }
+    }
+
+    /// The Rgba8 readback normalisation: one copied row is four pixels of four bytes each, red
+    /// first, and only the red byte is the sentinel. A pixel that wrote its sentinel into the wrong
+    /// channel, or a copy that came back byte-swapped, must not read as a pass.
+    #[test]
+    fn the_rgba_readback_reads_the_red_byte_of_each_pixel() {
+        let mut row = Vec::new();
+
+        for sentinel in PROBE_SENTINELS {
+            row.extend_from_slice(&[sentinel as u8, 1, 2, 3]);
+        }
+
+        assert_eq!(
+            probe_rgba_readback_words(&row),
+            [100, 101, 102, 103],
+            "the sentinel is the red byte, not the pixel as a whole"
+        );
+
+        // A row the copy returned zeroed reads as the dead-fetch shape, not as a pass.
+        assert_eq!(probe_rgba_readback_words(&[0; 16]), [0, 0, 0, 0]);
     }
 
     /// The index-record probe's index words have to be spelled exactly as a bake spells them - the
