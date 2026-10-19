@@ -458,11 +458,14 @@ object TerrainPass {
          *  - **and it is a correctness fix before it is a saving.** `applyFrustum` clears the list before it
          *    refills it - unobservable, both inside one call on the render thread - but `allChanged` clears it
          *    *without* a refill (a render-distance change, a resource reload, the way into a world) and leaves it
-         *    empty until the graph's next update lands. Sending that says something else entirely - `Some(empty)`
-         *    is "the game looked and saw nothing", which makes the native side draw no terrain **and** drop the
-         *    grace set for sections the arena has just taken over (`Scene::sections_since_the_list`) - and the run
-         *    in `run-32chunks.log` caught it twice, one second apart, at the render-distance change: `0 section
-         *    draw(s)` with 42 sections in the arena and "42 not named by the game's occlusion graph".
+         *    empty until the graph's next update lands. Sending it would hand the native side a list that names
+         *    nothing the arena holds - the gather there now reads such a list as "no list" and draws from the
+         *    frustum instead (`RenderGraph::the_list_answers_about`, written after a run sat through a
+         *    thirty-five-second blank with a rebuilt-empty list and 526 sections in the arena) - so an empty send
+         *    costs a counted frustum frame rather than a blank world, and this revision gate keeps even that from
+         *    being sent more than once. The run in `run-32chunks.log` caught the old behaviour twice, one second
+         *    apart, at the render-distance change: `0 section draw(s)` with 42 sections in the arena and "42 not
+         *    named by the game's occlusion graph".
          *
          * The keys are `SectionPos.asLong`, taken straight off each section's own node: the same packing
          * `RustChunkBake` keys its records by and the native side unpacks, so a section cannot be named one

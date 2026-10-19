@@ -68,6 +68,15 @@ static SECTIONS_TOO_NEW: AtomicU64 = AtomicU64::new(0);
 /// catches up with where the player is, which is worth knowing on its own.
 static OCCLUSION_LIST_EXPIRED: AtomicU64 = AtomicU64::new(0);
 
+/// How many frames read the game's list as "no list" because it was empty or named nothing the arena
+/// holds anything drawable for. See [`RenderGraph::the_list_answers_about`].
+///
+/// This is the count that says the whole-world blank cannot come back quietly: a frame it counts is
+/// a frame the frustum drew instead, and a graph that has wedged into naming nothing shows it
+/// climbing every second in the one line a session prints whether diagnostics are on or not -
+/// rather than a world going invisible with nothing in the log to argue about.
+static OCCLUSION_LIST_UNUSABLE: AtomicU64 = AtomicU64::new(0);
+
 /// One section that survived the gather: where it is, what the arena holds for each layer, and how far
 /// away it is.
 ///
@@ -2832,13 +2841,34 @@ impl RenderGraph {
         }
     }
 
+    /// Whether the game's list can cull the arena this gather is about to walk.
+    ///
+    /// `None` is no list and answers no; `Some` answers yes only when the list names at least one
+    /// section the arena holds something drawable for. An empty set names nothing; a set of positions
+    /// the arena does not hold - the game's view and this renderer's have not met, which a teleport
+    /// and a wedged graph each produce - names nothing this frame can draw. Either way the list is
+    /// not an answer about the geometry this frame will draw, and the gather reads it as no list
+    /// rather than as "everything is out of sight". The predicate is handed over rather than the
+    /// arena itself, so a test can ask it of a table instead of a world.
+    fn the_list_answers_about(
+        visible: Option<&std::collections::HashSet<glam::IVec3>>,
+        mut the_arena_holds: impl FnMut(&glam::IVec3) -> bool,
+    ) -> bool {
+        visible.is_some_and(|set| set.iter().any(|pos| the_arena_holds(pos)))
+    }
+
     /// Whether a section is worth submitting, and if not, why not.
     ///
     /// Split out of the draw loop so the one distinction that matters can be tested: `None` is "the JVM
     /// has not said", which is a frustum question, and `Some` is the game's own answer, which is obeyed
     /// as it stands **including when it is empty**. An empty set meaning "not told" is the bug this
     /// variant exists to make impossible - it draws the whole arena for a frame in which the game
-    /// deliberately culled everything, and it reads as "occlusion culling does nothing".
+    /// deliberately culled everything, and it reads as "occlusion culling does nothing". **What the
+    /// caller hands over is guarded one level up**: the gather proves the list names the arena
+    /// ([`RenderGraph::the_list_answers_about`]) before any section is asked, so a list that cannot
+    /// answer about this frame's geometry arrives here as `None` - the whole-world blank a frozen
+    /// empty snapshot produced is the case that guard exists for. The `Some` contract stands for a
+    /// caller that skips the guard, which is what makes it testable on its own.
     ///
     /// **And a third answer, for a section the list has not had the chance to judge.** The list is a
     /// snapshot between refills - `LevelRenderer#applyFrustum` runs only when the camera has turned by
@@ -3057,6 +3087,23 @@ impl RenderGraph {
                 OCCLUSION_LIST_EXPIRED.fetch_add(1, Ordering::Relaxed);
             }
 
+            // **And whether the list can cull this arena at all.** The list is an answer about the
+            // sections it names, and this gather draws the sections the arena holds - so a list that
+            // is empty, or that names none of them, is not an answer about this frame's geometry, and
+            // culling with it draws nothing at all: the whole world gone, for as long as the snapshot
+            // stays. The run that wrote the check sat in that state for thirty-five seconds - a list
+            // the game had rebuilt empty, and then no refill for half a minute because the camera
+            // held still - with 526 sections in the arena and every one of them culled by an answer
+            // about none of them. Such a frame reads the list as "no list" - the frustum decides,
+            // over-drawn by exactly the culling's savings rather than a hole the size of the world -
+            // until a refill that names the arena arrives. Counted, so a graph that has genuinely
+            // gone quiet is a climbing number in a log rather than a blank screen to argue about.
+            let list_usable =
+                Self::the_list_answers_about(visible.as_ref(), |pos| sections.holds(*pos));
+            if visible.is_some() && !list_usable {
+                OCCLUSION_LIST_UNUSABLE.fetch_add(1, Ordering::Relaxed);
+            }
+
             // **The walk's own answer, when the setting asks for it.** One flood per frame, into a set
             // the loop below tests by position: the walk is a map of a few thousand sections while the
             // loop visits every section the arena holds, so building the set is the cheap side of that.
@@ -3091,11 +3138,17 @@ impl RenderGraph {
                         Some(drawn) => drawn.contains(pos),
                         None => {
                             // A list the camera has moved out of answers about a place the camera is
-                            // not in, so this frame reads it as "no list" - the frustum decides, the
-                            // same way it does before the first list of a session arrives. See
-                            // `Scene::visible_sections_camera`.
+                            // not in, and a list that names nothing the arena holds answers about no
+                            // geometry this frame can draw - so either way this frame reads it as
+                            // "no list": the frustum decides, the same way it does before the first
+                            // list of a session arrives. See `Scene::visible_sections_camera` and
+                            // `the_list_answers_about`.
                             Self::section_visibility(
-                                if list_expired { None } else { visible.as_ref() },
+                                if list_expired || !list_usable {
+                                    None
+                                } else {
+                                    visible.as_ref()
+                                },
                                 &sections_since_the_list,
                                 pos,
                             ) != SectionVisibility::OutOfSight
@@ -3237,17 +3290,21 @@ impl RenderGraph {
 
             if PLANE_HINT_REPORTED.swap(now, Ordering::Relaxed) != now {
                 let total = hint_hits + hint_misses;
+                let unusable = OCCLUSION_LIST_UNUSABLE.swap(0, Ordering::Relaxed);
 
                 log::info!(
                     "wgpu-mc: the frustum cull, last frame: {} section(s) tested, {} of them answered by the \
-                     plane the section before was culled by ({:.1}% - one plane test rather than up to six)",
+                     plane the section before was culled by ({:.1}% - one plane test rather than up to six), \
+                     {} frame(s) that drew from the frustum because the game's list was empty or named \
+                     nothing the arena holds",
                     total,
                     hint_hits,
                     if total == 0 {
                         0.0
                     } else {
                         100.0 * hint_hits as f64 / total as f64
-                    }
+                    },
+                    unusable,
                 );
             }
         }
@@ -4984,6 +5041,53 @@ mod terrain_layer_tests {
             SectionVisibility::OutOfSight,
             "a section the list named is not, and this one it did not name and has judged"
         );
+    }
+
+    /// **The gather trusts a list only when the list is about the arena it is culling.**
+    ///
+    /// The three ways a list fails to be an answer, and the one way it is one: `None` is no answer,
+    /// an empty set names nothing, a set of positions the arena holds nothing drawable for names
+    /// nothing this frame can draw - and a set that names one drawable section of the arena is the
+    /// culling working. The thirty-five-second blank was the first two obeyed as the third.
+    #[test]
+    fn a_list_that_names_none_of_the_arena_is_no_answer() {
+        let here = glam::ivec3(3, 4, 5);
+        let elsewhere = glam::ivec3(-1, 0, 2);
+
+        let holds = |pos: &glam::IVec3| *pos == here;
+
+        // No list at all: not an answer.
+        assert!(!RenderGraph::the_list_answers_about(None, holds));
+
+        // An empty list: names nothing, not an answer.
+        let empty = std::collections::HashSet::new();
+        assert!(
+            !RenderGraph::the_list_answers_about(Some(&empty), holds),
+            "an empty list cannot cull anything, and obeying it is the whole-world blank"
+        );
+
+        // A list about some other part of the world: not an answer about this arena.
+        let mut elsewhere_only = std::collections::HashSet::new();
+        elsewhere_only.insert(elsewhere);
+        assert!(
+            !RenderGraph::the_list_answers_about(Some(&elsewhere_only), holds),
+            "a list that names none of the arena's sections is an answer about none of them"
+        );
+
+        // One named section is enough: the culling is working.
+        let mut names_the_arena = std::collections::HashSet::new();
+        names_the_arena.insert(here);
+        assert!(RenderGraph::the_list_answers_about(
+            Some(&names_the_arena),
+            holds
+        ));
+
+        // And the mixed case, which is the shape of every healthy frame: some of the list is
+        // geometry this renderer holds and some of it is not.
+        let mut mixed = std::collections::HashSet::new();
+        mixed.insert(elsewhere);
+        mixed.insert(here);
+        assert!(RenderGraph::the_list_answers_about(Some(&mixed), holds));
     }
 
     fn at(distance_squared: f32) -> VisibleSection {
