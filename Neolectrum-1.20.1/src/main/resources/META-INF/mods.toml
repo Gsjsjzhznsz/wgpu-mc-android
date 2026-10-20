@@ -1,0 +1,31 @@
+modLoader="javafml"
+loaderVersion="[47,)"
+license="${mod_license}"
+issueTrackerURL="https://github.com/NTS-Official/Neolectrum/issues"
+
+[[mods]]
+modId="${mod_id}"
+version="${mod_version}"
+displayName="${mod_name}"
+authors="NoTuring_Steve"
+logoFile="assets/wgpu_mc/icon.png"
+description='''
+A renderer made to replace Blaze3D, written in Rust, using wgpu for cross-platform support.
+On Minecraft 1.20.1 the mod takes the GL seam: the game renders its own meshes, and every GL
+call it makes is answered out of wgpu, which is how the window ends up on Vulkan, D3D12 or
+Metal instead of OpenGL.
+'''
+
+[[dependencies.${mod_id}]]
+    modId="forge"
+    mandatory=true
+    versionRange="[47,)"
+    ordering="NONE"
+    side="CLIENT"
+
+[[dependencies.${mod_id}]]
+    modId="minecraft"
+    mandatory=true
+    versionRange="[1.20.1,1.21)"
+    ordering="NONE"
+    side="CLIENT"
