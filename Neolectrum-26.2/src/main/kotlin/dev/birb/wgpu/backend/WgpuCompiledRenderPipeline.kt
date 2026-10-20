@@ -556,6 +556,131 @@ class WgpuCompiledRenderPipeline private constructor(
             -> WmNative.BLEND_ONE_MINUS_CONSTANT
         }
 
+
+        /** `RawArray_VertexFormat` holding the pipeline's single vertex format binding. */
+        private fun vertexFormats(arena: Arena, format: VertexFormat?): MemorySegment {
+            val array = arena.allocate(WmNative.RAW_ARRAY)
+            if (format == null) {
+                WmNative.writeRawArray(array, 0L, MemorySegment.NULL, 0L)
+                return array
+            }
+
+            val elements = format.elements
+            val nativeElements = arena.allocate(WmNative.VERTEX_FORMAT_ELEMENT, elements.size.toLong())
+
+            for ((index, element) in elements.withIndex()) {
+                val base = WmNative.elementOffset(WmNative.VERTEX_FORMAT_ELEMENT, index)
+                nativeElements.set(
+                    WmNative.LONG,
+                    base + WmNative.VERTEX_FORMAT_ELEMENT_OFFSET,
+                    format.getOffset(element).toLong(),
+                )
+                nativeElements.set(
+                    WmNative.LONG,
+                    base + WmNative.VERTEX_FORMAT_ELEMENT_FORMAT,
+                    WgpuFormat.nativeId(element),
+                )
+                nativeElements.set(
+                    WmNative.ADDRESS,
+                    base + WmNative.VERTEX_FORMAT_ELEMENT_NAME,
+                    NativeNames.utf8(element.name()),
+                )
+            }
+
+            val elementArray = arena.allocate(WmNative.RAW_ARRAY)
+            WmNative.writeRawArray(elementArray, 0L, nativeElements, elements.size.toLong())
+
+            val nativeFormat = arena.allocate(WmNative.VERTEX_FORMAT)
+            nativeFormat.set(WmNative.ADDRESS, WmNative.VERTEX_FORMAT_ELEMENTS, elementArray)
+            nativeFormat.set(WmNative.LONG, WmNative.VERTEX_FORMAT_VERTEX_SIZE, format.vertexSize.toLong())
+
+            WmNative.writeRawArray(array, 0L, nativeFormat, 1L)
+            return array
+        }
+
+        /**
+         * 26.1 flattens a pipeline's bindings into `samplers` and `uniforms`; Rust wants a single
+         * entry array per bind group with uniforms first, which is the order the shader binding
+         * indices assume.
+         */
+        /**
+         * The `WM_CHUNK_PAD` directive: how many `vec4`s of padding a per-draw section block needs.
+         *
+         * The game writes one `DynamicUniforms.ChunkSectionInfo` per section into a uniform ring whose
+         * stride is `Mth.roundToward(CHUNK_SECTION_UBO_SIZE, device.getUniformOffsetAlignment())` - the
+         * same arithmetic `DynamicUniformStorage` does, and the same ring the slices Minecraft binds per
+         * draw come out of. A shader that reads its own record out of that ring at the number the draw
+         * carries has to declare a struct whose *array stride* is that stride, or record `i` would be
+         * read from `i * sizeof(struct)`; this is the difference, in `vec4`s.
+         *
+         * **It is computed here rather than in Rust because both numbers are on this side**: the block's
+         * size is Minecraft's own constant and the alignment belongs to the device the pipeline is being
+         * compiled for. It travels as a directive, and directives are part of the shader cache key - so
+         * a cached translation can never come back carrying another device's stride.
+         */
+        private fun perDrawPad(device: WgpuDevice): String {
+            val alignment = device.getUniformOffsetAlignment()
+            val block = Mth.roundToward(DynamicUniforms.CHUNK_SECTION_UBO_SIZE, alignment)
+            val pad = (block - DynamicUniforms.CHUNK_SECTION_UBO_SIZE) / 16
+
+            return "\n#define WM_CHUNK_PAD $pad\n"
+        }
+
+        private fun bindGroupLayouts(arena: Arena, pipeline: RenderPipeline): MemorySegment {
+            // 26.2 keeps the uniform and sampler lists on the pipeline's bind group layouts; the
+            // flattened views are the same lists one level up, which is what the ABI wants.
+            val uniforms = com.mojang.blaze3d.pipeline.BindGroupLayout.flattenUniforms(pipeline.getBindGroupLayouts())
+            val samplers = com.mojang.blaze3d.pipeline.BindGroupLayout.flattenSamplers(pipeline.getBindGroupLayouts())
+            val entryCount = uniforms.size + samplers.size
+            val entries = arena.allocate(WmNative.BIND_GROUP_ENTRY, entryCount.toLong())
+
+            fun writeEntry(index: Int, kind: Long, name: String, format: Long) {
+                val base = WmNative.elementOffset(WmNative.BIND_GROUP_ENTRY, index)
+                entries.set(WmNative.LONG, base + WmNative.BIND_GROUP_ENTRY_TYPE, kind)
+                entries.set(WmNative.ADDRESS, base + WmNative.BIND_GROUP_ENTRY_NAME, NativeNames.utf8(name))
+                entries.set(WmNative.LONG, base + WmNative.BIND_GROUP_ENTRY_FORMAT, format)
+            }
+
+            for ((index, uniform) in uniforms.withIndex()) {
+                writeEntry(
+                    index,
+                    when {
+                        uniform.type() == UniformType.TEXEL_BUFFER -> WmNative.ENTRY_TEXEL_BUFFER
+                        uniform.name() in perDrawStorageNames(pipeline) -> WmNative.ENTRY_STORAGE_BUFFER
+                        else -> WmNative.ENTRY_UNIFORM_BUFFER
+                    },
+                    uniform.name(),
+                    uniform.gpuFormat()?.let { WgpuFormat.nativeId(it) } ?: WmNative.NONE,
+                )
+            }
+
+            for ((index, sampler) in samplers.withIndex()) {
+                writeEntry(uniforms.size + index, WmNative.ENTRY_SAMPLER, sampler, WmNative.NONE)
+            }
+
+            val entryArray = arena.allocate(WmNative.RAW_ARRAY)
+            WmNative.writeRawArray(entryArray, 0L, entries, entryCount.toLong())
+
+            // struct BlazeBindGroupLayout { RawArray_BindGroupEntryDescriptor *entries; }
+            val layout = arena.allocate(WmNative.BIND_GROUP_LAYOUT)
+            layout.set(WmNative.ADDRESS, 0L, entryArray)
+
+            val layouts = arena.allocate(WmNative.RAW_ARRAY)
+            WmNative.writeRawArray(layouts, 0L, layout, 1L)
+            return layouts
+        }
+
+        private fun com.mojang.blaze3d.PrimitiveTopology.toNativeTopology(): Long = when (this) {
+            com.mojang.blaze3d.PrimitiveTopology.LINES -> WmNative.TOPOLOGY_LINES
+            com.mojang.blaze3d.PrimitiveTopology.DEBUG_LINES -> WmNative.TOPOLOGY_LINES
+            com.mojang.blaze3d.PrimitiveTopology.DEBUG_LINE_STRIP -> WmNative.TOPOLOGY_DEBUG_LINE_STRIP
+            com.mojang.blaze3d.PrimitiveTopology.POINTS -> WmNative.TOPOLOGY_POINTS
+            com.mojang.blaze3d.PrimitiveTopology.TRIANGLES -> WmNative.TOPOLOGY_TRIANGLES
+            com.mojang.blaze3d.PrimitiveTopology.TRIANGLE_STRIP -> WmNative.TOPOLOGY_TRIANGLE_STRIP
+            com.mojang.blaze3d.PrimitiveTopology.TRIANGLE_FAN -> WmNative.TOPOLOGY_TRIANGLE_FAN
+            com.mojang.blaze3d.PrimitiveTopology.QUADS -> WmNative.TOPOLOGY_QUADS
+        }
+
         /** Main render targets are always RGBA8 in 26.1. */
         private val MAIN_TARGET_FORMAT = WmNative.RGBA8_UNORM
 

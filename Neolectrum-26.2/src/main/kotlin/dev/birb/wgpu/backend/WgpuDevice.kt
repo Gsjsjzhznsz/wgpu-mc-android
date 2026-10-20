@@ -25,6 +25,7 @@ import dev.birb.wgpu.rust.WmNative
 import java.lang.foreign.MemorySegment
 import java.nio.ByteBuffer
 import java.util.OptionalDouble
+import java.util.OptionalLong
 import java.util.function.Supplier
 
 /**
@@ -309,7 +310,7 @@ class WgpuDevice(
     override fun createTimestampQueryPool(size: Int): GpuQueryPool = object : GpuQueryPool {
         override fun size(): Int = size
         override fun getValue(index: Int): OptionalLong = OptionalLong.empty()
-        override fun getValues(from: Int, to: Int): Array<OptionalLong> = Array(to - from) { OptionalLong.empty() }
+        override fun getValues(index: Int, count: Int): Array<OptionalLong> = Array(count) { OptionalLong.empty() }
         override fun close() = Unit
     }
 
