@@ -103,7 +103,7 @@ class WgpuBackend : GpuBackend {
             throw BackendCreationException(
                 "wgpu-mc could not create a renderer on any backend. See the log for the reason, " +
                     "then choose a different backend on the Electrum options page (or in " +
-                    "config/wgpu-mc-renderer.json) and restart."
+                    "config/wgpu-mc-renderer.json) and restart.",
                 BackendCreationException.Reason.OTHER,
             )
         }

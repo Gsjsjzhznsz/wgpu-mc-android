@@ -1,6 +1,7 @@
 package dev.birb.wgpu.backend
 
 import com.mojang.blaze3d.buffers.GpuBuffer
+import com.mojang.blaze3d.buffers.GpuBufferSlice
 import dev.birb.wgpu.rust.NativeNames
 import dev.birb.wgpu.rust.WmNative
 import org.lwjgl.system.MemoryUtil
@@ -56,6 +57,55 @@ class WgpuBuffer private constructor(
 
     /** The wgpu usage flags this buffer carries, for diagnostics. */
     fun wgpuUsages(): Long = WmNative.bufferUsages.invokeExact(nativeHandle) as Long
+
+    /**
+     * 26.2's abstract `map`: the same staging dance `WgpuCommandEncoder.mapBuffer` performs,
+     * answered here because the base class now demands it. The staging buffer is this side's own
+     * memory - a read is filled before the view is handed back, and a write is uploaded when the
+     * view closes, which is when Blaze3D considers the bytes final.
+     */
+    override fun map(offset: Long, length: Long, read: Boolean, write: Boolean): GpuBufferSlice.MappedView {
+        // wgpu requires staged ranges to be 16-byte aligned, and a buffer's size is whatever the
+        // game asked for - the tail is this side's own memory and is zeroed.
+        val upload = (length + 15) / 16 * 16
+        val staging = java.nio.ByteBuffer.allocateDirect(upload.toInt())
+        val renderer = dev.birb.wgpu.render.Wgpu.device()?.renderer
+            ?: return GpuBufferSlice.MappedView(
+                GpuBufferSlice(this, offset, length), staging, Runnable { })
+
+        if (read) {
+            val filled = WmNative.readBuffer.invokeExact(
+                renderer,
+                nativeHandle,
+                offset,
+                length,
+                MemorySegment.ofAddress(org.lwjgl.system.MemoryUtil.memAddress0(staging)),
+            ) as Boolean
+            if (!filled) {
+                dev.birb.wgpu.WgpuMcMod.LOGGER.error(
+                    "wgpu: could not read {} bytes at {} back from {}; the mapping stays empty",
+                    length, offset, label,
+                )
+            }
+        }
+
+        return GpuBufferSlice.MappedView(GpuBufferSlice(this, offset, length), staging, Runnable {
+            try {
+                if (write) {
+                    lastMappedWrite = staging.position().toLong()
+                    WmNative.writeToBuffer.invokeExact(
+                        renderer,
+                        nativeHandle,
+                        offset,
+                        upload,
+                        MemorySegment.ofAddress(org.lwjgl.system.MemoryUtil.memAddress0(staging)),
+                    ) as Unit
+                }
+            } catch (error: Throwable) {
+                dev.birb.wgpu.WgpuMcMod.LOGGER.error("wgpu: a mapped write on {} failed to upload", label, error)
+            }
+        })
+    }
 
     override fun isClosed(): Boolean = closed.get()
 

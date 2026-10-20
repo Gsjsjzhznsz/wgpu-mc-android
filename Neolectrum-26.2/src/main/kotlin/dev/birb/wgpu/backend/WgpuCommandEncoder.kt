@@ -118,7 +118,7 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
     override fun createRenderPass(descriptor: RenderPassDescriptor): RenderPassBackend {
         val color = descriptor.colorAttachments.firstOrNull()
             ?: throw IllegalArgumentException(
-                "wgpu: the pass '${descriptor.label.get()}' names no colour attachment, which the " +
+                "wgpu: the pass '${descriptor.label().get()}' names no colour attachment, which the " +
                     "native pass ABI has no answer for")
         if (descriptor.colorAttachments.size > 1) {
             throw UnsupportedOperationException(
