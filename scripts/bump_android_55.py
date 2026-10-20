@@ -82,7 +82,12 @@ def main() -> int:
     promos["26.2-latest"] = NEW_2620
     promos["1.20.1-latest"] = NEW_1201
 
+    # Every section the promos name gets its changelog entry - the packaging test holds each
+    # promo's version to a changelog under that promo's own Minecraft version, and the 26.1 line
+    # answers for three sections (26.1, 26.1.1, 26.1.2), not one.
     updates["26.1.2"][NEW_2612] = NOTES_2612
+    updates["26.1.1"][NEW_2612] = NOTES_2612
+    updates["26.1"][NEW_2612] = NOTES_2612
     updates["26.2"][NEW_2620] = NOTES_2620
     updates["1.20.1"] = OrderedDict([(NEW_1201, NOTES_1201)])
 
