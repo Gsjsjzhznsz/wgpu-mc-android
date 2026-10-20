@@ -1124,12 +1124,23 @@ internal class NativeImageUpload private constructor(
  *
  * `allocateCpu` is a plain direct buffer: it is CPU memory the game fills and hands to a follow-up
  * call, and no GPU resource is needed for it.
- */
-object WgpuTransientMemory : TransientMemory {
+ */object WgpuTransientMemory : TransientMemory {
 
     /**
-     * Every staging/gpu slice this object has handed out and not yet seen submitted, keyed by
-     * (buffer identity, offset, length) - the record is final, so the triple is the identity.
+     * The transient allocator 26.2 asks the backend for, driven by the animated-sprite path and
+     * the resource loads.
+     *
+     * The honest shape is "a fresh buffer per allocation", which is correct and heavy for the
+     * per-frame callers it serves; the shape implemented here is the CPU-backed shadow: every
+     * upload keeps its bytes on this side keyed by the slice it named, so the `copyBufferToTexture`
+     * the animated atlas runs next finds its source without a GPU round trip - the GPU copy folds
+     * into the upload itself, which is what the game's own GL `GlTransientMemory.Fallback` does
+     * too. The shadow lives until the next [WgpuCommandEncoder.submit]; a staging slice is
+     * scratch, and the allocator is free to hand the same slot out again.
+     *
+     * The abstract signatures carry a `usage` int between the alignment and the frame keys, and
+     * the frame keys are what the game hands back on the next call of the same frame - ignored
+     * here, because every slice carries its own bytes.
      */
     private val shadows = java.util.concurrent.ConcurrentHashMap<ShadowKey, ByteBuffer>()
 
@@ -1155,7 +1166,7 @@ object WgpuTransientMemory : TransientMemory {
 
     private fun uploadToGpu(bytes: ByteBuffer, tag: String): GpuBufferSlice? {
         val device = gpu() ?: return null
-        val buffer = device.createBuffer({ tag }, GpuBuffer.COPY_SRC or GpuBuffer.COPY_DST, bytes.remaining().toLong())
+        val buffer = device.createBuffer({ tag }, GpuBuffer.USAGE_COPY_SRC or GpuBuffer.USAGE_COPY_DST, bytes.remaining().toLong())
         val slice = GpuBufferSlice(buffer, 0L, bytes.remaining().toLong())
         device.commandEncoder().writeToBuffer(slice, bytes)
         return remember(slice, bytes)
@@ -1168,8 +1179,8 @@ object WgpuTransientMemory : TransientMemory {
         return ByteBuffer.allocateDirect(size.toInt())
     }
 
-    private fun uploadMapped(size: Long, alignment: Long, tag: String): GpuBufferSlice.MappedView {
-        val bytes = allocateCpu(size, alignment, 0, 0)
+    private fun uploadMapped(size: Long, usage: Int, tag: String): GpuBufferSlice.MappedView {
+        val bytes = allocateCpu(size, 16, 0, 0)
         val slice = uploadToGpu(bytes, tag)
         // The mapped view writes into the shadow and re-uploads on close, which is the same
         // dance `mapBuffer` has always performed for a mapped write. Without a device yet the
@@ -1182,16 +1193,16 @@ object WgpuTransientMemory : TransientMemory {
         })
     }
 
-    override fun allocateStaging(size: Long, alignment: Long, key1: Long, key2: Long): GpuBufferSlice.MappedView =
-        uploadMapped(size, alignment, "wgpu-mc transient staging")
+    override fun allocateStaging(size: Long, alignment: Long, usage: Int, key1: Long, key2: Long): GpuBufferSlice.MappedView =
+        uploadMapped(size, usage, "wgpu-mc transient staging")
 
-    override fun allocateGpuMapped(size: Long, alignment: Long, key1: Long, key2: Long): GpuBufferSlice.MappedView =
-        uploadMapped(size, alignment, "wgpu-mc transient gpu")
+    override fun allocateGpuMapped(size: Long, alignment: Long, usage: Int, key1: Long, key2: Long): GpuBufferSlice.MappedView =
+        uploadMapped(size, usage, "wgpu-mc transient gpu")
 
-    override fun uploadStaging(source: ByteBuffer, alignment: Long, key1: Long, key2: Long): GpuBufferSlice =
+    override fun uploadStaging(source: ByteBuffer, alignment: Long, usage: Int, key1: Long, key2: Long): GpuBufferSlice =
         upload(source, "wgpu-mc transient staging")
 
-    override fun uploadGpu(source: ByteBuffer, alignment: Long, key1: Long, key2: Long): GpuBufferSlice =
+    override fun uploadGpu(source: ByteBuffer, alignment: Long, usage: Int, key1: Long, key2: Long): GpuBufferSlice =
         upload(source, "wgpu-mc transient gpu")
 
     private fun upload(source: ByteBuffer, tag: String): GpuBufferSlice {
@@ -1205,7 +1216,7 @@ object WgpuTransientMemory : TransientMemory {
      * The stand-in for "no device yet", which the game never has a reason to draw from: reads of
      * it answer zeros, and the copy paths refuse it loudly enough to be found.
      */
-    private val NULL_BUFFER: GpuBuffer = object : GpuBuffer(GpuBuffer.COPY_DST, 0L) {
+    private val NULL_BUFFER: GpuBuffer = object : GpuBuffer(GpuBuffer.USAGE_COPY_DST, 0L) {
         override fun close() = Unit
         override fun map(offset: Long, length: Long, read: Boolean, write: Boolean): GpuBufferSlice.MappedView =
             GpuBufferSlice.MappedView(
@@ -1215,10 +1226,10 @@ object WgpuTransientMemory : TransientMemory {
             )
     }
 
-    override fun uploadStaging(sources: MutableList<ByteBuffer>, alignment: Long, key1: Long, key2: Long): GpuBufferSlice =
+    override fun uploadStaging(sources: MutableList<ByteBuffer>, alignment: Long, usage: Int, key1: Long, key2: Long): GpuBufferSlice =
         uploadAll(sources, "wgpu-mc transient staging")
 
-    override fun uploadGpu(sources: MutableList<ByteBuffer>, alignment: Long, key1: Long, key2: Long): GpuBufferSlice =
+    override fun uploadGpu(sources: MutableList<ByteBuffer>, alignment: Long, usage: Int, key1: Long, key2: Long): GpuBufferSlice =
         uploadAll(sources, "wgpu-mc transient gpu")
 
     private fun uploadAll(sources: MutableList<ByteBuffer>, tag: String): GpuBufferSlice {
@@ -1229,9 +1240,9 @@ object WgpuTransientMemory : TransientMemory {
         return uploadToGpu(bytes, tag) ?: GpuBufferSlice(NULL_BUFFER, 0L, bytes.remaining().toLong())
     }
 
-    override fun multiUploadStaging(sources: MutableList<ByteBuffer>, alignment: Long, key: Long): MutableList<GpuBufferSlice> =
+    override fun multiUploadStaging(sources: MutableList<ByteBuffer>, alignment: Long, usage: Int): MutableList<GpuBufferSlice> =
         sources.mapTo(arrayListOf()) { upload(it, "wgpu-mc transient staging") }
 
-    override fun multiUploadGpu(sources: MutableList<ByteBuffer>, alignment: Long, key: Long): MutableList<GpuBufferSlice> =
+    override fun multiUploadGpu(sources: MutableList<ByteBuffer>, alignment: Long, usage: Int): MutableList<GpuBufferSlice> =
         sources.mapTo(arrayListOf()) { upload(it, "wgpu-mc transient gpu") }
 }
