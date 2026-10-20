@@ -91,20 +91,68 @@ tasks.processResources {
         }
 }
 
-// **The natives, from the build that already packaged them** - the same handoff the 26.1 module
-// describes: the NeoForge build's `copyNatives` lays the libraries out in
-// `../Neolectrum-26.2/build/generated/natives`, and this module ships the same files the same way.
+// **The natives, from whichever build packaged them first.** The normal handoff is the NeoForge
+// build's `copyNatives` output in `../Neolectrum-26.2/build/generated/natives` - the same files
+// both loaders ship. On a build where that step did not run (CI marks the NeoForge 26.2 build
+// non-blocking while NeoForm 26.2-2 is broken upstream - see the workflow's note), this module
+// lays the same libraries out itself, straight from the engine checkout the NeoForge build would
+// have read, so the line's Fabric jar carries natives regardless of the NeoForge build's health.
 val packagedNatives = rootProject.file("../Neolectrum-26.2/build/generated/natives")
-if (packagedNatives.isDirectory) {
-        sourceSets.main {
-                resources.srcDir(packagedNatives)
+val engineTarget = rootProject.file("../wgpu-mc-neo/rust/target")
+
+val copyNativesFromEngine = tasks.register<Copy>("copyNativesFromEngine") {
+        description = "Lays the engine's native libraries out as a jar carries them."
+        onlyIf {
+            val host = File(engineTarget, "release/${System.mapLibraryName("wgpu_mc_jni")}")
+            val android = File(engineTarget, "aarch64-linux-android/release/libwgpu_mc_jni.so")
+            val apple = File(engineTarget, "aarch64-apple-ios/release/libwgpu_mc_jni.dylib")
+            val found = listOf(host, android, apple).any { it.isFile }
+            if (!found) {
+                logger.warn(
+                    "wgpu-mc: no engine libraries under {} - this Fabric jar carries no natives",
+                    engineTarget.path,
+                )
+            }
+            found
         }
-} else {
-        logger.warn(
-                "wgpu-mc: {} does not exist yet, so this Fabric jar carries no natives - build the " +
-                        "NeoForge jar first (its copyNatives packages what both loaders ship)",
-                packagedNatives.path,
-        )
+        into(layout.buildDirectory.dir("generated/natives-fabric-only"))
+        from(engineTarget) {
+            include("release/${System.mapLibraryName("wgpu_mc_jni")}")
+            include("aarch64-linux-android/release/libwgpu_mc_jni.so")
+            include("x86_64-linux-android/release/libwgpu_mc_jni.so")
+            include("aarch64-apple-ios/release/libwgpu_mc_jni.dylib")
+            include("aarch64-apple-darwin/release/libwgpu_mc_jni.dylib")
+            eachFile {
+                // `assets/wgpu_mc/natives/<abi>/<file>` for the cross-compiles, and the host
+                // platform's library flat under `assets/wgpu_mc/natives/` - the same layout the
+                // NeoForge build's copyNatives produces.
+                val segments = relativePath.segments
+                val dir = when (segments.first()) {
+                    "release" -> null
+                    "aarch64-linux-android" -> "android-arm64-v8a"
+                    "x86_64-linux-android" -> "android-x86_64"
+                    "i686-linux-android" -> "android-x86"
+                    "aarch64-apple-ios" -> "ios-arm64"
+                    "aarch64-apple-darwin" -> "macos-arm64"
+                    else -> segments.first()
+                }
+                relativePath = if (dir == null) {
+                    RelativePath(false, "assets", "wgpu_mc", "natives", segments.last())
+                } else {
+                    RelativePath(true, "assets", "wgpu_mc", "natives", dir, segments.last())
+                }
+            }
+        }
+        includeEmptyDirs = false
+}
+
+sourceSets.main {
+        if (packagedNatives.isDirectory) {
+                resources.srcDir(packagedNatives)
+        } else {
+                resources.srcDir(copyNativesFromEngine.map { it.destinationDir })
+                tasks.named("processResources") { dependsOn(copyNativesFromEngine) }
+        }
 }
 
 dependencies {
