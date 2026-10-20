@@ -257,9 +257,9 @@ class OptionPageScreen(private val parent: Screen) :
         // first, so the maximum is taken rather than assumed to be the first or the last.
         // 26.2 renamed the monitor's mode accessors (modeCount()/mode(i)) and the current mode
         // reader with them.
-        var widest = monitor.currentMode().width()
+        var widest = monitor.currentMode().width
         for (index in 0 until monitor.modeCount()) {
-            widest = maxOf(widest, monitor.mode(index).width())
+            widest = maxOf(widest, monitor.mode(index).width)
         }
 
         val limit = floor(widest * WIDTH_SHARE_OF_MONITOR).toInt()

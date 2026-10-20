@@ -40,10 +40,11 @@ object WgpuFormat {
      * @throws IllegalArgumentException for a format the Rust discriminants have no answer for,
      *   which the exhaustive `when` of the 26.1 shape used to make a compile error.
      */
-    fun nativeVertexId(element: VertexFormatElement): Long = nativeId(element.format())
+    fun nativeVertexId(element: VertexFormatElement): Long = nativeVertexFormatId(element.format())
 
-    /** The vertex-element formats, and their native discriminants. */
-    fun nativeId(elementFormat: GpuFormat): Long = when (elementFormat) {
+    /** The vertex-element formats, and their native discriminants - a distinct map from the
+     *  texture formats', because the two answer different questions about the same enum. */
+    fun nativeVertexFormatId(elementFormat: GpuFormat): Long = when (elementFormat) {
         GpuFormat.R32_FLOAT -> WmNative.R32_FLOAT
         GpuFormat.RG32_FLOAT -> WmNative.RG32_FLOAT
         GpuFormat.RGB32_FLOAT -> WmNative.RGB32_FLOAT

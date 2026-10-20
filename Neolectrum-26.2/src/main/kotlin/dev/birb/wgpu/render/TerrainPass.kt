@@ -225,7 +225,7 @@ object TerrainPass {
 
                 // The camera state of the frame being drawn, which `GameRenderer.renderLevel` filled in before
                 // it called into the level renderer this pass belongs to.
-                val cameraState = client.gameRenderer.gameRenderState.levelRenderState.cameraRenderState
+                val cameraState = client.gameRenderer.gameRenderState().levelRenderState.cameraRenderState
 
                 val bob = levelBob(cameraState, client)
 
@@ -751,7 +751,7 @@ object TerrainPass {
         private fun describeCamera(): String {
                 val client = Minecraft.getInstance()
                 val live = client.gameRenderer.mainCamera().position()
-                val state = client.gameRenderer.gameRenderState.levelRenderState.cameraRenderState.pos
+                val state = client.gameRenderer.gameRenderState().levelRenderState.cameraRenderState.pos
 
                 // `position()` answers a vector rather than a nullable, so the `?: "none"` that used to be here was
                 // unreachable and Kotlin said so every build. "none" is not a state this camera has.
