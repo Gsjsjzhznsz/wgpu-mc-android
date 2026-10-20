@@ -390,7 +390,7 @@ class WgpuCompiledRenderPipeline private constructor(
             val descriptor = arena.allocate(WmNative.RENDER_PIPELINE)
 
             val bindGroupLayouts = bindGroupLayouts(arena, pipeline)
-            val vertexFormats = vertexFormats(arena, pipeline.vertexFormat)
+            val vertexFormats = vertexFormats(arena, pipeline.getVertexFormatBindings().firstOrNull())
             val colorTargets = colorTargets(arena, pipeline)
             val depthState = if (wantsDepth) depthStencilState(arena, pipeline) else MemorySegment.NULL
 
@@ -495,7 +495,10 @@ class WgpuCompiledRenderPipeline private constructor(
          * the colour channels or none of them.
          */
         private fun colorTargets(arena: Arena, pipeline: RenderPipeline): MemorySegment {
-            val target = pipeline.colorTargetState
+            val target = pipeline.getColorTargetState()
+                ?: throw IllegalArgumentException(
+                    "wgpu-mc: the pipeline ${pipeline.location} names no colour target, which the " +
+                        "native state ABI has no answer for")
             val state = arena.allocate(WmNative.COLOR_TARGET_STATE)
 
             state.set(WmNative.LONG, WmNative.COLOR_TARGET_FORMAT, MAIN_TARGET_FORMAT)
@@ -519,10 +522,12 @@ class WgpuCompiledRenderPipeline private constructor(
             val blend = target.blendFunction().orElse(null) ?: return MemorySegment.NULL
 
             val state = arena.allocate(WmNative.BLEND_STATE)
-            state.set(WmNative.LONG, WmNative.BLEND_STATE_SRC_COLOR, sourceFactor(blend.sourceColor()))
-            state.set(WmNative.LONG, WmNative.BLEND_STATE_DST_COLOR, destFactor(blend.destColor()))
-            state.set(WmNative.LONG, WmNative.BLEND_STATE_SRC_ALPHA, sourceFactor(blend.sourceAlpha()))
-            state.set(WmNative.LONG, WmNative.BLEND_STATE_DST_ALPHA, destFactor(blend.destAlpha()))
+            // 26.2 folds the four factors into two equations, colour and alpha, each carrying
+            // its own source and destination.
+            state.set(WmNative.LONG, WmNative.BLEND_STATE_SRC_COLOR, sourceFactor(blend.color().sourceFactor()))
+            state.set(WmNative.LONG, WmNative.BLEND_STATE_DST_COLOR, destFactor(blend.color().destFactor()))
+            state.set(WmNative.LONG, WmNative.BLEND_STATE_SRC_ALPHA, sourceFactor(blend.alpha().sourceFactor()))
+            state.set(WmNative.LONG, WmNative.BLEND_STATE_DST_ALPHA, destFactor(blend.alpha().destFactor()))
             return state
         }
 
