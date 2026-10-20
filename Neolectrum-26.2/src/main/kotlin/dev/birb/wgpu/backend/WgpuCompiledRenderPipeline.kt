@@ -4,8 +4,6 @@ import com.mojang.blaze3d.pipeline.ColorTargetState
 import com.mojang.blaze3d.pipeline.CompiledRenderPipeline
 import com.mojang.blaze3d.pipeline.RenderPipeline
 import com.mojang.blaze3d.platform.CompareOp
-import com.mojang.blaze3d.platform.DestFactor
-import com.mojang.blaze3d.platform.SourceFactor
 import com.mojang.blaze3d.shaders.ShaderSource
 import com.mojang.blaze3d.shaders.ShaderType
 import com.mojang.blaze3d.shaders.UniformType
@@ -280,9 +278,12 @@ class WgpuCompiledRenderPipeline private constructor(
                     .joinToString(","),
                 depth?.let { "${it.depthTest()} write=${it.writeDepth()} bias=${it.depthBiasConstant()}/${it.depthBiasScaleFactor()}" }
                     ?: "none",
-                blend?.let { "${it.sourceColor()}/${it.destColor()} a ${it.sourceAlpha()}/${it.destAlpha()}" }
+                blend?.let {
+                    "${it.color().sourceFactor()}/${it.color().destFactor()} a " +
+                        "${it.alpha().sourceFactor()}/${it.alpha().destFactor()}"
+                }
                     ?: "none",
-                String.format("0x%x", target.writeMask()),
+                String.format("0x%x", target?.writeMask() ?: 0),
                 pipeline.isCull(),
             )
         }
@@ -524,171 +525,35 @@ class WgpuCompiledRenderPipeline private constructor(
             val state = arena.allocate(WmNative.BLEND_STATE)
             // 26.2 folds the four factors into two equations, colour and alpha, each carrying
             // its own source and destination.
-            state.set(WmNative.LONG, WmNative.BLEND_STATE_SRC_COLOR, sourceFactor(blend.color().sourceFactor()))
-            state.set(WmNative.LONG, WmNative.BLEND_STATE_DST_COLOR, destFactor(blend.color().destFactor()))
-            state.set(WmNative.LONG, WmNative.BLEND_STATE_SRC_ALPHA, sourceFactor(blend.alpha().sourceFactor()))
-            state.set(WmNative.LONG, WmNative.BLEND_STATE_DST_ALPHA, destFactor(blend.alpha().destFactor()))
+            state.set(WmNative.LONG, WmNative.BLEND_STATE_SRC_COLOR, blendFactor(blend.color().sourceFactor()))
+            state.set(WmNative.LONG, WmNative.BLEND_STATE_DST_COLOR, blendFactor(blend.color().destFactor()))
+            state.set(WmNative.LONG, WmNative.BLEND_STATE_SRC_ALPHA, blendFactor(blend.alpha().sourceFactor()))
+            state.set(WmNative.LONG, WmNative.BLEND_STATE_DST_ALPHA, blendFactor(blend.alpha().destFactor()))
             return state
         }
 
-        private fun sourceFactor(factor: SourceFactor): Long = when (factor) {
-            SourceFactor.ZERO -> WmNative.BLEND_ZERO
-            SourceFactor.ONE -> WmNative.BLEND_ONE
-            SourceFactor.SRC_COLOR -> WmNative.BLEND_SRC_COLOR
-            SourceFactor.ONE_MINUS_SRC_COLOR -> WmNative.BLEND_ONE_MINUS_SRC_COLOR
-            SourceFactor.DST_COLOR -> WmNative.BLEND_DST_COLOR
-            SourceFactor.ONE_MINUS_DST_COLOR -> WmNative.BLEND_ONE_MINUS_DST_COLOR
-            SourceFactor.SRC_ALPHA -> WmNative.BLEND_SRC_ALPHA
-            SourceFactor.ONE_MINUS_SRC_ALPHA -> WmNative.BLEND_ONE_MINUS_SRC_ALPHA
-            SourceFactor.DST_ALPHA -> WmNative.BLEND_DST_ALPHA
-            SourceFactor.ONE_MINUS_DST_ALPHA -> WmNative.BLEND_ONE_MINUS_DST_ALPHA
-            SourceFactor.SRC_ALPHA_SATURATE -> WmNative.BLEND_SRC_ALPHA_SATURATE
+        // 26.2 folds the source and destination factor enums into one `BlendFactor`; the native
+        // discriminants are the same table either way.
+        private fun blendFactor(factor: com.mojang.blaze3d.platform.BlendFactor): Long = when (factor) {
+            com.mojang.blaze3d.platform.BlendFactor.ZERO -> WmNative.BLEND_ZERO
+            com.mojang.blaze3d.platform.BlendFactor.ONE -> WmNative.BLEND_ONE
+            com.mojang.blaze3d.platform.BlendFactor.SRC_COLOR -> WmNative.BLEND_SRC_COLOR
+            com.mojang.blaze3d.platform.BlendFactor.ONE_MINUS_SRC_COLOR -> WmNative.BLEND_ONE_MINUS_SRC_COLOR
+            com.mojang.blaze3d.platform.BlendFactor.DST_COLOR -> WmNative.BLEND_DST_COLOR
+            com.mojang.blaze3d.platform.BlendFactor.ONE_MINUS_DST_COLOR -> WmNative.BLEND_ONE_MINUS_DST_COLOR
+            com.mojang.blaze3d.platform.BlendFactor.SRC_ALPHA -> WmNative.BLEND_SRC_ALPHA
+            com.mojang.blaze3d.platform.BlendFactor.ONE_MINUS_SRC_ALPHA -> WmNative.BLEND_ONE_MINUS_SRC_ALPHA
+            com.mojang.blaze3d.platform.BlendFactor.DST_ALPHA -> WmNative.BLEND_DST_ALPHA
+            com.mojang.blaze3d.platform.BlendFactor.ONE_MINUS_DST_ALPHA -> WmNative.BLEND_ONE_MINUS_DST_ALPHA
+            com.mojang.blaze3d.platform.BlendFactor.SRC_ALPHA_SATURATE -> WmNative.BLEND_SRC_ALPHA_SATURATE
             // wgpu carries a single constant blend colour where GL has separate colour and alpha
             // ones, so the two collapse onto the same factor. No Minecraft pipeline asks for either.
-            SourceFactor.CONSTANT_ALPHA, SourceFactor.CONSTANT_COLOR -> WmNative.BLEND_CONSTANT
-            SourceFactor.ONE_MINUS_CONSTANT_ALPHA, SourceFactor.ONE_MINUS_CONSTANT_COLOR ->
-                WmNative.BLEND_ONE_MINUS_CONSTANT
-        }
-
-        private fun destFactor(factor: DestFactor): Long = when (factor) {
-            DestFactor.ZERO -> WmNative.BLEND_ZERO
-            DestFactor.ONE -> WmNative.BLEND_ONE
-            DestFactor.SRC_COLOR -> WmNative.BLEND_SRC_COLOR
-            DestFactor.ONE_MINUS_SRC_COLOR -> WmNative.BLEND_ONE_MINUS_SRC_COLOR
-            DestFactor.DST_COLOR -> WmNative.BLEND_DST_COLOR
-            DestFactor.ONE_MINUS_DST_COLOR -> WmNative.BLEND_ONE_MINUS_DST_COLOR
-            DestFactor.SRC_ALPHA -> WmNative.BLEND_SRC_ALPHA
-            DestFactor.ONE_MINUS_SRC_ALPHA -> WmNative.BLEND_ONE_MINUS_SRC_ALPHA
-            DestFactor.DST_ALPHA -> WmNative.BLEND_DST_ALPHA
-            DestFactor.ONE_MINUS_DST_ALPHA -> WmNative.BLEND_ONE_MINUS_DST_ALPHA
-            DestFactor.CONSTANT_ALPHA, DestFactor.CONSTANT_COLOR -> WmNative.BLEND_CONSTANT
-            DestFactor.ONE_MINUS_CONSTANT_ALPHA, DestFactor.ONE_MINUS_CONSTANT_COLOR ->
-                WmNative.BLEND_ONE_MINUS_CONSTANT
-        }
-
-        /** `RawArray_VertexFormat` holding the pipeline's single vertex format. */
-        private fun vertexFormats(arena: Arena, format: VertexFormat?): MemorySegment {
-            val array = arena.allocate(WmNative.RAW_ARRAY)
-            if (format == null) {
-                WmNative.writeRawArray(array, 0L, MemorySegment.NULL, 0L)
-                return array
-            }
-
-            val elements = format.elements
-            val nativeElements = arena.allocate(WmNative.VERTEX_FORMAT_ELEMENT, elements.size.toLong())
-
-            for ((index, element) in elements.withIndex()) {
-                val base = WmNative.elementOffset(WmNative.VERTEX_FORMAT_ELEMENT, index)
-                nativeElements.set(
-                    WmNative.LONG,
-                    base + WmNative.VERTEX_FORMAT_ELEMENT_OFFSET,
-                    format.getOffset(element).toLong(),
-                )
-                nativeElements.set(
-                    WmNative.LONG,
-                    base + WmNative.VERTEX_FORMAT_ELEMENT_FORMAT,
-                    WgpuFormat.nativeId(element),
-                )
-                nativeElements.set(
-                    WmNative.ADDRESS,
-                    base + WmNative.VERTEX_FORMAT_ELEMENT_NAME,
-                    NativeNames.utf8(element.name()),
-                )
-            }
-
-            val elementArray = arena.allocate(WmNative.RAW_ARRAY)
-            WmNative.writeRawArray(elementArray, 0L, nativeElements, elements.size.toLong())
-
-            val nativeFormat = arena.allocate(WmNative.VERTEX_FORMAT)
-            nativeFormat.set(WmNative.ADDRESS, WmNative.VERTEX_FORMAT_ELEMENTS, elementArray)
-            nativeFormat.set(WmNative.LONG, WmNative.VERTEX_FORMAT_VERTEX_SIZE, format.vertexSize.toLong())
-
-            WmNative.writeRawArray(array, 0L, nativeFormat, 1L)
-            return array
-        }
-
-        /**
-         * 26.1 flattens a pipeline's bindings into `samplers` and `uniforms`; Rust wants a single
-         * entry array per bind group with uniforms first, which is the order the shader binding
-         * indices assume.
-         */
-        /**
-         * The `WM_CHUNK_PAD` directive: how many `vec4`s of padding a per-draw section block needs.
-         *
-         * The game writes one `DynamicUniforms.ChunkSectionInfo` per section into a uniform ring whose
-         * stride is `Mth.roundToward(CHUNK_SECTION_UBO_SIZE, device.getUniformOffsetAlignment())` - the
-         * same arithmetic `DynamicUniformStorage` does, and the same ring the slices Minecraft binds per
-         * draw come out of. A shader that reads its own record out of that ring at the number the draw
-         * carries has to declare a struct whose *array stride* is that stride, or record `i` would be
-         * read from `i * sizeof(struct)`; this is the difference, in `vec4`s.
-         *
-         * **It is computed here rather than in Rust because both numbers are on this side**: the block's
-         * size is Minecraft's own constant and the alignment belongs to the device the pipeline is being
-         * compiled for. It travels as a directive, and directives are part of the shader cache key - so
-         * a cached translation can never come back carrying another device's stride.
-         */
-        private fun perDrawPad(device: WgpuDevice): String {
-            val alignment = device.getUniformOffsetAlignment()
-            val block = Mth.roundToward(DynamicUniforms.CHUNK_SECTION_UBO_SIZE, alignment)
-            val pad = (block - DynamicUniforms.CHUNK_SECTION_UBO_SIZE) / 16
-
-            return "\n#define WM_CHUNK_PAD $pad\n"
-        }
-
-        private fun bindGroupLayouts(arena: Arena, pipeline: RenderPipeline): MemorySegment {
-            // 26.2 moved the uniform and sampler lists into the pipeline's bind group layouts;
-            // the flattened views are the same lists one level up, which is what the native ABI
-            // wants.
-            val uniforms = com.mojang.blaze3d.pipeline.BindGroupLayout.flattenUniforms(pipeline.getBindGroupLayouts())
-            val samplers = com.mojang.blaze3d.pipeline.BindGroupLayout.flattenSamplers(pipeline.getBindGroupLayouts())
-            val entryCount = uniforms.size + samplers.size
-            val entries = arena.allocate(WmNative.BIND_GROUP_ENTRY, entryCount.toLong())
-
-            fun writeEntry(index: Int, kind: Long, name: String, format: Long) {
-                val base = WmNative.elementOffset(WmNative.BIND_GROUP_ENTRY, index)
-                entries.set(WmNative.LONG, base + WmNative.BIND_GROUP_ENTRY_TYPE, kind)
-                entries.set(WmNative.ADDRESS, base + WmNative.BIND_GROUP_ENTRY_NAME, NativeNames.utf8(name))
-                entries.set(WmNative.LONG, base + WmNative.BIND_GROUP_ENTRY_FORMAT, format)
-            }
-
-            for ((index, uniform) in uniforms.withIndex()) {
-                writeEntry(
-                    index,
-                    when {
-                        uniform.type() == UniformType.TEXEL_BUFFER -> WmNative.ENTRY_TEXEL_BUFFER
-                        uniform.name() in perDrawStorageNames(pipeline) -> WmNative.ENTRY_STORAGE_BUFFER
-                        else -> WmNative.ENTRY_UNIFORM_BUFFER
-                    },
-                    uniform.name(),
-                    uniform.gpuFormat()?.let { WgpuFormat.nativeId(it) } ?: WmNative.NONE,
-                )
-            }
-
-            for ((index, sampler) in samplers.withIndex()) {
-                writeEntry(uniforms.size + index, WmNative.ENTRY_SAMPLER, sampler, WmNative.NONE)
-            }
-
-            val entryArray = arena.allocate(WmNative.RAW_ARRAY)
-            WmNative.writeRawArray(entryArray, 0L, entries, entryCount.toLong())
-
-            // struct BlazeBindGroupLayout { RawArray_BindGroupEntryDescriptor *entries; }
-            val layout = arena.allocate(WmNative.BIND_GROUP_LAYOUT)
-            layout.set(WmNative.ADDRESS, 0L, entryArray)
-
-            val layouts = arena.allocate(WmNative.RAW_ARRAY)
-            WmNative.writeRawArray(layouts, 0L, layout, 1L)
-            return layouts
-        }
-
-        private fun com.mojang.blaze3d.PrimitiveTopology.toNativeTopology(): Long = when (this) {
-            com.mojang.blaze3d.PrimitiveTopology.LINES -> WmNative.TOPOLOGY_LINES
-            com.mojang.blaze3d.PrimitiveTopology.DEBUG_LINES -> WmNative.TOPOLOGY_LINES
-            com.mojang.blaze3d.PrimitiveTopology.DEBUG_LINE_STRIP -> WmNative.TOPOLOGY_DEBUG_LINE_STRIP
-            com.mojang.blaze3d.PrimitiveTopology.POINTS -> WmNative.TOPOLOGY_POINTS
-            com.mojang.blaze3d.PrimitiveTopology.TRIANGLES -> WmNative.TOPOLOGY_TRIANGLES
-            com.mojang.blaze3d.PrimitiveTopology.TRIANGLE_STRIP -> WmNative.TOPOLOGY_TRIANGLE_STRIP
-            com.mojang.blaze3d.PrimitiveTopology.TRIANGLE_FAN -> WmNative.TOPOLOGY_TRIANGLE_FAN
-            com.mojang.blaze3d.PrimitiveTopology.QUADS -> WmNative.TOPOLOGY_QUADS
+            com.mojang.blaze3d.platform.BlendFactor.CONSTANT_ALPHA,
+            com.mojang.blaze3d.platform.BlendFactor.CONSTANT_COLOR,
+            -> WmNative.BLEND_CONSTANT
+            com.mojang.blaze3d.platform.BlendFactor.ONE_MINUS_CONSTANT_ALPHA,
+            com.mojang.blaze3d.platform.BlendFactor.ONE_MINUS_CONSTANT_COLOR,
+            -> WmNative.BLEND_ONE_MINUS_CONSTANT
         }
 
         /** Main render targets are always RGBA8 in 26.1. */
