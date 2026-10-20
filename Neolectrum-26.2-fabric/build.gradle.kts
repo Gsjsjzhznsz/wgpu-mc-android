@@ -66,9 +66,15 @@ sourceSets.main {
                 "dev/birb/wgpu/render/TintProfile.kt",
                 "dev/birb/wgpu/render/Wgpu.kt",
                 "dev/birb/wgpu/BlockCache.kt",
-                // The 26.2 overlay's NeoForge-flavoured copy of the same file - this module's own
-                // `BlockCacheFabric.kt` under `src/main` here is the 26.2 answer on this loader.
-                "dev/birb/wgpu/BlockCache.kt",
+                // The 26.2 answers this module carries its own copies of (under `src/main` here,
+                // the same FQN): the exclude kills both trees' copies - the 26.1 original and the
+                // 26.2 overlay - and the module's own file is the one that compiles. The same
+                // move the loader seams above make, one Minecraft line up.
+                "dev/birb/wgpu/backend/WgpuCommandEncoder.kt",
+                "dev/birb/wgpu/backend/WgpuFormat.kt",
+                "dev/birb/wgpu/chunk/RustChunkBake.kt",
+                "dev/birb/wgpu/render/TerrainPass.kt",
+                "dev/birb/wgpu/gui/OptionPageScreen.kt",
         )
         resources.exclude(
                 "**/META-INF/neoforge.mods.toml",

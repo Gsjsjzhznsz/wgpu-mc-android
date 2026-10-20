@@ -46,7 +46,9 @@ accessible	field	net/minecraft/world/level/lighting/LevelLightEngine	skyEngine	L
 accessible	method	net/minecraft/client/MouseHandler	onMove	(JDD)V
 accessible	method	net/minecraft/client/MouseHandler	onButton	(JLnet/minecraft/client/input/MouseButtonInfo;I)V
 accessible	method	net/minecraft/client/MouseHandler	onScroll	(JDD)V
-accessible	method	net/minecraft/client/renderer/chunk/SectionRenderDispatcher$RenderSection	createCompileTask	(Lnet/minecraft/client/renderer/chunk/RenderRegionCache;)Lnet/minecraft/client/renderer/chunk/SectionRenderDispatcher$RenderSection$CompileTask;
+# 26.2 made createCompileTask private and changed its answer to the unified SectionTask;
+# the same widening, against the 26.2 shape.
+accessible	method	net/minecraft/client/renderer/chunk/SectionRenderDispatcher$RenderSection	createCompileTask	(Lnet/minecraft/client/renderer/chunk/RenderSectionRegion;)Lnet/minecraft/client/renderer/chunk/SectionRenderDispatcher$RenderSection$SectionTask;
 # 26.1 takes a CameraRenderState; still private.
 accessible	method	net/minecraft/client/renderer/GameRenderer	bobView	(Lnet/minecraft/client/renderer/state/level/CameraRenderState;Lcom/mojang/blaze3d/vertex/PoseStack;)V
 
