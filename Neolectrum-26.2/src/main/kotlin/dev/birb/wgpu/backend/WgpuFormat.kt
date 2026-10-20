@@ -40,7 +40,7 @@ object WgpuFormat {
      * @throws IllegalArgumentException for a format the Rust discriminants have no answer for,
      *   which the exhaustive `when` of the 26.1 shape used to make a compile error.
      */
-    fun nativeId(element: VertexFormatElement): Long = nativeId(element.format())
+    fun nativeVertexId(element: VertexFormatElement): Long = nativeId(element.format())
 
     /** The vertex-element formats, and their native discriminants. */
     fun nativeId(elementFormat: GpuFormat): Long = when (elementFormat) {

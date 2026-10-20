@@ -174,7 +174,7 @@ class WgpuSurface internal constructor(
             return
         }
 
-        val camera = client.gameRenderer.mainCamera
+        val camera = client.gameRenderer.mainCamera()
         val position = camera?.position() ?: client.player?.position() ?: return
 
         val sectionX = net.minecraft.core.SectionPos.blockToSectionCoord(position.x)

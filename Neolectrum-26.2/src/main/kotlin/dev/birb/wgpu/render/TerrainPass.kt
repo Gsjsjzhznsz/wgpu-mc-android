@@ -192,7 +192,7 @@ object TerrainPass {
          */
         fun sendCameraMatrices() {
                 val client = Minecraft.getInstance()
-                val camera = client.gameRenderer.mainCamera
+                val camera = client.gameRenderer.mainCamera()
 
                 // **The game's `textureFiltering` option, pushed before the frame that will use it.**
                 //
@@ -750,7 +750,7 @@ object TerrainPass {
          */
         private fun describeCamera(): String {
                 val client = Minecraft.getInstance()
-                val live = client.gameRenderer.mainCamera.position()
+                val live = client.gameRenderer.mainCamera().position()
                 val state = client.gameRenderer.gameRenderState.levelRenderState.cameraRenderState.pos
 
                 // `position()` answers a vector rather than a nullable, so the `?: "none"` that used to be here was

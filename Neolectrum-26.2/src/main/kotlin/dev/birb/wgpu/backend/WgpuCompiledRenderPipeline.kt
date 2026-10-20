@@ -573,12 +573,12 @@ class WgpuCompiledRenderPipeline private constructor(
                 nativeElements.set(
                     WmNative.LONG,
                     base + WmNative.VERTEX_FORMAT_ELEMENT_OFFSET,
-                    format.getOffset(element).toLong(),
+                    element.offset().toLong(),
                 )
                 nativeElements.set(
                     WmNative.LONG,
                     base + WmNative.VERTEX_FORMAT_ELEMENT_FORMAT,
-                    WgpuFormat.nativeId(element),
+                    WgpuFormat.nativeVertexId(element),
                 )
                 nativeElements.set(
                     WmNative.ADDRESS,

@@ -255,9 +255,11 @@ class OptionPageScreen(private val parent: Screen) :
         // its own maximum can still show the page at full size, and the caller clamps the result to
         // the window in GUI units anyway. GLFW lists a monitor's modes sorted, but by colour depth
         // first, so the maximum is taken rather than assumed to be the first or the last.
-        var widest = monitor.currentMode.width
-        for (index in 0 until monitor.modeCount) {
-            widest = maxOf(widest, monitor.getMode(index).width)
+        // 26.2 renamed the monitor's mode accessors (modeCount()/mode(i)) and the current mode
+        // reader with them.
+        var widest = monitor.currentMode().width()
+        for (index in 0 until monitor.modeCount()) {
+            widest = maxOf(widest, monitor.mode(index).width())
         }
 
         val limit = floor(widest * WIDTH_SHARE_OF_MONITOR).toInt()
