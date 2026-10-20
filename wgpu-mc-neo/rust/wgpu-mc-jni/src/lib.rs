@@ -70,6 +70,7 @@ mod timing;
 /// runtime rather than at compile time.
 #[cfg(test)]
 mod abi_tests;
+mod jni_abi;
 
 /// Task 14's regression: the Adreno `FrontFacing` + `Flat` device loss, its generated
 /// GLSL, and the SPIR-V shape the fix promises the driver.

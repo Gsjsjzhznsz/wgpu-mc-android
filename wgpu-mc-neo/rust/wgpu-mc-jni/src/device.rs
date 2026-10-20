@@ -5305,6 +5305,153 @@ const DUMP_SANITY_LIMIT: u32 = 1 << 16;
 /// frame, which is exactly the comparison these dumps exist for.
 ///
 /// Requires the texture to carry `COPY_SRC`.
+/// Reads a texture's level 0 back to the CPU, as tightly packed RGBA rows, optionally flipped.
+///
+/// The one readback the GL seam's `glGetTexImage` answer is built on: the game hands over a
+/// pointer it allocated and expects the pixels to be there afterwards, and a wgpu texture cannot
+/// be read on the CPU at all - so the copy happens on the GPU and comes back through a mapped
+/// buffer. `flip_y` writes the rows bottom-up, which is what a render target needs: this backend
+/// keeps Minecraft's OpenGL clip space, so a target's first row is at the bottom.
+///
+/// Answers `(width, height, pixels)`, or `None` when the texture is empty or beyond the sanity
+/// limit a dump would refuse for the same reasons.
+fn copy_texture_to_cpu(
+    wm: &WmRenderer,
+    texture: &wgpu::Texture,
+    flip_y: bool,
+) -> Option<(u32, u32, Vec<u8>)> {
+    let width = texture.width();
+    let height = texture.height();
+    let unpadded = width * 4;
+    let padded =
+        unpadded.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+
+    if width == 0 || height == 0 || width > DUMP_SANITY_LIMIT || height > DUMP_SANITY_LIMIT {
+        error!("wgpu-mc: refusing to read back a {width}x{height} texture");
+        return None;
+    }
+
+    let buffer = wm.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("<wm/mc readback>"),
+        size: (padded * height) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = wm
+        .gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: Default::default(),
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded),
+                rows_per_image: Some(height),
+            },
+        },
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    wm.gpu.queue.submit([encoder.finish()]);
+
+    let slice = buffer.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+
+    if wm
+        .gpu
+        .device
+        .poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })
+        .is_err()
+    {
+        error!("wgpu-mc: a readback could not be waited for");
+        return None;
+    }
+
+    match receiver.recv() {
+        Ok(Ok(())) => {}
+        _ => {
+            error!("wgpu-mc: a readback could not be mapped");
+            return None;
+        }
+    }
+
+    // The mapping is read here and not checked: the map callback above already said the mapping
+    // succeeded, and a `Result` that says otherwise is one this side has nowhere to put.
+    let data = slice.get_mapped_range().expect("the mapping reported done");
+    let mut out = Vec::with_capacity((unpadded * height) as usize);
+
+    for row in 0..height {
+        let source_row = if flip_y { height - 1 - row } else { row };
+        let start = (source_row * padded) as usize;
+        out.extend_from_slice(&data[start..start + unpadded as usize]);
+    }
+
+    drop(data);
+    buffer.unmap();
+
+    Some((width, height, out))
+}
+
+/// Reads a texture's level 0 into memory the caller owns, as tightly packed RGBA rows.
+///
+/// This is what `glGetTexImage` needs. The game hands over a pointer it allocated and expects the
+/// pixels to be there afterwards. `flip_y` means what it does in a dump: the game asks for a
+/// render target's rows bottom-up, and `NativeImage#flipY` turns them over afterwards.
+///
+/// Returns false, writing nothing, when the texture is empty or `capacity` is too small for it.
+/// The caller's buffer is then left exactly as it was, which is what GL does when it refuses.
+#[unsafe(no_mangle)]
+pub extern "C" fn read_texture_rgba(
+    wm: &WmRenderer,
+    texture: &wgpu::Texture,
+    out: *mut u8,
+    capacity: usize,
+    flip_y: bool,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+
+    let needed = (texture.width() as usize) * (texture.height() as usize) * 4;
+    if needed == 0 || needed > capacity {
+        error!(
+            "wgpu-mc: a readback of {}x{} needs {needed} byte(s) and the caller offered {capacity}",
+            texture.width(),
+            texture.height()
+        );
+        return false;
+    }
+
+    match copy_texture_to_cpu(wm, texture, flip_y) {
+        Some((_, _, pixels)) => {
+            // SAFETY: `out` is the game's own allocation, `capacity` is what it said it is, and the
+            // check above proved `pixels.len() == needed <= capacity`.
+            unsafe { std::ptr::copy_nonoverlapping(pixels.as_ptr(), out, pixels.len()) };
+            true
+        }
+        None => false,
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn dump_texture_rgba(
     wm: &WmRenderer,

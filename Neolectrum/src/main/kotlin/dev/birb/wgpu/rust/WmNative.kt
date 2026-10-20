@@ -504,6 +504,23 @@ object WmNative {
             FunctionDescriptor.of(ValueLayout.JAVA_BOOLEAN, PTR, PTR, PTR, ValueLayout.JAVA_BOOLEAN),
         )
 
+    // The read-into-a-caller's-buffer cousin of the dump above - the glGetTexImage answer the GL
+    // seam reads pixels through. The 26.x mod binds it and does not call it (its diagnostics dump
+    // to files); the 1.20.1 line reaches the same export over JNI, and the engine's C-ABI test
+    // wants every export bound on this side whichever bridge calls it.
+    @JvmField val readTextureRgba: MethodHandle =
+        handle(
+            "read_texture_rgba",
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_BOOLEAN,
+                PTR,
+                PTR,
+                PTR,
+                ValueLayout.JAVA_LONG,
+                ValueLayout.JAVA_BOOLEAN,
+            ),
+        )
+
     /** The same, for the swapchain image, of which the JVM side only has the `SurfaceTexture`. */
     @JvmField val dumpSurfaceTextureRgba: MethodHandle =
         handle(

@@ -39,6 +39,18 @@ mod tests {
             .to_string()
     }
 
+    /// The same lookup, answered with `None` where the property is absent - the shape a version
+    /// module that predates the question is read with (the 1.20.1 line has no NeoForge version to
+    /// stamp, so its gradle.properties does not carry that key at all).
+    fn property_opt(gradle: &str, name: &str) -> Option<String> {
+        let prefix = format!("{name}=");
+
+        gradle
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .map(|value| value.trim().to_string())
+    }
+
     fn parse_updates(updates: &str) -> Value {
         serde_json::from_str(updates)
             .expect("updates.json is valid JSON - NeoForge will not read it if it is not")
@@ -50,21 +62,27 @@ mod tests {
     /// and, when the hotfix slot is `0` (the line's first release, as `26.2.0.93` is for Minecraft
     /// `26.2`), without the hotfix too: the game reports itself as `26.2`, not `26.2.0`.
     fn minecraft_version(gradle: &str) -> String {
-        let neo = property(gradle, "neoforge_neo_version");
+        // The 26.x lines stamp a NeoForge version and derive the checker key from it. The 1.20.1
+        // line has no NeoForge to stamp - the loader there is Forge 47, because NeoForge forked
+        // from Forge at 1.20.2 - and names its Minecraft version directly, which is exactly the
+        // key the checker on that line asks for.
+        if let Some(neo) = property_opt(gradle, "neoforge_neo_version") {
+            let mut parts = neo.split('.').collect::<Vec<_>>();
 
-        let mut parts = neo.split('.').collect::<Vec<_>>();
+            assert!(
+                parts.len() == 4,
+                "the NeoForge version is four parts, `<minecraft>-<hotfix>.<release>`: {neo}"
+            );
 
-        assert!(
-            parts.len() == 4,
-            "the NeoForge version is four parts, `<minecraft>-<hotfix>.<release>`: {neo}"
-        );
-
-        parts.pop();
-        if parts.last() == Some(&"0") {
             parts.pop();
+            if parts.last() == Some(&"0") {
+                parts.pop();
+            }
+
+            return parts.join(".");
         }
 
-        parts.join(".")
+        property(gradle, "minecraft_version")
     }
 
     /// The build this tree produces is the one the update file offers, for the Minecraft version the game
