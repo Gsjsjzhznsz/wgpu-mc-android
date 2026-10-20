@@ -294,7 +294,7 @@ public class WgpuRenderPass implements RenderPassBackend {
     private MemorySegment buildDescriptor(
             String label,
             GpuTextureView colorTexture,
-            @NonNull java.util.Optional<org.joml.Vector4fc> clearColor,
+            java.util.Optional<org.joml.Vector4fc> clearColor,
             GpuTextureView depthTexture,
             OptionalDouble clearDepth) {
         try (Arena arena = Arena.ofConfined()) {
@@ -1285,6 +1285,11 @@ public class WgpuRenderPass implements RenderPassBackend {
         invoke(WmNative.setScissorRect, nativePass, 0, 0, targetWidth, targetHeight);
     }
 
+    /** The whole-buffer slice for a draw whose vertex buffer is still a bare `GpuBuffer`. */
+    private static GpuBufferSlice vertexSlice(GpuBuffer buffer) {
+        return new GpuBufferSlice(buffer, 0L, buffer.size());
+    }
+
     // 26.2 hands the vertex buffer down as a slice (buffer + offset + length) rather than a bare
     // buffer; the offset rides into the native draw call the same way the bare buffer's implicit
     // zero did.
@@ -1842,7 +1847,7 @@ public class WgpuRenderPass implements RenderPassBackend {
         }
 
         RenderPass.Draw<T> first = run.get(0);
-        setVertexBuffer(first.slot(), first.vertexBuffer());
+        setVertexBuffer(first.slot(), vertexSlice(first.vertexBuffer()));
         setIndexBuffer(indexBuffer, indexType);
 
         // **The template the native side records the whole run with.** Its parameters are the first
@@ -1901,11 +1906,12 @@ public class WgpuRenderPass implements RenderPassBackend {
             GpuBuffer indexBuffer,
             IndexType indexType,
             int instance) {
-        setVertexBuffer(draw.slot(), draw.vertexBuffer());
+        setVertexBuffer(draw.slot(), vertexSlice(draw.vertexBuffer()));
         setIndexBuffer(indexBuffer, indexType);
 
         firstInstance = instance == NO_INSTANCE ? 0 : instance;
-        drawIndexed(draw.baseVertex(), draw.firstIndex(), draw.indexCount(), 1);
+        // 26.2's order: count, instances, first index, base vertex, base instance.
+        drawIndexed(draw.indexCount(), 1, draw.firstIndex(), draw.baseVertex(), 0);
         firstInstance = 0;
     }
 
