@@ -1054,6 +1054,12 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
     // GPU-side numbers rather than the frame losing its passes.
     override fun writeTimestamp(pool: GpuQueryPool, index: Int) = Unit
 
+    private object ImmediateFence : GpuFence {
+        override fun awaitCompletion(timeoutMs: Long): Boolean = true
+        override fun close() = Unit
+    }
+}
+
 internal class NativeImageUpload private constructor(
     private val arena: Arena,
     @JvmField val segment: MemorySegment,
@@ -1125,7 +1131,7 @@ object WgpuTransientMemory : TransientMemory {
      * Every staging/gpu slice this object has handed out and not yet seen submitted, keyed by
      * (buffer identity, offset, length) - the record is final, so the triple is the identity.
      */
-    private val shadows = java.util.concurrent.ConcurrentHashMap<ShadowKey, java.nio.ByteBuffer>()
+    private val shadows = java.util.concurrent.ConcurrentHashMap<ShadowKey, ByteBuffer>()
 
     private fun remember(slice: GpuBufferSlice, bytes: ByteBuffer): GpuBufferSlice {
         shadows[ShadowKey(slice)] = bytes
@@ -1145,7 +1151,7 @@ object WgpuTransientMemory : TransientMemory {
     }
 
     /** The device the renderer is running with, or null before the game created one. */
-    private fun gpu(): dev.birb.wgpu.backend.WgpuDevice? = Wgpu.device()
+    private fun gpu(): WgpuDevice? = dev.birb.wgpu.render.Wgpu.device()
 
     private fun uploadToGpu(bytes: ByteBuffer, tag: String): GpuBufferSlice? {
         val device = gpu() ?: return null
@@ -1157,25 +1163,10 @@ object WgpuTransientMemory : TransientMemory {
 
     override fun allocateCpu(size: Long, alignment: Long, key1: Long, key2: Long): ByteBuffer {
         require(size > 0) { "wgpu: a staging allocation of $size bytes" }
-        val buffer = ByteBuffer.allocateDirect(size.toInt())
         // Direct buffers are 16-byte aligned by construction, which satisfies any alignment the
         // game asks for on a CPU scratch buffer.
-        return buffer
+        return ByteBuffer.allocateDirect(size.toInt())
     }
-
-    private fun uploadToGpu(bytes: ByteBuffer, alignment: Int, tag: String): GpuBufferSlice {
-        val device = RenderSystemDevice.device()
-        val buffer = device.createBuffer({ tag }, GpuBuffer.COPY_SRC or GpuBuffer.COPY_DST, bytes.remaining().toLong())
-        val slice = GpuBufferSlice(buffer, 0L, bytes.remaining().toLong())
-        device.commandEncoderWriteToBuffer(slice, bytes)
-        return remember(slice, bytes)
-    }
-
-    override fun allocateStaging(size: Long, alignment: Long, key1: Long, key2: Long): GpuBufferSlice.MappedView =
-        uploadMapped(size, alignment, "wgpu-mc transient staging")
-
-    override fun allocateGpuMapped(size: Long, alignment: Long, key1: Long, key2: Long): GpuBufferSlice.MappedView =
-        uploadMapped(size, alignment, "wgpu-mc transient gpu")
 
     private fun uploadMapped(size: Long, alignment: Long, tag: String): GpuBufferSlice.MappedView {
         val bytes = allocateCpu(size, alignment, 0, 0)
@@ -1191,24 +1182,23 @@ object WgpuTransientMemory : TransientMemory {
         })
     }
 
+    override fun allocateStaging(size: Long, alignment: Long, key1: Long, key2: Long): GpuBufferSlice.MappedView =
+        uploadMapped(size, alignment, "wgpu-mc transient staging")
+
+    override fun allocateGpuMapped(size: Long, alignment: Long, key1: Long, key2: Long): GpuBufferSlice.MappedView =
+        uploadMapped(size, alignment, "wgpu-mc transient gpu")
+
     override fun uploadStaging(source: ByteBuffer, alignment: Long, key1: Long, key2: Long): GpuBufferSlice =
-        upload(source, alignment, key1, key2, "wgpu-mc transient staging")
+        upload(source, "wgpu-mc transient staging")
 
     override fun uploadGpu(source: ByteBuffer, alignment: Long, key1: Long, key2: Long): GpuBufferSlice =
-        upload(source, alignment, key1, key2, "wgpu-mc transient gpu")
+        upload(source, "wgpu-mc transient gpu")
 
-    private fun upload(
-        source: ByteBuffer,
-        alignment: Long,
-        key1: Long,
-        key2: Long,
-        tag: String,
-    ): GpuBufferSlice {
-        val bytes = allocateCpu(source.remaining().toLong(), alignment, key1, key2)
+    private fun upload(source: ByteBuffer, tag: String): GpuBufferSlice {
+        val bytes = allocateCpu(source.remaining().toLong(), 16, 0, 0)
         bytes.put(source.duplicate())
         bytes.flip()
-        return uploadToGpu(bytes, tag) ?: GpuBufferSlice(
-            NULL_BUFFER, 0L, bytes.remaining().toLong())
+        return uploadToGpu(bytes, tag) ?: GpuBufferSlice(NULL_BUFFER, 0L, bytes.remaining().toLong())
     }
 
     /**
@@ -1217,26 +1207,31 @@ object WgpuTransientMemory : TransientMemory {
      */
     private val NULL_BUFFER: GpuBuffer = object : GpuBuffer(GpuBuffer.COPY_DST, 0L) {
         override fun close() = Unit
+        override fun map(offset: Long, length: Long, read: Boolean, write: Boolean): GpuBufferSlice.MappedView =
+            GpuBufferSlice.MappedView(
+                GpuBufferSlice(this, offset, length),
+                ByteBuffer.allocateDirect(length.toInt().coerceAtLeast(0)),
+                Runnable { },
+            )
     }
 
     override fun uploadStaging(sources: MutableList<ByteBuffer>, alignment: Long, key1: Long, key2: Long): GpuBufferSlice =
-        uploadAll(sources, alignment, key1, key2, "wgpu-mc transient staging")
+        uploadAll(sources, "wgpu-mc transient staging")
 
     override fun uploadGpu(sources: MutableList<ByteBuffer>, alignment: Long, key1: Long, key2: Long): GpuBufferSlice =
-        uploadAll(sources, alignment, key1, key2, "wgpu-mc transient gpu")
+        uploadAll(sources, "wgpu-mc transient gpu")
 
-    private fun uploadAll(sources: MutableList<ByteBuffer>, alignment: Long, key1: Long, key2: Long, tag: String): GpuBufferSlice {
+    private fun uploadAll(sources: MutableList<ByteBuffer>, tag: String): GpuBufferSlice {
         val total = sources.sumOf { it.remaining().toLong() }
-        val bytes = allocateCpu(total, alignment, key1, key2)
+        val bytes = allocateCpu(total, 16, 0, 0)
         for (source in sources) bytes.put(source.duplicate())
         bytes.flip()
         return uploadToGpu(bytes, tag) ?: GpuBufferSlice(NULL_BUFFER, 0L, bytes.remaining().toLong())
     }
 
     override fun multiUploadStaging(sources: MutableList<ByteBuffer>, alignment: Long, key: Long): MutableList<GpuBufferSlice> =
-        sources.mapTo(arrayListOf()) { upload(it, alignment, key, 0, "wgpu-mc transient staging") }
+        sources.mapTo(arrayListOf()) { upload(it, "wgpu-mc transient staging") }
 
     override fun multiUploadGpu(sources: MutableList<ByteBuffer>, alignment: Long, key: Long): MutableList<GpuBufferSlice> =
-        sources.mapTo(arrayListOf()) { upload(it, alignment, key, 0, "wgpu-mc transient gpu") }
-}
+        sources.mapTo(arrayListOf()) { upload(it, "wgpu-mc transient gpu") }
 }
