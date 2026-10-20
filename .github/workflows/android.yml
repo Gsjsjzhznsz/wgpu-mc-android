@@ -457,6 +457,7 @@ jobs:
             echo "::error::the 26.2 Fabric jar does not carry fabric.mod.json"
             exit 1
           fi
+          python3 ../scripts/audit_fabric_mixin_shape.py "$fabric_jar"
 
       - name: Package the Fabric mod jar
         shell: bash
@@ -502,6 +503,17 @@ jobs:
             echo "::error::the Fabric jar does not carry fabric.mod.json"
             exit 1
           fi
+
+      - name: Audit the Fabric jar's @Redirect shape
+        if: success()
+        shell: bash
+        working-directory: Neolectrum-fabric
+        # The compile classpath pins sponge-mixin 0.17.3 so every `Redirect.at` is encoded
+        # as a single annotation - the one shape the MixinExtras on every loader (0.5.4 on
+        # 0.19.3 included) reads. A future loom/loader bump that silently re-resolves
+        # 0.17.4 re-arrays the shape and kills those loaders at TextureAtlasMixin; this
+        # fails the release instead. See the pin comment in this module's build.gradle.kts.
+        run: python3 ../scripts/audit_fabric_mixin_shape.py build/libs/wgpu_mc-fabric-*.jar
 
       - name: Check what the jar carries
         shell: bash
@@ -609,6 +621,7 @@ jobs:
             echo "::error::the 1.20.1 Fabric jar does not carry fabric.mod.json"
             exit 1
           fi
+          python3 ../scripts/audit_fabric_mixin_shape.py "$fabric_jar"
           if ! unzip -l "$fabric_jar" | grep -q "wgpu_mc.refmap.json"; then
             echo "::error::the 1.20.1 Fabric jar does not carry its refmap"
             exit 1

@@ -310,3 +310,25 @@ dependencies {
         // classpath before the first one loads. `include` is Fabric's jar-in-jar.
         include("org.jetbrains.kotlin:kotlin-stdlib:2.3.20")
 }
+
+// ---------------------------------------------------------------------------
+// **The mixin the compiler reads decides the shape the jar ships.**
+//
+// `Redirect.at()` changed type in the fabric sponge-mixin fork: 0.17.3 declares a single
+// `At`, 0.17.4 declares `At[]`. javac encodes the *declared* shape - compile against
+// 0.17.4 and every `at = @At(...)` in the jar is written as an array, which is a legal
+// encoding for that declaration but one the MixinExtras bundled with older loaders
+// (0.5.4 on 0.19.3 and below, 0.4.x on the 1.20.x era) cannot read: its factory-redirect
+// scan casts the `at` value straight to one `AnnotationNode` and a launch dies on
+// "ArrayList cannot be cast to AnnotationNode" the first mixin with a @Redirect is
+// prepared - TextureAtlasMixin, here. Every loader from 0.15 to the latest reads the
+// single shape (0.17.4 gained the normalizing `getValue(..., notNull)` overload and
+// MixinExtras 0.5.5 the list form exactly so both shapes parse), so compiling against
+// 0.17.3 is the one answer every launcher can read: the iOS Prisma build is pinned to
+// loader 0.19.3 and cannot be told to move. The pin rides the compile and runtime
+// classpaths only - loom's own configurations keep the 0.17.4 they are built against.
+// ---------------------------------------------------------------------------
+configurations.matching { it.name in setOf("compileClasspath", "runtimeClasspath", "testCompileClasspath", "testRuntimeClasspath") }
+        .configureEach {
+                resolutionStrategy.force("net.fabricmc:sponge-mixin:0.17.3+mixin.0.8.7")
+        }
