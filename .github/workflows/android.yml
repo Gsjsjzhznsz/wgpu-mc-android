@@ -415,83 +415,6 @@ jobs:
         # and its natives from the 26.2 NeoForge build above.
         run: bash gradlew build --no-daemon --stacktrace
 
-      - name: Set up JDK 21 for the 1.20.1 line
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "21"
-        # The 26.x builds run Gradle 9.8 on this JVM; the 1.20.1 modules run Gradle 8.14, which
-        # does not run on 25. The compile still targets Java 17 - the floor a 1.20.1 launcher
-        # hands the game - through the toolchain the modules' settings scripts resolve.
-
-      - name: Package the 1.20.1 Forge jar
-        shell: bash
-        working-directory: Neolectrum-1.20.1
-        # The line's "main" loader build - Forge 47.x, because NeoForge forked at 1.20.2 and does
-        # not exist on 1.20.1. ForgeGradle 6 reobfuscates the jarJar output to the runtime's SRG
-        # member names; the refmap beside it is the static one the line ships. Same engine, same
-        # natives, same packaging contract as every other line.
-        #
-        # `bash gradlew`, not `./gradlew` - the repo keeps core.fileMode off, and this module's
-        # wrapper carries no execute bit on the checkout.
-        run: bash gradlew check jarJar --no-daemon --stacktrace
-
-      - name: Package the 1.20.1 Fabric jar
-        shell: bash
-        working-directory: Neolectrum-1.20.1-fabric
-        # The line's second loader: the shared whitelist plus the 1.20.1 overlay, compiled against
-        # Mojang's official mappings and remapped to intermediary, with the refmap the annotation
-        # processor writes from the mapping the build completes for it.
-        run: bash gradlew build --no-daemon --stacktrace
-
-      - name: Check what the 1.20.1 jars carry
-        if: success()
-        shell: bash
-        working-directory: Neolectrum-1.20.1
-        run: |
-          jar=$(ls build/libs/*-all.jar 2>/dev/null | head -n 1 || true)
-          if [ -z "$jar" ]; then
-            echo "::error::no 1.20.1 Forge jar was produced"
-            exit 1
-          fi
-          echo "== $jar =="
-          unzip -l "$jar"
-          for abi in android-arm64-v8a android-x86_64; do
-            if ! unzip -l "$jar" | grep -q "assets/wgpu_mc/natives/$abi/libwgpu_mc_jni.so"; then
-              echo "::error::the 1.20.1 jar is missing assets/wgpu_mc/natives/$abi/libwgpu_mc_jni.so"
-              exit 1
-            fi
-          done
-          for dir in ios-arm64 macos-arm64; do
-            if ! unzip -l "$jar" | grep -q "assets/wgpu_mc/natives/$dir/libwgpu_mc_jni.dylib"; then
-              echo "::error::the 1.20.1 jar is missing assets/wgpu_mc/natives/$dir/libwgpu_mc_jni.dylib"
-              exit 1
-            fi
-          done
-          for f in META-INF/mods.toml wgpu_mc.mixins.json wgpu_mc.refmap.json; do
-            if ! unzip -l "$jar" | grep -q "$f"; then
-              echo "::error::the 1.20.1 jar is missing $f"
-              exit 1
-            fi
-          done
-          if ! unzip -l "$jar" | grep -q "META-INF/jarjar/.*kotlin-stdlib"; then
-            echo "::error::the 1.20.1 jar is missing the embedded META-INF/jarjar/kotlin-stdlib"
-            exit 1
-          fi
-          fabric_jar=$(ls ../Neolectrum-1.20.1-fabric/build/libs/*.jar 2>/dev/null | grep -v -- '-sources' | head -n 1 || true)
-          if [ -z "$fabric_jar" ]; then
-            echo "::error::no 1.20.1 Fabric jar was built"
-            exit 1
-          fi
-          if ! unzip -l "$fabric_jar" | grep -q "fabric.mod.json"; then
-            echo "::error::the 1.20.1 Fabric jar does not carry fabric.mod.json"
-            exit 1
-          fi
-          if ! unzip -l "$fabric_jar" | grep -q "wgpu_mc.refmap.json"; then
-            echo "::error::the 1.20.1 Fabric jar does not carry its refmap"
-            exit 1
-          fi
-
       - name: Check what the 26.2 jars carry
         if: success()
         shell: bash
@@ -613,6 +536,91 @@ jobs:
               exit 1
             fi
           done
+
+      - name: Set up JDK 21 for the 1.20.1 line
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+        # The 26.x builds run Gradle 9.8 on this JVM; the 1.20.1 modules run Gradle 8.14, which
+        # does not run on 25. The compile still targets Java 17 - the floor a 1.20.1 launcher
+        # hands the game - through the toolchain the modules' settings scripts resolve.
+
+      - name: Package the 1.20.1 Forge jar
+        shell: bash
+        working-directory: Neolectrum-1.20.1
+        # The line's "main" loader build - Forge 47.x, because NeoForge forked at 1.20.2 and does
+        # not exist on 1.20.1. ForgeGradle 6 reobfuscates the jarJar output to the runtime's SRG
+        # member names; the refmap beside it is the static one the line ships. Same engine, same
+        # natives, same packaging contract as every other line.
+        #
+        # `bash gradlew`, not `./gradlew` - the repo keeps core.fileMode off, and this module's
+        # wrapper carries no execute bit on the checkout.
+        run: bash gradlew check jarJar --no-daemon --stacktrace
+
+      - name: Package the 1.20.1 Fabric jar
+        shell: bash
+        working-directory: Neolectrum-1.20.1-fabric
+        # The line's second loader: the shared whitelist plus the 1.20.1 overlay, compiled against
+        # Mojang's official mappings and remapped to intermediary, with the refmap the annotation
+        # processor writes from the mapping the build completes for it.
+        run: bash gradlew build --no-daemon --stacktrace
+
+      - name: Check what the 1.20.1 jars carry
+        if: success()
+        shell: bash
+        working-directory: Neolectrum-1.20.1
+        run: |
+          jar=$(ls build/libs/*-all.jar 2>/dev/null | head -n 1 || true)
+          if [ -z "$jar" ]; then
+            echo "::error::no 1.20.1 Forge jar was produced"
+            exit 1
+          fi
+          echo "== $jar =="
+          unzip -l "$jar"
+          for abi in android-arm64-v8a android-x86_64; do
+            if ! unzip -l "$jar" | grep -q "assets/wgpu_mc/natives/$abi/libwgpu_mc_jni.so"; then
+              echo "::error::the 1.20.1 jar is missing assets/wgpu_mc/natives/$abi/libwgpu_mc_jni.so"
+              exit 1
+            fi
+          done
+          for dir in ios-arm64 macos-arm64; do
+            if ! unzip -l "$jar" | grep -q "assets/wgpu_mc/natives/$dir/libwgpu_mc_jni.dylib"; then
+              echo "::error::the 1.20.1 jar is missing assets/wgpu_mc/natives/$dir/libwgpu_mc_jni.dylib"
+              exit 1
+            fi
+          done
+          for f in META-INF/mods.toml wgpu_mc.mixins.json wgpu_mc.refmap.json; do
+            if ! unzip -l "$jar" | grep -q "$f"; then
+              echo "::error::the 1.20.1 jar is missing $f"
+              exit 1
+            fi
+          done
+          if ! unzip -l "$jar" | grep -q "META-INF/jarjar/.*kotlin-stdlib"; then
+            echo "::error::the 1.20.1 jar is missing the embedded META-INF/jarjar/kotlin-stdlib"
+            exit 1
+          fi
+          fabric_jar=$(ls ../Neolectrum-1.20.1-fabric/build/libs/*.jar 2>/dev/null | grep -v -- '-sources' | head -n 1 || true)
+          if [ -z "$fabric_jar" ]; then
+            echo "::error::no 1.20.1 Fabric jar was built"
+            exit 1
+          fi
+          if ! unzip -l "$fabric_jar" | grep -q "fabric.mod.json"; then
+            echo "::error::the 1.20.1 Fabric jar does not carry fabric.mod.json"
+            exit 1
+          fi
+          if ! unzip -l "$fabric_jar" | grep -q "wgpu_mc.refmap.json"; then
+            echo "::error::the 1.20.1 Fabric jar does not carry its refmap"
+            exit 1
+          fi
+
+      - name: Set up JDK 25 for the rest of the build
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+        # The switch back: loom 1.19 refuses a JVM younger than 25, and the 26.x builds after
+        # this point run on it.
 
       - name: Upload the jars
         uses: actions/upload-artifact@v4
