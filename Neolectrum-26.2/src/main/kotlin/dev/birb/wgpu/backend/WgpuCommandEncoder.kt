@@ -16,10 +16,12 @@ import dev.birb.wgpu.rust.WmNative
 import net.minecraft.util.ARGB
 import net.minecraft.client.Minecraft
 import net.minecraft.core.SectionPos
+import org.joml.Vector4fc
 import org.lwjgl.system.MemoryUtil
 import java.lang.foreign.Arena
 import java.lang.foreign.MemorySegment
 import java.nio.ByteBuffer
+import java.util.Optional
 import java.util.OptionalDouble
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.function.Supplier
@@ -122,12 +124,12 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
                     "native pass ABI has no answer for")
         if (descriptor.colorAttachments.size > 1) {
             throw UnsupportedOperationException(
-                "wgpu: the pass '${descriptor.label.get()}' names ${descriptor.colorAttachments.size} " +
+                "wgpu: the pass '${descriptor.label().get()}' names ${descriptor.colorAttachments.size} " +
                     "colour attachments; this backend draws into one target per pass")
         }
 
         return openPass(
-            descriptor.label,
+            descriptor.label(),
             color.textureView(),
             color.clearValue(),
             descriptor.depthAttachment?.textureView(),
@@ -1184,13 +1186,17 @@ internal class NativeImageUpload private constructor(
         val slice = uploadToGpu(bytes, tag)
         // The mapped view writes into the shadow and re-uploads on close, which is the same
         // dance `mapBuffer` has always performed for a mapped write. Without a device yet the
-        // slice is null and the view answers over CPU memory alone - the game does not reach
-        // transient memory before the renderer exists, and if it ever does, this says so.
-        return GpuBufferSlice.MappedView(slice, bytes, Runnable {
-            if (bytes.position() > 0 && slice != null) {
-                uploadToGpu(bytes, tag)
-            }
-        })
+        // slice is the null stand-in and the view answers over CPU memory alone - the game does
+        // not reach transient memory before the renderer exists, and if it ever does, this says so.
+        return GpuBufferSlice.MappedView(
+            slice ?: GpuBufferSlice(NULL_BUFFER, 0L, bytes.remaining().toLong()),
+            bytes,
+            Runnable {
+                if (bytes.position() > 0 && slice != null) {
+                    uploadToGpu(bytes, tag)
+                }
+            },
+        )
     }
 
     override fun allocateStaging(size: Long, alignment: Long, usage: Int, key1: Long, key2: Long): GpuBufferSlice.MappedView =
@@ -1198,6 +1204,11 @@ internal class NativeImageUpload private constructor(
 
     override fun allocateGpuMapped(size: Long, alignment: Long, usage: Int, key1: Long, key2: Long): GpuBufferSlice.MappedView =
         uploadMapped(size, usage, "wgpu-mc transient gpu")
+
+    override fun allocateGpu(size: Long, alignment: Long, usage: Int, key1: Long, key2: Long): GpuBufferSlice =
+        upload(uploadToGpuBytes(size), "wgpu-mc transient gpu")
+
+    private fun uploadToGpuBytes(size: Long): ByteBuffer = allocateCpu(size, 16, 0, 0)
 
     override fun uploadStaging(source: ByteBuffer, alignment: Long, usage: Int, key1: Long, key2: Long): GpuBufferSlice =
         upload(source, "wgpu-mc transient staging")
@@ -1217,6 +1228,7 @@ internal class NativeImageUpload private constructor(
      * it answer zeros, and the copy paths refuse it loudly enough to be found.
      */
     private val NULL_BUFFER: GpuBuffer = object : GpuBuffer(GpuBuffer.USAGE_COPY_DST, 0L) {
+        override fun isClosed(): Boolean = false
         override fun close() = Unit
         override fun map(offset: Long, length: Long, read: Boolean, write: Boolean): GpuBufferSlice.MappedView =
             GpuBufferSlice.MappedView(
