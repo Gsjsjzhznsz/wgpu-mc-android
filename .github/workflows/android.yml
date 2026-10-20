@@ -167,6 +167,15 @@ jobs:
           want="android.$((number + 1))"
           failed=0
           for props in Neolectrum/gradle.properties Neolectrum-*/gradle.properties; do
+            # The loader modules (`Neolectrum-26.2-fabric` and friends) read their version from
+            # that line's NeoForge tree and carry no version of their own - a module without the
+            # key is skipped, not failed. Guarded, not piped into an assignment: `set -e` kills
+            # the whole step on a grep that matches nothing, which is what the first tag run died
+            # of, silently, one module in.
+            if ! grep -q '^neoforge_mod_version=' "$props"; then
+              echo "tag $tag skips $props (no neoforge_mod_version of its own)"
+              continue
+            fi
             have="$(grep -m1 '^neoforge_mod_version=' "$props" | cut -d= -f2)"
             echo "tag $tag wants *-$want; $props says $have"
             case "$have" in
