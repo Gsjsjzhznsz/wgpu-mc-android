@@ -117,7 +117,17 @@ val syncOverlayKotlin = tasks.register<Sync>("syncOverlayKotlin") {
 }
 
 val syncOverlayJava = tasks.register<Sync>("syncOverlayJava") {
-        from("../Neolectrum-1.20.1/src/main/java")
+        from("../Neolectrum-1.20.1/src/main/java") {
+                exclude(
+                        // the Forge-flavoured window mixin - it injects where Forge's patched
+                        // Window constructor hands creation to ImmediateWindowHandler; this
+                        // module's own copy (src/main/java) injects before the glfwCreateWindow
+                        // call the vanilla constructor makes, and the mixins.json entry
+                        // `render.WindowMixin` resolves to whichever of the two this build
+                        // compiled
+                        "dev/birb/wgpu/mixin/render/WindowMixin.java",
+                )
+        }
         into(layout.buildDirectory.dir("generated/overlay-java"))
 }
 
@@ -140,6 +150,11 @@ sourceSets.main {
                 // transformer list only the Forge loader applies
                 "**/META-INF/mods.toml",
                 "**/META-INF/accesstransformer.cfg",
+                // the Forge build's static SRG refmap - the refmap this build ships is the one
+                // its own annotation processor writes into the classes directory (intermediary,
+                // from the mapping this build completes), and the two carry the same name, so
+                // the Forge copy is excluded by name rather than losing to it on duplicates
+                "**/wgpu_mc.refmap.json",
         )
 }
 
