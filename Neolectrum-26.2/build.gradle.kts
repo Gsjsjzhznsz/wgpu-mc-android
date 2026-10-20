@@ -81,6 +81,7 @@ sourceSets.main {
                 "dev/birb/wgpu/render/TerrainPass.kt",
                 "dev/birb/wgpu/gui/OptionPageScreen.kt",
                 "dev/birb/wgpu/gui/OptionPages.kt",
+                "dev/birb/wgpu/gui/widgets/TabWidget.kt",
                 "dev/birb/wgpu/BlockCache.kt",
         )
         resources {

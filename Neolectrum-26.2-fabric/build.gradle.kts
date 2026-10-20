@@ -102,6 +102,7 @@ val sharedKotlinExcludes = listOf(
         "dev/birb/wgpu/render/TerrainPass.kt",
         "dev/birb/wgpu/gui/OptionPageScreen.kt",
         "dev/birb/wgpu/gui/OptionPages.kt",
+        "dev/birb/wgpu/gui/widgets/TabWidget.kt",
 )
 
 val syncSharedKotlin = tasks.register<Sync>("syncSharedKotlin") {
