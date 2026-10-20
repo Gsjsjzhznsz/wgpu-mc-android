@@ -160,7 +160,12 @@ dependencies {
         // 26.2 is unobfuscated like 26.1 - no mappings line, and the loader and API arrive as
         // plain `implementation` for the same reason: there is nothing left to remap.
         implementation("net.fabricmc:fabric-loader:0.20.1")
-        implementation("net.fabricmc:fabric-api:0.161.0+26.2")
+        // The real coordinates, not loom's `net.fabricmc:fabric-api` shorthand: the shorthand
+        // resolves for the 26.1.2 line and did not for 26.2 (the search came back as plain
+        // `net.fabricmc:fabric-api` on the maven, which is a group that has no artifacts), while
+        // the module's own group - `net.fabricmc.fabric-api` - serves every 26.2 build. Same
+        // artifact either way; this spelling is the one the maven answers.
+        implementation("net.fabricmc.fabric-api:fabric-api:0.161.0+26.2")
 
         include("org.jetbrains.kotlin:kotlin-stdlib:2.3.20")
 }
