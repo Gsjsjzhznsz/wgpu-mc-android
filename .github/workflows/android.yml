@@ -382,8 +382,10 @@ jobs:
         # The 26.2 sibling: the same pipeline one Minecraft line later. It reads the same Rust
         # tree this job already built (the natives are the same libraries every line ships) and
         # packs them the same way, so a 26.2 jar is the 26.1 jar's build twin, not a second
-        # engine build.
-        run: ./gradlew check jarJar --no-daemon --stacktrace
+        # engine build. `bash gradlew`, not `./gradlew` - the same reason the fabric step spells
+        # it that way: the repo keeps core.fileMode off, and this module's fresh wrapper carries
+        # no execute bit on the checkout.
+        run: bash gradlew check jarJar --no-daemon --stacktrace
 
       - name: Package the 26.2 Fabric mod jar
         shell: bash
