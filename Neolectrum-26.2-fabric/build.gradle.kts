@@ -44,38 +44,89 @@ loom {
         }
 }
 
+// **The shared trees, filtered into the build rather than excluded out of it.** Gradle's
+// excludes match a relative path against EVERY source root at once, and this module compiles
+// three trees whose files share paths: the 26.1 original, the 26.2 overlay, and this module's
+// own loader answers. Excluding `dev/birb/wgpu/chunk/RustChunkBake.kt` would have killed all
+// three - the first CI run proved it by failing on the module's own copy. So the two shared
+// trees are synced into this build's generated directories first, minus exactly the files the
+// next tree up answers, and the source set reads the filtered copies:
+//
+//   shared-java    = ../Neolectrum/src/main/java, minus the five mixins 26.2 moved (the overlay
+//                    tree answers them) and minus the two NeoForge-only mixins
+//   shared-kotlin  = ../Neolectrum/src/main/kotlin, minus every file the loader or the 26.2
+//                    overlay answers
+//   overlay-kotlin = ../Neolectrum-26.2/src/main/kotlin, minus the NeoForge-flavoured block
+//                    cache (this module's own `BlockCacheFabric.kt` answers it)
+//
+// This module's own `src/main` provides the loader answers, and wins every conflict by being
+// named last.
+val syncSharedJava = tasks.register<Sync>("syncSharedJava") {
+        from("../Neolectrum/src/main/java") {
+                exclude(
+                        // the five mixins the 26.2 overlay answers
+                        "dev/birb/wgpu/mixin/level/VisibleSectionsMixin.java",
+                        "dev/birb/wgpu/mixin/render/WorldRendererMixin.java",
+                        "dev/birb/wgpu/mixin/render/InGameHudMixin.java",
+                        "dev/birb/wgpu/mixin/chunk/RustChunkBakeMixin.java",
+                        "dev/birb/wgpu/mixin/core/OptionsScreenMixin.java",
+                        // the two NeoForge-only mixins
+                        "dev/birb/wgpu/mixin/render/WindowMixin.java",
+                        "dev/birb/wgpu/mixin/core/EarlyWindowMixin.java",
+                )
+        }
+        into(layout.buildDirectory.dir("generated/shared-java"))
+}
+
+val sharedKotlinExcludes = listOf(
+        // the loader seams
+        "dev/birb/wgpu/WgpuMcMod.kt",
+        "dev/birb/wgpu/WgpuMcModClient.kt",
+        "dev/birb/wgpu/backend/EarlyWindow.kt",
+        // the NeoForge-patched surfaces this module answers
+        "dev/birb/wgpu/backend/WgpuCommandEncoder.kt",
+        "dev/birb/wgpu/backend/WgpuFormat.kt",
+        "dev/birb/wgpu/render/TintProfile.kt",
+        "dev/birb/wgpu/render/Wgpu.kt",
+        "dev/birb/wgpu/BlockCache.kt",
+        // the 26.2 answers the overlay tree carries
+        "dev/birb/wgpu/backend/WgpuDevice.kt",
+        "dev/birb/wgpu/backend/WgpuSurface.kt",
+        "dev/birb/wgpu/backend/WgpuBackend.kt",
+        "dev/birb/wgpu/backend/WgpuTexture.kt",
+        "dev/birb/wgpu/backend/WgpuBuffer.kt",
+        "dev/birb/wgpu/backend/WgpuCompiledRenderPipeline.kt",
+        "dev/birb/wgpu/chunk/RustChunkBake.kt",
+        "dev/birb/wgpu/render/TerrainPass.kt",
+        "dev/birb/wgpu/gui/OptionPageScreen.kt",
+)
+
+val syncSharedKotlin = tasks.register<Sync>("syncSharedKotlin") {
+        from("../Neolectrum/src/main/kotlin") { exclude(sharedKotlinExcludes) }
+        into(layout.buildDirectory.dir("generated/shared-kotlin"))
+}
+
+val syncOverlayKotlin = tasks.register<Sync>("syncOverlayKotlin") {
+        from("../Neolectrum-26.2/src/main/kotlin") {
+                // the overlay's block cache is the NeoForge-flavoured copy; this module's own
+                // `BlockCacheFabric.kt` is the answer here
+                exclude("dev/birb/wgpu/BlockCache.kt")
+        }
+        into(layout.buildDirectory.dir("generated/overlay-kotlin"))
+}
+
 sourceSets.main {
-        java.srcDirs("../Neolectrum/src/main/java", "../Neolectrum-26.2/src/main/java")
-        kotlin.srcDirs("../Neolectrum/src/main/kotlin", "../Neolectrum-26.2/src/main/kotlin")
+        java.srcDirs(syncSharedJava.map { it.destinationDir }, "../Neolectrum-26.2/src/main/java")
+        kotlin.srcDirs(
+                syncSharedKotlin.map { it.destinationDir },
+                syncOverlayKotlin.map { it.destinationDir },
+                "src/main/kotlin",
+        )
         resources.srcDirs("../Neolectrum/src/main/resources", "../Neolectrum-26.2/src/main/resources")
 
-        // The loader seams the 26.1 fabric module names, unchanged: the NeoForge entrypoints and
-        // early window, and the five files whose job touches the game's NeoForge-patched surface.
-        // (26.2 merges `TextureFormat` into `GpuFormat`, so the format map's stencil seam is gone;
-        // the file this module answers now is the block cache, same as 26.1.)
-        java.exclude(
-                "dev/birb/wgpu/mixin/render/WindowMixin.java",
-                "dev/birb/wgpu/mixin/core/EarlyWindowMixin.java",
-        )
-        kotlin.exclude(
-                "dev/birb/wgpu/WgpuMcMod.kt",
-                "dev/birb/wgpu/WgpuMcModClient.kt",
-                "dev/birb/wgpu/backend/EarlyWindow.kt",
-                "dev/birb/wgpu/backend/WgpuCommandEncoder.kt",
-                "dev/birb/wgpu/backend/WgpuFormat.kt",
-                "dev/birb/wgpu/render/TintProfile.kt",
-                "dev/birb/wgpu/render/Wgpu.kt",
-                "dev/birb/wgpu/BlockCache.kt",
-                // The 26.2 answers this module carries its own copies of (under `src/main` here,
-                // the same FQN): the exclude kills both trees' copies - the 26.1 original and the
-                // 26.2 overlay - and the module's own file is the one that compiles. The same
-                // move the loader seams above make, one Minecraft line up.
-                "dev/birb/wgpu/backend/WgpuCommandEncoder.kt",
-                "dev/birb/wgpu/backend/WgpuFormat.kt",
-                "dev/birb/wgpu/chunk/RustChunkBake.kt",
-                "dev/birb/wgpu/render/TerrainPass.kt",
-                "dev/birb/wgpu/gui/OptionPageScreen.kt",
-        )
+        tasks.named("processResources") {
+                dependsOn(syncSharedJava, syncSharedKotlin, syncOverlayKotlin)
+        }
         resources.exclude(
                 "**/META-INF/neoforge.mods.toml",
                 "**/META-INF/accesstransformer.cfg",

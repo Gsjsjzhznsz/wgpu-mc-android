@@ -54,7 +54,8 @@ object TintProfile {
 		val client = Minecraft.getInstance()
 		val level = client.level ?: return
 
-		val camera = client.gameRenderer.mainCamera.blockPosition()
+		// 26.2 made the field private; the getter is the same camera.
+		val camera = client.gameRenderer.mainCamera().blockPosition()
 		val y = camera.y
 
 		// The nearest change, in whichever of the two axes it happens on, so the row can be read across it.

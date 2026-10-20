@@ -80,7 +80,8 @@ class WgpuBackend : GpuBackend {
                     ?: throw BackendCreationException(
                         "wgpu-mc could not find a window to present through on Android: this " +
                             "launcher offers neither the Pojav-family native bridge nor a game " +
-                            "Surface in its view hierarchy. The log names what was searched."
+                            "Surface in its view hierarchy. The log names what was searched.",
+                        BackendCreationException.Reason.OTHER,
                     )
                 WgpuNative.createWmRendererOnAndroidSurface(surface, framebufferWidth, framebufferHeight)
             }
@@ -88,7 +89,10 @@ class WgpuBackend : GpuBackend {
             val (display, nativeWindow) = try {
                 WgpuSurface.windowHandles(window)
             } catch (error: IllegalStateException) {
-                throw BackendCreationException(error.message ?: "wgpu-mc cannot present to this window")
+                throw BackendCreationException(
+                    error.message ?: "wgpu-mc cannot present to this window",
+                    BackendCreationException.Reason.OTHER,
+                )
             }
             WgpuNative.createWmRendererOnWindow(display, nativeWindow, framebufferWidth, framebufferHeight)
         }
@@ -100,6 +104,7 @@ class WgpuBackend : GpuBackend {
                 "wgpu-mc could not create a renderer on any backend. See the log for the reason, " +
                     "then choose a different backend on the Electrum options page (or in " +
                     "config/wgpu-mc-renderer.json) and restart."
+                BackendCreationException.Reason.OTHER,
             )
         }
 
