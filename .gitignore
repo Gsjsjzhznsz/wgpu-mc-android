@@ -19,3 +19,4 @@ build/
 # Local engine checkouts made by scripts
 *.log
 build/
+.mc-cache/

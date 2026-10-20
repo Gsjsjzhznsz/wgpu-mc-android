@@ -499,16 +499,19 @@ CHECKERS = (("Inject", check_inject), ("Redirect", check_redirect),
             ("Accessor", check_accessor), ("Invoker", check_invoker))
 
 
-def audit_config(config: Path, jar: JarIndex, source_root: Path, allowed: set[str]) -> None:
+def audit_config(config: Path, jar: JarIndex, source_roots: list[Path], allowed: set[str]) -> None:
     data = json.loads(config.read_text())
     package = data["package"]
     mixins = list(data.get("client", [])) + list(data.get("server", []))
     print(f"== {config}: {len(mixins)} mixin(s), package {package}")
     for entry in mixins:
         fqn = f"{package}.{entry}"
-        path = source_root / (fqn.replace(".", "/") + ".java")
+        # The first root that carries the class answers - the version overlay is named before the
+        # shared tree, so a mixin both trees hold is audited from its version-specific source.
+        paths = [root / (fqn.replace(".", "/") + ".java") for root in source_roots]
+        path = next((p for p in paths if p.exists()), paths[-1])
         if not path.exists():
-            fail(f"{config}: mixin class {fqn} has no source at {path}")
+            fail(f"{config}: mixin class {fqn} has no source at {paths[0].parent}*/{path.name}")
             continue
         if fqn in allowed:
             print(f"   ~ {entry}: allowed (documented loader-specific surface)")
@@ -538,12 +541,14 @@ def audit_config(config: Path, jar: JarIndex, source_root: Path, allowed: set[st
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--jar", required=True)
-    parser.add_argument("--source-root", default=None)
+    parser.add_argument("--source-root", action="append", default=None,
+                        help="a Java source root; repeat for version overlays (first hit wins)")
     parser.add_argument("--allow", default=None)
     parser.add_argument("configs", nargs="+")
     args = parser.parse_args()
     here = Path(__file__).resolve().parent.parent
-    source_root = Path(args.source_root) if args.source_root else here / "Neolectrum/src/main/java"
+    source_roots = [Path(root) for root in args.source_root] if args.source_root \
+        else [here / "Neolectrum/src/main/java"]
     allowed = set()
     if args.allow and Path(args.allow).exists():
         for line in Path(args.allow).read_text().splitlines():
@@ -553,7 +558,7 @@ def main() -> int:
     jar = JarIndex(args.jar)
     print(f"jar: {args.jar} ({len(jar.entries)} entries)")
     for config in args.configs:
-        audit_config(Path(config), jar, source_root, allowed)
+        audit_config(Path(config), jar, source_roots, allowed)
     for message in dict.fromkeys(FAILURES):
         print(f"::error::mixin audit: {message}")
     if FAILURES:

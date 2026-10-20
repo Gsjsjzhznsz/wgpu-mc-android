@@ -1,0 +1,66 @@
+classTweaker	v1	official
+
+# The NeoForge build widens these members with META-INF/accesstransformer.cfg, applied by the
+# loader at runtime; this is the same set spelled for the jar loom hands the Kotlin compiler -
+# the same members, in classTweaker's shape (tab-separated; the file the classTweaker reader
+# accepts since loom 1.19). Entries whose 26.1 shape this file guesses at are marked GUESS, and
+# the reader names the real member when a guess is wrong, which is how the guesses get fixed.
+
+# ---------- Class accessibility ----------
+accessible	class	net/minecraft/client/renderer/chunk/SectionRenderDispatcher$RenderSection$CompileTask
+accessible	class	net/minecraft/world/level/chunk/PaletteResize
+accessible	class	net/minecraft/world/level/chunk/PalettedContainer$Data
+accessible	class	net/minecraft/world/level/chunk/Configuration
+accessible	class	net/minecraft/world/level/lighting/SkyLightSectionStorage$SkyDataLayerStorageMap
+
+# ---------- Field accessibility ----------
+# The Rust palette/light paths read these out of the container's internals.
+accessible	field	net/minecraft/world/level/chunk/PalettedContainer	data	Lnet/minecraft/world/level/chunk/PalettedContainer$Data;
+accessible	field	net/minecraft/world/level/chunk/PalettedContainer$Data	palette	Lnet/minecraft/world/level/chunk/Palette; # GUESS
+accessible	field	net/minecraft/world/level/chunk/PalettedContainer$Data	storage	Lnet/minecraft/util/BitStorage;
+accessible	field	net/minecraft/world/level/chunk/PalettedContainer$Data	configuration	Lnet/minecraft/world/level/chunk/Configuration;
+
+# 26.1 leaves renderThread non-public; the render-thread checks read it.
+accessible	field	com/mojang/blaze3d/systems/RenderSystem	renderThread	Ljava/lang/Thread;
+
+# ---------- Chunk / light storage state ----------
+accessible	field	net/minecraft/client/multiplayer/ClientChunkCache	storage	Lnet/minecraft/client/multiplayer/ClientChunkCache$Storage;
+accessible	field	net/minecraft/client/multiplayer/ClientChunkCache$Storage	viewCenterX	I
+accessible	field	net/minecraft/client/multiplayer/ClientChunkCache$Storage	viewCenterZ	I
+
+# SimpleBitStorage internals, read by the palette packer.
+accessible	field	net/minecraft/util/SimpleBitStorage	valuesPerLong	I
+accessible	field	net/minecraft/util/SimpleBitStorage	divideAdd	I
+accessible	field	net/minecraft/util/SimpleBitStorage	divideMul	I
+accessible	field	net/minecraft/util/SimpleBitStorage	divideShift	I
+accessible	field	net/minecraft/util/SimpleBitStorage	mask	J
+
+accessible	field	net/minecraft/world/level/lighting/LevelLightEngine	blockEngine	Lnet/minecraft/world/level/lighting/LightEngine; # GUESS
+accessible	field	net/minecraft/world/level/lighting/LevelLightEngine	skyEngine	Lnet/minecraft/world/level/lighting/LightEngine; # GUESS
+# The light-storage fields the NeoForge AT carries (updatingSectionData / visibleSectionData)
+# are NeoForge's own patches on that class - the vanilla jar this build compiles against has
+# neither, and no source this build compiles reads them, so they are simply not widened here.
+
+# ---------- Method accessibility ----------
+# onMove/onButton/onScroll remain package-private in 26.1; the input mixins invoke them.
+accessible	method	net/minecraft/client/MouseHandler	onMove	(JDD)V
+accessible	method	net/minecraft/client/MouseHandler	onButton	(JLnet/minecraft/client/input/MouseButtonInfo;I)V
+accessible	method	net/minecraft/client/MouseHandler	onScroll	(JDD)V
+accessible	method	net/minecraft/client/renderer/chunk/SectionRenderDispatcher$RenderSection	createCompileTask	(Lnet/minecraft/client/renderer/chunk/RenderRegionCache;)Lnet/minecraft/client/renderer/chunk/SectionRenderDispatcher$RenderSection$CompileTask;
+# 26.1 takes a CameraRenderState; still private.
+accessible	method	net/minecraft/client/renderer/GameRenderer	bobView	(Lnet/minecraft/client/renderer/state/level/CameraRenderState;Lcom/mojang/blaze3d/vertex/PoseStack;)V
+
+# ---------- Sprite / atlas internals (the entries NeoForge's own AT carries) ----------
+# The bake reads where each sprite sits in the atlas and what its frames are. These are
+# package-private or private in the vanilla jar and widened by NeoForge's own transformer on the
+# patched jar the NeoForge build compiles against - the same entries, spelled for this build.
+accessible	field	net/minecraft/client/renderer/texture/TextureAtlasSprite	u0	F # GUESS
+accessible	field	net/minecraft/client/renderer/texture/TextureAtlasSprite	v0	F # GUESS
+accessible	field	net/minecraft/client/renderer/texture/TextureAtlasSprite	u1	F # GUESS
+accessible	field	net/minecraft/client/renderer/texture/TextureAtlasSprite	v1	F # GUESS
+accessible	method	net/minecraft/client/renderer/texture/TextureAtlasSprite	contents	()Lnet/minecraft/client/renderer/texture/SpriteContents; # GUESS
+accessible	field	net/minecraft/client/renderer/texture/TextureAtlas	texturesByName	Ljava/util/Map;
+
+# The options screen walks the game's value sets, which are package-private here and widened by
+# NeoForge's own transformer there.
+accessible	class	net/minecraft/client/OptionInstance$ValueSet

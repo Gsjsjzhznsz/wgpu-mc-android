@@ -1,0 +1,81 @@
+package dev.birb.wgpu.fabric
+
+import dev.birb.wgpu.BlockCache
+import dev.birb.wgpu.DebugCamera
+import dev.birb.wgpu.DebugReload
+import dev.birb.wgpu.WgpuMcMod
+import dev.birb.wgpu.render.ShaderReloadListener
+import dev.birb.wgpu.rust.WgpuNative
+import net.fabricmc.api.ClientModInitializer
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents
+import net.fabricmc.fabric.api.resource.v1.ResourceLoader
+import net.fabricmc.loader.api.FabricLoader
+import net.minecraft.resources.Identifier
+import net.minecraft.server.packs.PackType
+
+/**
+ * The Fabric answer to the two `@Mod` classes the NeoForge build carries.
+ *
+ * The sequence is the one `WgpuMcMod`'s constructor and `WgpuMcModClient`'s client setup run,
+ * ordered the same way for the same reasons: the run directory goes to the native **before** the
+ * renderer exists (the renderer is built while the window is created, and the config it reads
+ * then names the backend - a run directory handed over after that is a setting that silently does
+ * nothing), and the panic hook plus the settings readback come as soon as the loader is on.
+ *
+ * The per-tick heartbeat and the shader reload listener register here exactly as
+ * `WgpuMcModClient` registers them on NeoForge - the objects are loader-neutral, the hooks are
+ * not, and this file is the Fabric pair of that registration.
+ *
+ * **This is a `class`, not an `object`, and that is load-bearing.** Fabric's default language
+ * adapter instantiates entrypoints with `Class.forName(...).getDeclaredConstructor().newInstance()`
+ * - no `setAccessible` on the way - and a Kotlin `object` compiles to a class whose no-argument
+ * constructor is *private*, so the reflective construction died with
+ * `IllegalAccessException ... modifiers "private"` before one line of `onInitializeClient` ran
+ * (the every-launch crash android.43 shipped with). A plain class carries the public no-argument
+ * constructor the adapter needs; the loader builds the one instance and there is nothing here a
+ * second instance would break.
+ */
+class WgpuMcFabric : ClientModInitializer {
+        override fun onInitializeClient() {
+                WgpuMcMod.LOGGER.info("Initializing wgpu-mc Fabric module")
+
+                try {
+                        WgpuNative.getClassLoader()
+                        WgpuNative.sendRunDirectory(
+                                FabricLoader.getInstance().gameDir.toAbsolutePath().normalize().toString()
+                        )
+                        WgpuNative.setPanicHook()
+
+                        // The same readback the NeoForge setup logs, for the same reason: the
+                        // renderer read the config before `setPanicHook` installed `env_logger`,
+                        // and this line is what makes "my setting did not survive the restart"
+                        // answerable from the log.
+                        WgpuMcMod.LOGGER.info(
+                                "wgpu-mc renderer settings as loaded: {}",
+                                WgpuNative.getSettings(),
+                        )
+
+                        WgpuMcMod.LOGGER.info("wgpu-mc native bridge initialized")
+                } catch (throwable: Throwable) {
+                        WgpuMcMod.LOGGER.error("Failed to initialize wgpu-mc native bridge", throwable)
+                }
+
+                // The per-tick heartbeat: the cache the bake reads its block colours from, the
+                // camera the frame comparisons pin, and the debug reload marker. Client ticks
+                // rather than frames, the same phase NeoForge's `ClientTickEvent.Post` gives them.
+                ClientTickEvents.END_CLIENT_TICK.register {
+                        BlockCache.onClientTick()
+                        DebugCamera.onClientTick()
+                        DebugReload.onClientTick()
+                }
+
+                // The shader reload listener, under the same id the NeoForge event names it
+                // with. resource-loader-v1's register takes the id and the game's own listener
+                // interface the mod implements, one call and no adapter.
+                ResourceLoader.get(PackType.CLIENT_RESOURCES)
+                        .registerReloadListener(
+                                Identifier.fromNamespaceAndPath(WgpuMcMod.MOD_ID, "shaders"),
+                                ShaderReloadListener,
+                        )
+        }
+}

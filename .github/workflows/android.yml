@@ -159,13 +159,24 @@ jobs:
             echo "::error::tag $tag carries no version number; the mapping v0.1.K-android -> android.(K+1) cannot be checked"
             exit 1
           fi
-          want="2612.0.8-android.$((number + 1))"
-          have="$(grep -m1 '^neoforge_mod_version=' Neolectrum/gradle.properties | cut -d= -f2)"
-          echo "tag $tag wants mod version $want; gradle.properties says $have"
-          if [ "$have" != "$want" ]; then
-            echo "::error::tag $tag needs neoforge_mod_version=$want in Neolectrum/gradle.properties, found $have - bump the version before tagging"
-            exit 1
-          fi
+          # One release, one build number, every Minecraft line: each module's version is
+          # `<line prefix>.<line version>-android.(K+1)` - the prefixes differ per line
+          # (2612 for 26.1.2, 2620 for 26.2), the `-android.K` tail is the one number the tag
+          # moves, and a module whose tail did not move ships a duplicate version that the
+          # update checker cannot warn about.
+          want="android.$((number + 1))"
+          failed=0
+          for props in Neolectrum/gradle.properties Neolectrum-*/gradle.properties; do
+            have="$(grep -m1 '^neoforge_mod_version=' "$props" | cut -d= -f2)"
+            echo "tag $tag wants *-$want; $props says $have"
+            case "$have" in
+              *-"$want") ;;
+              *)
+                echo "::error::$props needs neoforge_mod_version=<line>-$want - bump every version module together before tagging"
+                failed=1 ;;
+            esac
+          done
+          exit $failed
 
       - name: Audit every mixin target against the vanilla jar
         # The mixin annotations carry their targets as strings nothing at compile
@@ -178,18 +189,34 @@ jobs:
         # both loaders share - before a single build step runs. NeoForge-only
         # surfaces live in scripts/mixin_audit_allowlist.txt with a reason.
         run: |
-          version="$(grep -m1 '^neoforge_minecraft_version=' Neolectrum/gradle.properties | cut -d= -f2)"
-          jar=".mc-cache/client-$version.jar"
-          if [ ! -f "$jar" ]; then
-            mkdir -p .mc-cache
-            url="$(curl -sfL https://piston-meta.mojang.com/mc/game/version_manifest_v2.json \
-              | python3 -c "import json,sys;print(next(v['url'] for v in json.load(sys.stdin)['versions'] if v['id']=='$version'))")"
-            curl -sfL "$url" -o .mc-cache/version.json
-            client="$(python3 -c "import json;print(json.load(open('.mc-cache/version.json'))['downloads']['client']['url'])")"
-            curl -sfL "$client" -o "$jar"
-          fi
-          ls -la "$jar"
-          python3 scripts/audit_mixin_targets.py --jar "$jar" \
+          fetch_client_jar() {
+            version="$1"
+            jar=".mc-cache/client-$version.jar"
+            if [ ! -f "$jar" ]; then
+              mkdir -p .mc-cache
+              url="$(curl -sfL https://piston-meta.mojang.com/mc/game/version_manifest_v2.json \
+                | python3 -c "import json,sys;print(next(v['url'] for v in json.load(sys.stdin)['versions'] if v['id']=='$version'))")"
+              curl -sfL "$url" -o .mc-cache/version-$version.json
+              client="$(python3 -c "import json;print(json.load(open('.mc-cache/version-$version.json'))['downloads']['client']['url'])")"
+              curl -sfL "$client" -o "$jar"
+            fi
+            ls -la "$jar"
+          }
+
+          # One audit per Minecraft line: the line's vanilla jar, and the source roots whose
+          # mixins apply to it - the version overlay first, the shared tree second, so a mixin
+          # both trees hold is audited from its version-specific source. The fabric module's
+          # own mixins.json is audited beside the shared one on every line, exactly as before.
+          fetch_client_jar 26.1
+          python3 scripts/audit_mixin_targets.py --jar .mc-cache/client-26.1.jar \
+            --allow scripts/mixin_audit_allowlist.txt \
+            Neolectrum/src/main/resources/wgpu_mc.mixins.json \
+            Neolectrum-fabric/src/main/resources/wgpu_mc.mixins.json
+
+          fetch_client_jar 26.2
+          python3 scripts/audit_mixin_targets.py --jar .mc-cache/client-26.2.jar \
+            --source-root Neolectrum-26.2/src/main/java \
+            --source-root Neolectrum/src/main/java \
             --allow scripts/mixin_audit_allowlist.txt \
             Neolectrum/src/main/resources/wgpu_mc.mixins.json \
             Neolectrum-fabric/src/main/resources/wgpu_mc.mixins.json
@@ -208,24 +235,30 @@ jobs:
         # run, cross-checks every claimed instruction, and fails the build on
         # any overlap that is not two plain @Injects.
         run: |
-          mc_version="$(grep -m1 '^neoforge_minecraft_version=' Neolectrum/gradle.properties | cut -d= -f2)"
-          jar=".mc-cache/client-$mc_version.jar"
-          fa_version="$(tr -d '[:space:]' < scripts/fabric_api_audit_pin.txt)"
-          fa_jar=".mc-cache/fabric-api-$fa_version.jar"
-          if [ ! -f "$fa_jar" ]; then
-            mkdir -p .mc-cache
-            # the pin is the full version_number (it names its own game
-            # version), so no game_versions filter - one exact match or fail
-            fa_url="$(curl -sfL "https://api.modrinth.com/v2/project/fabric-api/version" \
-              | python3 -c "import json,sys; pin='$fa_version'; print(next(v['files'][0]['url'] for v in json.load(sys.stdin) if v['version_number']==pin))")"
-            curl -sfL "$fa_url" -o "$fa_jar"
-          fi
-          ls -la "$fa_jar"
-          python3 scripts/audit_mixin_conflicts.py \
-            --vanilla-jar "$jar" \
-            --other-jar "$fa_jar" --other-name "fabric-api $fa_version" \
-            Neolectrum/src/main/resources/wgpu_mc.mixins.json \
-            Neolectrum-fabric/src/main/resources/wgpu_mc.mixins.json
+          run_conflict_audit() {
+            mc_version="$1"
+            pin_file="$2"
+            jar=".mc-cache/client-$mc_version.jar"
+            fa_version="$(tr -d '[:space:]' < "$pin_file")"
+            fa_jar=".mc-cache/fabric-api-$fa_version.jar"
+            if [ ! -f "$fa_jar" ]; then
+              mkdir -p .mc-cache
+              # the pin is the full version_number (it names its own game
+              # version), so no game_versions filter - one exact match or fail
+              fa_url="$(curl -sfL "https://api.modrinth.com/v2/project/fabric-api/version" \
+                | python3 -c "import json,sys; pin='$fa_version'; print(next(v['files'][0]['url'] for v in json.load(sys.stdin) if v['version_number']==pin))")"
+              curl -sfL "$fa_url" -o "$fa_jar"
+            fi
+            ls -la "$fa_jar"
+            python3 scripts/audit_mixin_conflicts.py \
+              --vanilla-jar "$jar" \
+              --other-jar "$fa_jar" --other-name "fabric-api $fa_version" \
+              Neolectrum/src/main/resources/wgpu_mc.mixins.json \
+              Neolectrum-fabric/src/main/resources/wgpu_mc.mixins.json
+          }
+
+          run_conflict_audit 26.1 scripts/fabric_api_audit_pin.txt
+          run_conflict_audit 26.2 scripts/fabric_api_audit_pin_26.2.txt
 
       - name: Set up JDK 25
         uses: actions/setup-java@v4
@@ -334,6 +367,59 @@ jobs:
         # initialisers and the rest of the verification the build carries.
         run: ./gradlew check jarJar --no-daemon --stacktrace
 
+      - name: Package the 26.2 mod jar
+        shell: bash
+        working-directory: Neolectrum-26.2
+        # The 26.2 sibling: the same pipeline one Minecraft line later. It reads the same Rust
+        # tree this job already built (the natives are the same libraries every line ships) and
+        # packs them the same way, so a 26.2 jar is the 26.1 jar's build twin, not a second
+        # engine build.
+        run: ./gradlew check jarJar --no-daemon --stacktrace
+
+      - name: Package the 26.2 Fabric mod jar
+        shell: bash
+        working-directory: Neolectrum-26.2-fabric
+        # Same shape as the 26.1 fabric build: the shared tree plus the 26.2 overlay, compiled
+        # against Fabric's 26.2 jars, reading its version from ../Neolectrum-26.2/gradle.properties
+        # and its natives from the 26.2 NeoForge build above.
+        run: bash gradlew build --no-daemon --stacktrace
+
+      - name: Check what the 26.2 jars carry
+        if: success()
+        shell: bash
+        working-directory: Neolectrum-26.2
+        run: |
+          jar=$(ls build/libs/*-all.jar | head -n 1)
+          echo "== $jar =="
+          unzip -l "$jar"
+          for abi in android-arm64-v8a android-x86_64; do
+            if ! unzip -l "$jar" | grep -q "assets/wgpu_mc/natives/$abi/libwgpu_mc_jni.so"; then
+              echo "::error::the 26.2 jar is missing assets/wgpu_mc/natives/$abi/libwgpu_mc_jni.so"
+              exit 1
+            fi
+          done
+          for dir in ios-arm64 macos-arm64; do
+            if ! unzip -l "$jar" | grep -q "assets/wgpu_mc/natives/$dir/libwgpu_mc_jni.dylib"; then
+              echo "::error::the 26.2 jar is missing assets/wgpu_mc/natives/$dir/libwgpu_mc_jni.dylib"
+              exit 1
+            fi
+          done
+          for lib in kotlin-stdlib kotlinforforge-neoforge kffmod-neoforge kfflib-neoforge kfflang-neoforge; do
+            if ! unzip -l "$jar" | grep -q "META-INF/jarjar/.*$lib"; then
+              echo "::error::the 26.2 jar is missing the embedded META-INF/jarjar/$lib"
+              exit 1
+            fi
+          done
+          fabric_jar=$(ls ../Neolectrum-26.2-fabric/build/libs/*.jar 2>/dev/null | grep -v -- '-sources' | head -n 1 || true)
+          if [ -z "$fabric_jar" ]; then
+            echo "::error::no 26.2 Fabric jar was built"
+            exit 1
+          fi
+          if ! unzip -l "$fabric_jar" | grep -q "fabric.mod.json"; then
+            echo "::error::the 26.2 Fabric jar does not carry fabric.mod.json"
+            exit 1
+          fi
+
       - name: Package the Fabric mod jar
         shell: bash
         working-directory: Neolectrum-fabric
@@ -422,6 +508,8 @@ jobs:
           path: |
             Neolectrum/build/libs/*-all.jar
             Neolectrum-fabric/build/libs/*.jar
+            Neolectrum-26.2/build/libs/*-all.jar
+            Neolectrum-26.2-fabric/build/libs/*.jar
           if-no-files-found: error
 
       - name: Release
@@ -433,4 +521,6 @@ jobs:
           files: |
             Neolectrum/build/libs/*-all.jar
             Neolectrum-fabric/build/libs/*.jar
+            Neolectrum-26.2/build/libs/*-all.jar
+            Neolectrum-26.2-fabric/build/libs/*.jar
           generate_release_notes: true

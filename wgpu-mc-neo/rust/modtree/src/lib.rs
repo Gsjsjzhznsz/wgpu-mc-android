@@ -205,6 +205,62 @@ pub fn gradle_properties() -> Option<String> {
     read("gradle.properties")
 }
 
+/// The sibling version modules' `gradle.properties`, as `(module name, file text)` pairs.
+///
+/// One Minecraft line per module: the checkout `dir()` finds is the 26.1 build (the tree the
+/// engine's contract is anchored to), and every `Neolectrum-<minecraft>` directory beside it builds
+/// the same renderer for another line - `Neolectrum-26.2`, `Neolectrum-26.3`, and so on. Their
+/// versions answer to the same `updates.json` the 26.1 tree's does, one promo section each, and the
+/// packaging test walks them so a bumped line that forgot its promo is a failing test rather than a
+/// checker that silently stopped offering updates to that line's players.
+pub fn sibling_gradle_properties() -> Vec<(String, String)> {
+    let Some(root) = dir() else {
+        return Vec::new();
+    };
+    let Some(parent) = root.parent() else {
+        return Vec::new();
+    };
+
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<(String, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        // `Neolectrum-<minecraft line>` - a digit after the dash, and no `-fabric` suffix. That
+        // is what tells the version modules apart from the loader modules: `Neolectrum-fabric`
+        // and `Neolectrum-26.2-fabric` build one line's Fabric jar and read their versions from
+        // that line's NeoForge tree, so they have no promo of their own.
+        let after_prefix = name.strip_prefix("Neolectrum-").unwrap_or("");
+        if after_prefix.is_empty()
+            || !after_prefix
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
+            || after_prefix.ends_with("-fabric")
+        {
+            continue;
+        }
+        let props = path.join("gradle.properties");
+        if !props.is_file() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&props)
+            .unwrap_or_else(|err| panic!("{} is unreadable: {err}", props.display()));
+        out.push((name.to_string(), text));
+    }
+
+    out.sort();
+    out
+}
+
 /// `updates.json`: what NeoForge's update checker fetches.
 pub fn updates_json() -> Option<String> {
     read("updates.json")

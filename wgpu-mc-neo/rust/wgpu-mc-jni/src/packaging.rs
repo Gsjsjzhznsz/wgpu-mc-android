@@ -46,7 +46,9 @@ mod tests {
 
     /// The version the mod file is stamped with - the `version` of the `minecraft` mod file, which is what
     /// the checker keys `promos` on. NeoForge 26.1 versions are `<minecraft>-<hotfix>.<release>` (see the
-    /// note in `gradle.properties`), so the Minecraft version is that string without its last part.
+    /// note in `gradle.properties`), so the Minecraft version is that string without its last part -
+    /// and, when the hotfix slot is `0` (the line's first release, as `26.2.0.93` is for Minecraft
+    /// `26.2`), without the hotfix too: the game reports itself as `26.2`, not `26.2.0`.
     fn minecraft_version(gradle: &str) -> String {
         let neo = property(gradle, "neoforge_neo_version");
 
@@ -58,6 +60,9 @@ mod tests {
         );
 
         parts.pop();
+        if parts.last() == Some(&"0") {
+            parts.pop();
+        }
 
         parts.join(".")
     }
@@ -134,6 +139,48 @@ mod tests {
                 updates[minecraft][version].is_string(),
                 "`{key}` names {version}, and `{minecraft}` has no entry for it: the checker would flash \
                  an update with no changelog"
+            );
+        }
+    }
+
+    /// Every sibling version module answers its own promo: the module's `neoforge_mod_version` is
+    /// what its Minecraft line's promo key names, and the file has a changelog for it. A bumped
+    /// module that forgot its promo leaves that line's players on "up to date" forever, which is
+    /// the same silence the 26.1 check above exists to stop.
+    #[test]
+    fn every_version_module_answers_its_promo() {
+        let Some(json) = wgpu_mc_modtree::updates_json() else {
+            wgpu_mc_modtree::skip("the sibling-module check");
+            return;
+        };
+
+        let modules = wgpu_mc_modtree::sibling_gradle_properties();
+        if modules.is_empty() {
+            wgpu_mc_modtree::skip("the sibling-module check");
+            return;
+        }
+
+        let updates = parse_updates(&json);
+        let promos = updates["promos"]
+            .as_object()
+            .expect("`promos` is an object");
+
+        for (module, gradle) in modules {
+            let version = property(&gradle, "neoforge_mod_version");
+            let minecraft = minecraft_version(&gradle);
+            let key = format!("{minecraft}-latest");
+
+            assert_eq!(
+                promos.get(&key).and_then(Value::as_str),
+                Some(version.as_str()),
+                "`{module}` builds {version} for Minecraft {minecraft}, whose promo key is `{key}`. \
+                 `promos` says: {promos:?}"
+            );
+
+            assert!(
+                updates[minecraft.as_str()][version.as_str()].is_string(),
+                "`{minecraft}` has no changelog entry for {version} (built by `{module}`), so that \
+                 line's outdated players are told there is an update and shown nothing about it"
             );
         }
     }
