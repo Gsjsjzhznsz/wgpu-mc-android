@@ -73,6 +73,8 @@ val syncSharedJava = tasks.register<Sync>("syncSharedJava") {
                         // the two NeoForge-only mixins
                         "dev/birb/wgpu/mixin/render/WindowMixin.java",
                         "dev/birb/wgpu/mixin/core/EarlyWindowMixin.java",
+                        // the render pass the 26.2 overlay answers
+                        "dev/birb/wgpu/backend/WgpuRenderPass.java",
                 )
         }
         into(layout.buildDirectory.dir("generated/shared-java"))

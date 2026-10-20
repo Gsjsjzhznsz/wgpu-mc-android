@@ -950,7 +950,7 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
     /** The bytes of one buffer slice, read back through the native read path. */
     private fun readSlice(slice: GpuBufferSlice): ByteBuffer? {
         val buffer = slice.buffer() as WgpuBuffer
-        val staging = MemoryUtil.memAlignedAlloc(256, slice.length().coerceAtLeast(1))
+        val staging = MemoryUtil.memAlignedAlloc(256, slice.length().coerceAtLeast(1L))
         return try {
             val filled = WmNative.readBuffer.invokeExact(
                 device.renderer,
@@ -965,8 +965,9 @@ class WgpuCommandEncoder(@get:JvmName("device") val device: WgpuDevice) : Comman
                     slice.length(), slice.offset(), buffer.label)
                 null
             } else {
+                staging.limit(slice.length().toInt())
                 val copy = ByteBuffer.allocateDirect(slice.length().toInt())
-                copy.put(staging.asByteBuffer().limit(slice.length().toInt()))
+                copy.put(staging)
                 copy.flip()
                 copy
             }

@@ -255,22 +255,29 @@ class WgpuCompiledRenderPipeline private constructor(
             if (!Diagnostics.loggingEnabled() && !pipeline.location.toString().contains("terrain")) return
             if (!described.add(pipeline.location)) return
 
-            val target = pipeline.colorTargetState
-            val blend = target.blendFunction().orElse(null)
-            val depth = pipeline.depthStencilState
+            // 26.2 spells the pipeline's answers differently: the colour target is a direct
+            // accessor, the vertex format is one of the bindings array, and the uniforms and
+            // samplers moved into the bind group layouts - the log names the layouts, which is
+            // the same information one level up.
+            val target = pipeline.getColorTargetState()
+            val blend = target?.blendFunction()?.orElse(null)
+            val depth = pipeline.getDepthStencilState()
+            val vertexFormat = pipeline.getVertexFormatBindings().firstOrNull()
 
             dev.birb.wgpu.WgpuMcMod.LOGGER.info(
-                "wgpu: pipeline {}: vertex {}, mode {}, uniforms {}, samplers {}, " +
+                "wgpu: pipeline {}: vertex {}, mode {}, layouts {}, " +
                     // `{:#x}` is not slf4j syntax: it reads the value as the eighth argument of a
                     // seven-placeholder pattern and logs a warning about it instead of the mask.
                     "depth {}, blend {}, write mask {}, cull {}",
                 pipeline.location,
-                pipeline.vertexFormat?.let { format ->
+                vertexFormat?.let { format ->
                     "${format.vertexSize}B[${format.elements.joinToString(",") { it.name() }}]"
                 } ?: "none",
-                pipeline.vertexFormatMode,
-                pipeline.uniforms.joinToString(",") { it.name() },
-                pipeline.samplers.joinToString(","),
+                pipeline.getPrimitiveTopology(),
+                com.mojang.blaze3d.pipeline.BindGroupLayout.flattenUniforms(pipeline.getBindGroupLayouts())
+                    .joinToString(",") { it.name() },
+                com.mojang.blaze3d.pipeline.BindGroupLayout.flattenSamplers(pipeline.getBindGroupLayouts())
+                    .joinToString(","),
                 depth?.let { "${it.depthTest()} write=${it.writeDepth()} bias=${it.depthBiasConstant()}/${it.depthBiasScaleFactor()}" }
                     ?: "none",
                 blend?.let { "${it.sourceColor()}/${it.destColor()} a ${it.sourceAlpha()}/${it.destAlpha()}" }
@@ -415,7 +422,7 @@ class WgpuCompiledRenderPipeline private constructor(
             descriptor.set(
                 WmNative.LONG,
                 WmNative.PIPELINE_TOPOLOGY,
-                pipeline.vertexFormatMode.toNativeTopology(),
+                pipeline.getPrimitiveTopology().toNativeTopology(),
             )
             // `RenderPipeline#isCull` is what OpenGL's `glEnable(GL_CULL_FACE)` answered to, and it
             // defaults to true. Without it every quad was rasterized front and back: on a blended
@@ -624,8 +631,11 @@ class WgpuCompiledRenderPipeline private constructor(
         }
 
         private fun bindGroupLayouts(arena: Arena, pipeline: RenderPipeline): MemorySegment {
-            val uniforms = pipeline.uniforms
-            val samplers = pipeline.samplers
+            // 26.2 moved the uniform and sampler lists into the pipeline's bind group layouts;
+            // the flattened views are the same lists one level up, which is what the native ABI
+            // wants.
+            val uniforms = com.mojang.blaze3d.pipeline.BindGroupLayout.flattenUniforms(pipeline.getBindGroupLayouts())
+            val samplers = com.mojang.blaze3d.pipeline.BindGroupLayout.flattenSamplers(pipeline.getBindGroupLayouts())
             val entryCount = uniforms.size + samplers.size
             val entries = arena.allocate(WmNative.BIND_GROUP_ENTRY, entryCount.toLong())
 
@@ -645,7 +655,7 @@ class WgpuCompiledRenderPipeline private constructor(
                         else -> WmNative.ENTRY_UNIFORM_BUFFER
                     },
                     uniform.name(),
-                    uniform.textureFormat()?.let { WgpuFormat.nativeId(it) } ?: WmNative.NONE,
+                    uniform.gpuFormat()?.let { WgpuFormat.nativeId(it) } ?: WmNative.NONE,
                 )
             }
 
@@ -665,15 +675,15 @@ class WgpuCompiledRenderPipeline private constructor(
             return layouts
         }
 
-        private fun VertexFormat.Mode.toNativeTopology(): Long = when (this) {
-            VertexFormat.Mode.LINES -> WmNative.TOPOLOGY_LINES
-            VertexFormat.Mode.DEBUG_LINES -> WmNative.TOPOLOGY_LINES
-            VertexFormat.Mode.DEBUG_LINE_STRIP -> WmNative.TOPOLOGY_DEBUG_LINE_STRIP
-            VertexFormat.Mode.POINTS -> WmNative.TOPOLOGY_POINTS
-            VertexFormat.Mode.TRIANGLES -> WmNative.TOPOLOGY_TRIANGLES
-            VertexFormat.Mode.TRIANGLE_STRIP -> WmNative.TOPOLOGY_TRIANGLE_STRIP
-            VertexFormat.Mode.TRIANGLE_FAN -> WmNative.TOPOLOGY_TRIANGLE_FAN
-            VertexFormat.Mode.QUADS -> WmNative.TOPOLOGY_QUADS
+        private fun com.mojang.blaze3d.PrimitiveTopology.toNativeTopology(): Long = when (this) {
+            com.mojang.blaze3d.PrimitiveTopology.LINES -> WmNative.TOPOLOGY_LINES
+            com.mojang.blaze3d.PrimitiveTopology.DEBUG_LINES -> WmNative.TOPOLOGY_LINES
+            com.mojang.blaze3d.PrimitiveTopology.DEBUG_LINE_STRIP -> WmNative.TOPOLOGY_DEBUG_LINE_STRIP
+            com.mojang.blaze3d.PrimitiveTopology.POINTS -> WmNative.TOPOLOGY_POINTS
+            com.mojang.blaze3d.PrimitiveTopology.TRIANGLES -> WmNative.TOPOLOGY_TRIANGLES
+            com.mojang.blaze3d.PrimitiveTopology.TRIANGLE_STRIP -> WmNative.TOPOLOGY_TRIANGLE_STRIP
+            com.mojang.blaze3d.PrimitiveTopology.TRIANGLE_FAN -> WmNative.TOPOLOGY_TRIANGLE_FAN
+            com.mojang.blaze3d.PrimitiveTopology.QUADS -> WmNative.TOPOLOGY_QUADS
         }
 
         /** Main render targets are always RGBA8 in 26.1. */
