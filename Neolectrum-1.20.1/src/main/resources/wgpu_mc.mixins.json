@@ -1,0 +1,17 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "dev.birb.wgpu.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "refmap": "wgpu_mc.refmap.json",
+  "client": [
+    "core.GlBooleanStateMixin",
+    "core.GlStateManagerMixin",
+    "core.RenderSystemMixin",
+    "core.TimerQueryMixin",
+    "render.WindowMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

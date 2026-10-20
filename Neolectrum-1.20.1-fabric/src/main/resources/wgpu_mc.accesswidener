@@ -1,0 +1,10 @@
+accessWidener	v2	named
+
+# The 1.20.1 line's access widener, for the jar loom hands the Kotlin compiler.
+#
+# The GL seam this line is built on reaches the game through mixins and parameters, not through
+# widened members: the shim's GlStateManager/RenderSystem mixins carry their own @Shadow fields,
+# and everything else travels through method arguments. The 26.x lines' widener (the palette and
+# light-storage internals the Rust mesher reads) belongs to the terrain-feed code this line does
+# not carry yet - it arrives with that port, one rule at a time, each one added because a compile
+# or a run failed without it.
