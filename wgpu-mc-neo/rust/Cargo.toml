@@ -55,10 +55,28 @@ exclude = ["cyntax"]
 # existence, every later use of its handle is wgpu's ordinary invalid-resource
 # validation error, and the game loses the draws that pipeline would have made instead
 # of all of them. A genuinely gone device still answers `Lost` and still loses.
+#
+# **The second divergence from the published wgpu-core**: the indirect-call validation
+# (`VALIDATION_INDIRECT_CALL`, which this renderer enables by default) built its two
+# compute pipelines as a precondition of the device - a backend that refused them
+# answered `DeviceError::Lost` for a construct the caller never asked for. The GLES
+# backend runs that construction for the first time once wgpu-hal reports indirect
+# execution by symbol (below), so the fork makes it best-effort: a validation that
+# cannot be built is logged and skipped, and the device keeps its draws - which the
+# device probes have already proven the shape of.
+#
+# **The one divergence from the published glow**: its `Gl` wrapper stopped one function
+# short of the generated `GlFns` - `glMultiDrawElementsIndirect` was loaded wherever the
+# context exported it (core GLES 3.1, core GL 4.3) and no caller could reach it. The
+# fork adds the wrapper method and the symbol-loaded pair a context answers about
+# itself, which is what lets wgpu-hal (above) decide the multi-draw capability by the
+# symbol the context actually carries rather than by the version string a GL-on-Vulkan
+# shim reports, and draw a batch as the one call it is.
 [patch.crates-io]
 naga = { git = "https://github.com/Gsjsjzhznsz/naga", branch = "main" }
 wgpu-hal = { git = "https://github.com/Gsjsjzhznsz/wgpu-hal", branch = "main" }
 wgpu-core = { git = "https://github.com/Gsjsjzhznsz/wgpu-core", branch = "main" }
+glow = { git = "https://github.com/Gsjsjzhznsz/glow", branch = "main" }
 
 [profile.release]
 # Line tables, and only line tables, in the PDB beside the library.

@@ -879,6 +879,17 @@ static MULTI_DRAW: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::ne
 /// slower than the loop it would replace, because each of those draws still reads its record out of
 /// `section_draws`.
 ///
+/// **On the GL backends the same bit has carried a second meaning since android.58.** The fork's GLES
+/// backend implements the batch honestly - one `glMultiDrawElementsIndirect` for the whole `draw_count`,
+/// the plainest way to say "this is one call" - and reports the bit when the context exported the entry
+/// point, decided by the symbol the loader resolved rather than by the version string the context
+/// reports, because the GL-on-Vulkan shims this port runs behind may carry both entry points while
+/// reporting a version that names neither. On those devices the terrain's records ride in the indices
+/// and the indirect records carry `first_instance: 0` always, so nothing about the batched shape asks
+/// for a channel GLES lacks; what the call *does* is the index-record probe's to demonstrate, and a
+/// driver that cannot be trusted with the batch keeps the per-record loop (and, below it, the
+/// in-place and compacted shapes the `terrain_mega` family draws with).
+///
 /// Whether this device can record a `multi_draw_indexed_indirect` that is **one call**: indirect
 /// execution, and the count feature that stops wgpu expanding the batch into a loop.
 ///
